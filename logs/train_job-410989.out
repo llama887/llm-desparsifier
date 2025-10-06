@@ -1,0 +1,45 @@
+=== nvidia-smi ===
+Sun Oct  5 22:32:28 2025       
++---------------------------------------------------------------------------------------+
+| NVIDIA-SMI 535.154.05             Driver Version: 535.154.05   CUDA Version: 12.2     |
+|-----------------------------------------+----------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |         Memory-Usage | GPU-Util  Compute M. |
+|                                         |                      |               MIG M. |
+|=========================================+======================+======================|
+|   0  NVIDIA A100-SXM4-80GB          On  | 00000000:31:00.0 Off |                    0 |
+| N/A   25C    P0              58W / 500W |      0MiB / 81920MiB |      0%      Default |
+|                                         |                      |             Disabled |
++-----------------------------------------+----------------------+----------------------+
+                                                                                         
++---------------------------------------------------------------------------------------+
+| Processes:                                                                            |
+|  GPU   GI   CI        PID   Type   Process name                            GPU Memory |
+|        ID   ID                                                             Usage      |
+|=======================================================================================|
+|  No running processes found                                                           |
++---------------------------------------------------------------------------------------+
+=== JAX info ===
+JAX: 0.7.2 jaxlib: 0.7.2
+Devices: [CudaDevice(id=0)]
+xla_extension.so: /scratch/fyy2003/llm-desparsifier/.venv/lib/python3.12/site-packages/jaxlib/xla_extension.so
+Num devices: 1, Num meta updates: 24
+Compiling...
+Done in 77.13s.
+Training...
+Done in 3.47min
+Final return:  1.662500023841858
+Reward: 0.0
+Ruleset:
+GOAL:
+TileNearRightGoal(yellow square, green ball)
+
+RULES:
+
+INIT TILES:
+yellow square
+green ball
+red hexagon
+green square
+pink hexagon
+Saved: training_curve.png, eval_rollout.mp4
