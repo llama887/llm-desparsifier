@@ -209,3 +209,6 @@ __marimo__/
 srun.sh
 eval_rollout.mp4
 training_curve.png
+
+*.err
+*.out

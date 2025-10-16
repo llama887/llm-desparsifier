@@ -25,6 +25,7 @@ from xminigrid.environment import Environment, EnvParams
 from xminigrid.wrappers import GymAutoResetWrapper
 from xminigrid.benchmarks import Benchmark
 
+
 # ======================
 # Networks
 # ======================
@@ -319,12 +320,12 @@ class TrainConfig:
     rnn_num_layers: int = 1
     head_hidden_dim: int = 64
     # training
-    num_envs: int = 1024
+    num_envs: int = 2048
     num_steps_per_env: int = 4096
     num_steps_per_update: int = 32
     update_epochs: int = 1
     num_minibatches: int = 16
-    total_timesteps: int = 100_000_000
+    total_timesteps: int = 1_000_000_000
     lr: float = 0.001
     clip_eps: float = 0.2
     gamma: float = 0.99
@@ -333,7 +334,7 @@ class TrainConfig:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     eval_num_envs: int = 256
-    eval_num_episodes: int = 10
+    eval_num_episodes: int = 50
     eval_seed: int = 42
     train_seed: int = 42
 
@@ -351,6 +352,7 @@ class TrainConfig:
         assert self.num_steps_per_env % self.num_steps_per_update == 0
         print(f"Num devices: {num_devices}, Num meta updates: {self.num_meta_updates}")
 
+from reward_wrapper import dummy_dense_reward, DesparsifyRewardWrapper
 
 def make_states(config: TrainConfig):
     # for learning rage scheduling
@@ -365,6 +367,7 @@ def make_states(config: TrainConfig):
 
     env, env_params = xminigrid.make(config.env_id)
     env = GymAutoResetWrapper(env)
+    env = DesparsifyRewardWrapper(env, dense_fn=dummy_dense_reward)
 
     # enabling image observations if needed
     if config.img_obs:
