@@ -353,6 +353,7 @@ class TrainConfig:
         print(f"Num devices: {num_devices}, Num meta updates: {self.num_meta_updates}")
 
 from reward_wrapper import dummy_dense_reward, DesparsifyRewardWrapper
+from reward_generator import make_dense_reward
 
 def make_states(config: TrainConfig):
     # for learning rage scheduling
@@ -367,7 +368,10 @@ def make_states(config: TrainConfig):
 
     env, env_params = xminigrid.make(config.env_id)
     env = GymAutoResetWrapper(env)
-    env = DesparsifyRewardWrapper(env, dense_fn=dummy_dense_reward)
+    dense_reward, emitted_code = make_dense_reward(env, env_params)
+    with open("dense_reward_synthesized.py", "w", encoding="utf-8") as f:
+        f.write(emitted_code)
+    env = DesparsifyRewardWrapper(env, dense_fn=dense_reward)
 
     # enabling image observations if needed
     if config.img_obs:
