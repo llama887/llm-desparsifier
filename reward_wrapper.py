@@ -1,6 +1,7 @@
 # file: reward_wrapper.py
 from dataclasses import replace as _py_replace
 import inspect
+from collections.abc import Mapping
 
 class DesparsifyRewardWrapper:
     """Overwrite env reward with a dense heuristic but keep the original env API."""
@@ -22,6 +23,7 @@ class DesparsifyRewardWrapper:
 
     def step(self, env_params, ts, action):
         ts_next = self.env.step(env_params, ts, action)
+        original_reward = ts_next.reward
         if self.ctx_fn is not None:
             ctx = self.ctx_fn(env_params, ts, ts_next)
         else:
@@ -37,9 +39,29 @@ class DesparsifyRewardWrapper:
             # Safe fallback – keep env reward (sparse) rather than crash inside jit
             r_dense = ts_next.reward
 
+        extras_kwargs = {}
+        if hasattr(ts_next, "extras"):
+            extras = ts_next.extras
+            if extras is None:
+                extras_out = {}
+            elif isinstance(extras, Mapping):
+                extras_out = dict(extras)
+            else:
+                copy_fn = getattr(extras, "copy", None)
+                if callable(copy_fn):
+                    extras_out = copy_fn()
+                else:
+                    try:
+                        extras_out = dict(extras)
+                    except TypeError:
+                        # Fallback: wrap in a new dict keyed by type name to avoid mutating original
+                        extras_out = {"_wrapped_extras": extras}
+            extras_out["ground_truth_reward"] = original_reward
+            extras_kwargs["extras"] = extras_out
+
         if hasattr(ts_next, "replace"):
-            return ts_next.replace(reward=r_dense)
-        return _py_replace(ts_next, reward=r_dense)
+            return ts_next.replace(reward=r_dense, **extras_kwargs)
+        return _py_replace(ts_next, reward=r_dense, **extras_kwargs)
 
     # Convenience passthroughs
     def num_actions(self, env_params):

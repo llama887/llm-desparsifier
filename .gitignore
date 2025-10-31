@@ -212,3 +212,8 @@ training_curve.png
 
 *.err
 *.out
+
+# Local benchmark cache
+data/
+
+dense_reward_synthesized.py

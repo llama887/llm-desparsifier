@@ -1,6 +1,7 @@
 
 import time
 import math
+import os
 from typing import TypedDict
 
 import jax
@@ -257,6 +258,7 @@ from flax import struct
 
 class RolloutStats(struct.PyTreeNode):
     reward: jax.Array = struct.field(default_factory=lambda: jnp.asarray(0.0))
+    ground_truth_reward: jax.Array = struct.field(default_factory=lambda: jnp.asarray(0.0))
     length: jax.Array = struct.field(default_factory=lambda: jnp.asarray(0))
     episodes: jax.Array = struct.field(default_factory=lambda: jnp.asarray(0))
 
@@ -289,8 +291,15 @@ def rollout(
         action = dist.sample(seed=_rng).squeeze()
         timestep = env.step(env_params, timestep, action)
 
+        extras = getattr(timestep, "extras", None)
+        if extras is not None and "ground_truth_reward" in extras:
+            gt_reward = extras["ground_truth_reward"]
+        else:
+            gt_reward = timestep.reward
+
         stats = stats.replace(
             reward=stats.reward + timestep.reward,
+            ground_truth_reward=stats.ground_truth_reward + gt_reward,
             length=stats.length + 1,
             episodes=stats.episodes + timestep.last(),
         )
@@ -368,6 +377,17 @@ def make_states(config: TrainConfig):
 
     env, env_params = xminigrid.make(config.env_id)
     env = GymAutoResetWrapper(env)
+
+    data_root = os.environ.setdefault(
+        "XLAND_MINIGRID_DATA", os.path.join(os.getcwd(), "data", "xland_minigrid")
+    )
+    os.makedirs(data_root, exist_ok=True)
+
+    benchmark = xminigrid.load_benchmark(config.benchmark_id)
+    # Use a deterministic ruleset example so the LLM sees a concrete task description.
+    example_ruleset = benchmark.get_ruleset(0)
+    env_params = env_params.replace(ruleset=example_ruleset)
+
     dense_reward, emitted_code = make_dense_reward(env, env_params)
     with open("dense_reward_synthesized.py", "w", encoding="utf-8") as f:
         f.write(emitted_code)
@@ -379,9 +399,6 @@ def make_states(config: TrainConfig):
 
         env = RGBImgObservationWrapper(env)
     
-    # loading benchmark
-    benchmark = xminigrid.load_benchmark(config.benchmark_id)
-
     # set up training state
     rng = jax.random.key(config.train_seed)
     rng, _rng = jax.random.split(rng)
@@ -575,9 +592,14 @@ def make_train(
                 {
                     "eval/returns_mean": eval_stats.reward.mean(0),
                     "eval/returns_median": jnp.median(eval_stats.reward),
+                    "eval/ground_truth_returns_mean": eval_stats.ground_truth_reward.mean(0),
+                    "eval/ground_truth_returns_median": jnp.median(eval_stats.ground_truth_reward),
                     "eval/lengths": eval_stats.length.mean(0),
                     "eval/lengths_20percentile": jnp.percentile(eval_stats.length, q=20),
                     "eval/returns_20percentile": jnp.percentile(eval_stats.reward, q=20),
+                    "eval/ground_truth_returns_20percentile": jnp.percentile(
+                        eval_stats.ground_truth_reward, q=20
+                    ),
                     "lr": train_state.opt_state[-1].hyperparams["learning_rate"],
                 }
             )
@@ -617,11 +639,23 @@ def main():
     # unreplicating from multiple devices
     train_info = unreplicate(train_info)
 
-    print("Final return: ", float(train_info["loss_info"]["eval/returns_mean"][-1]))
-    plt.plot(jnp.arange(config.num_meta_updates), train_info["loss_info"]["eval/returns_mean"])
-    plt.title("Eval Returns (mean) over Meta Updates")
+    final_dense_return = float(train_info["loss_info"]["eval/returns_mean"][-1])
+    final_gt_return = float(train_info["loss_info"]["eval/ground_truth_returns_mean"][-1])
+    print("Final dense return:", final_dense_return)
+    print("Final ground-truth return:", final_gt_return)
+    meta_updates = jnp.arange(config.num_meta_updates)
+    plt.figure()
+    plt.plot(meta_updates, train_info["loss_info"]["eval/ground_truth_returns_mean"], label="Ground-truth reward")
+    plt.plot(
+        meta_updates,
+        train_info["loss_info"]["eval/returns_mean"],
+        label="Dense reward",
+        linestyle="--",
+    )
+    plt.title("Eval Returns over Meta Updates")
     plt.xlabel("Meta Update")
     plt.ylabel("Return")
+    plt.legend()
     plt.savefig("training_curve.png", dpi=150)
 
     # ========== Evaluation ==========
