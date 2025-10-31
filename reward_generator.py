@@ -1,45 +1,47 @@
 from __future__ import annotations
 import ast, types
+import os
 import jax
 import jax.numpy as jnp
 import dspy
+from dotenv import load_dotenv
 
-# file: dspy_portkey.py
+load_dotenv()  # pulls PORTKEY_API_KEY from .env if present
+
+# reward_generator.py (or dspy_portkey.py)
 import os
 import dspy
 
 def configure_dspy_with_portkey(
-    *,
     api_key: str | None = None,
     base_url: str = "https://ai-gateway.apps.cloud.rt.nyu.edu/v1",
-    model: str = "@vertex-ai-3e806d/meta.llama-3.1-8b-instruct-maas",
-    # max_tokens: int = 512,
-    temperature: float = 0.2,
+    model_alias: str = "@o3-mini-5791cb/o3-mini",
+    temperature: float = 1.0,
+    max_completion_tokens: int = 16000,  # NOTE: o3-mini uses this name
 ):
     """
-    Point DSPy at Portkey's OpenAI-compatible /v1 endpoint.
+    Point DSPy (via LiteLLM) at your Portkey gateway and the o3-mini route.
     """
     api_key = api_key or os.environ.get("PORTKEY_API_KEY")
     if not api_key:
         raise RuntimeError("Missing PORTKEY_API_KEY")
 
-    # DSPy’s OpenAI client accepts custom base URLs and works with OpenAI-compatible gateways.
-    from dspy.clients import OpenAI as DSPyOpenAI
-
-    lm = DSPyOpenAI(
+    # DSPy’s LM forwards kwargs to LiteLLM → OpenAI-compatible gateway (Portkey).
+    print("Temperature | Max tokens", temperature, max_completion_tokens)
+    lm = dspy.LM(
+        model=f"openai/{model_alias}",   # provider/model style; RHS is the OpenAI 'model' field
+        api_base=base_url,               # Portkey base URL
         api_key=api_key,
-        api_base=base_url,         # Portkey gateway
-        model=model,               # your routed model alias on Portkey
-        # max_tokens=max_tokens,
         temperature=temperature,
+        # Important for o3-mini:
+        max_tokens=max_completion_tokens,
+        # If your Portkey route needs any extra headers, pass them here:
+        # additional_headers={"x-portkey-...": "..."}
     )
-    # v2-style global settings
-    try:
-        dspy.settings.configure(lm=lm)
-    except AttributeError:
-        dspy.configure(lm=lm)
 
+    dspy.configure(lm=lm)
     return lm
+
 
 lm = configure_dspy_with_portkey()
 
@@ -178,3 +180,13 @@ def make_dense_reward(env, env_params, dspy_model=None):
     code = _prog(env_text, CONSTRAINTS_TEXT)
     dense_fn = sanitize_and_compile(code)
     return dense_fn, code
+
+if __name__ == "__main__":
+    dspy.configure(lm=lm)  # make sure it's set
+    class EchoSig(dspy.Signature):
+        question: str = dspy.InputField()
+        answer: str = dspy.OutputField()
+
+    p = dspy.Predict(EchoSig)
+    out = p(question="Say 'ok' once.")
+    print("LM check:", out.answer[:120])
