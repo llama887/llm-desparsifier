@@ -292,8 +292,14 @@ def rollout(
         timestep = env.step(env_params, timestep, action)
 
         extras = getattr(timestep, "extras", None)
-        if extras is not None and "ground_truth_reward" in extras:
-            gt_reward = extras["ground_truth_reward"]
+        if extras is not None:
+            get_fn = getattr(extras, "get", None)
+            if callable(get_fn):
+                gt_reward = get_fn("ground_truth_reward", timestep.reward)
+            elif "ground_truth_reward" in extras:
+                gt_reward = extras["ground_truth_reward"]
+            else:
+                gt_reward = timestep.reward
         else:
             gt_reward = timestep.reward
 
@@ -363,6 +369,7 @@ class TrainConfig:
 
 from reward_wrapper import dummy_dense_reward, DesparsifyRewardWrapper
 from reward_generator import make_dense_reward
+from ctx_extractors import extract_xland_ctx
 
 def make_states(config: TrainConfig):
     # for learning rage scheduling
@@ -391,7 +398,7 @@ def make_states(config: TrainConfig):
     dense_reward, emitted_code = make_dense_reward(env, env_params)
     with open("dense_reward_synthesized.py", "w", encoding="utf-8") as f:
         f.write(emitted_code)
-    env = DesparsifyRewardWrapper(env, dense_fn=dense_reward)
+    env = DesparsifyRewardWrapper(env, dense_fn=dense_reward, ctx_fn=extract_xland_ctx)
 
     # enabling image observations if needed
     if config.img_obs:
@@ -600,6 +607,9 @@ def make_train(
                     "eval/ground_truth_returns_20percentile": jnp.percentile(
                         eval_stats.ground_truth_reward, q=20
                     ),
+                    "eval/returns_abs_gap_mean": jnp.mean(
+                        jnp.abs(eval_stats.reward - eval_stats.ground_truth_reward)
+                    ),
                     "lr": train_state.opt_state[-1].hyperparams["learning_rate"],
                 }
             )
@@ -643,18 +653,50 @@ def main():
     final_gt_return = float(train_info["loss_info"]["eval/ground_truth_returns_mean"][-1])
     print("Final dense return:", final_dense_return)
     print("Final ground-truth return:", final_gt_return)
+    final_abs_gap = float(train_info["loss_info"]["eval/returns_abs_gap_mean"][-1])
+    print("Final |dense-ground| mean gap:", final_abs_gap)
     meta_updates = jnp.arange(config.num_meta_updates)
+
+    dense_series = train_info["loss_info"]["eval/returns_mean"]
+    gt_series = train_info["loss_info"]["eval/ground_truth_returns_mean"]
+
     plt.figure()
-    plt.plot(meta_updates, train_info["loss_info"]["eval/ground_truth_returns_mean"], label="Ground-truth reward")
-    plt.plot(
-        meta_updates,
-        train_info["loss_info"]["eval/returns_mean"],
-        label="Dense reward",
-        linestyle="--",
-    )
-    plt.title("Eval Returns over Meta Updates")
+    plt.plot(meta_updates, gt_series, label="Ground-truth reward")
+    plt.title("Ground-truth Eval Returns over Meta Updates")
     plt.xlabel("Meta Update")
     plt.ylabel("Return")
+    plt.legend()
+    plt.savefig("training_curve_ground_truth.png", dpi=150)
+
+    plt.figure()
+    plt.plot(meta_updates, dense_series, label="Dense reward", color="tab:orange")
+    plt.title("Dense Eval Returns over Meta Updates")
+    plt.xlabel("Meta Update")
+    plt.ylabel("Return")
+    plt.legend()
+    plt.savefig("training_curve_dense.png", dpi=150)
+
+    def _normalize_to_unit_interval(series):
+        min_val = jnp.min(series)
+        max_val = jnp.max(series)
+        range_val = max_val - min_val
+        inv_range = jnp.where(range_val > 0, 1.0 / range_val, 0.0)
+        return jnp.where(range_val > 0, (series - min_val) * inv_range, jnp.zeros_like(series))
+
+    dense_series_norm = _normalize_to_unit_interval(dense_series)
+    gt_series_norm = _normalize_to_unit_interval(gt_series)
+
+    plt.figure()
+    plt.plot(meta_updates, gt_series_norm, label="Ground-truth reward (normalized)")
+    plt.plot(
+        meta_updates,
+        dense_series_norm,
+        label="Dense reward (normalized)",
+        linestyle="--",
+    )
+    plt.title("Normalized Eval Returns over Meta Updates")
+    plt.xlabel("Meta Update")
+    plt.ylabel("Normalized Return [0, 1]")
     plt.legend()
     plt.savefig("training_curve.png", dpi=150)
 
