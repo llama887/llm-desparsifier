@@ -9,3 +9,11 @@ dependencies = [
     "jax[cuda12]>=0.7.2",
     "xminigrid[baselines]>=0.9.1",
 ]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llm_desparsifier*"]

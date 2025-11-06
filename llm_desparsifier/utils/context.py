@@ -1,4 +1,11 @@
-"""Context extraction utilities for XLand MiniGrid environments."""
+"""Context extraction utilities shared across environments.
+
+Functions should follow the signature::
+
+    def ctx_fn(env_params, ts_prev, ts_next) -> dict[str, jax.Array]:
+
+and return JAX-friendly arrays only so they can be used under `jax.jit`/`jax.vmap`.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +13,8 @@ import jax
 import jax.numpy as jnp
 
 from xminigrid.core.constants import Colors, Tiles
+
+__all__ = ["extract_xland_ctx"]
 
 
 def _find_first_match(mask: jnp.ndarray) -> jnp.ndarray:
@@ -29,8 +38,8 @@ def _find_first_match(mask: jnp.ndarray) -> jnp.ndarray:
 
 
 def extract_xland_ctx(env_params, ts_prev, ts_next):
-    """Build a dense-reward context dictionary from timestep state."""
-    del env_params, ts_prev  # unused in current extractor
+    """Build a dense-reward context dictionary from XLand MiniGrid timesteps."""
+    del env_params, ts_prev
 
     grid = ts_next.state.grid
     tile_layer = grid[..., 0]

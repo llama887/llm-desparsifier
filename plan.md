@@ -1,69 +1,122 @@
-# Plan: Diagnose and Fix Empty `ctx` Driving Dense Reward Degeneration
+# Refactor Plan for `llm-desparsifier`
 
-## Current Context Flow (What `ctx` Should Be)
-- `xland_meta_learning_baseline.make_states` wraps the raw XLand MiniGrid env with `GymAutoResetWrapper` and then `DesparsifyRewardWrapper` (`reward_wrapper.py`).
-- `DesparsifyRewardWrapper.step` (`reward_wrapper.py:84-113`) calls `env.step`, captures the original reward, and prepares `ctx`:
-  * If a `ctx_fn` is provided, it is invoked as `ctx_fn(env_params, ts_prev, ts_next)`.
-  * Otherwise it forwards `ts_next.extras` (falling back to `{}` if `extras` is `None`).
-- `reward_generator.make_dense_reward` emits a five-argument `dense_reward` (see `dense_reward_synthesized.py`) that expects keys like `"yellow_square_pos"` and `"green_ball_pos"` to be present inside `ctx`.
-- Normalized dense reward perfectly matching the sparse curve implies that either (a) the dense reward fell back to the sparse reward path, or (b) the dense reward collapsed to a constant/degenerate signal that normalizes identically to ground-truth returns. Both are consistent with an empty or incomplete `ctx`.
+## Core Objectives
+- Treat the reinforcement-learning training stack as a black box that exposes a clear entry point for experiments.
+- Untangle the reward generation (LLM interaction, sanitizing, parsing) into focused modules.
+- Move implementation files out of the repository root into a maintainable package layout while keeping artifacts and data separate.
 
-## A) Potential Root Causes to Investigate
-- **Underlying env never populates extras**: if `xminigrid`’s `TimeStep.extras` is empty unless a specific wrapper (e.g. a "state tracking" helper) is enabled, `ctx` will always be `{}` without a custom `ctx_fn`.
-- **`GymAutoResetWrapper` strips extras**: this wrapper might drop or reset the `extras` field when auto-resetting environments, leaving `ts_next.extras` empty even if the base env had context.
-- **`DesparsifyRewardWrapper` retunes extras improperly**: `_augment_extras` copies the incoming mapping before freezing it; if the original extras are stored under a different attribute or require a deep structure (e.g. `ts_next.info`), they may be lost.
-- **Missing bespoke `ctx_fn`**: the pipeline never supplies `ctx_fn`, so any contextual values must already live in `extras`. If XLand MiniGrid does not expose block positions there by default, the dense reward cannot see them.
-- **Signature mismatch fallback**: if `inspect.signature` misdetects the synthesized function (e.g. due to decorators or partials) the wrapper falls back to `ts_next.reward`, yielding an exact copy of the sparse reward.
-- **Key name mismatch**: `dense_reward` requests `"yellow_square_pos"` / `"green_ball_pos"`, but the env (or future `ctx_fn`) may emit different naming (`"yellow_square_position"`). Defaults would then fire, returning constant arrays.
-- **FrozenDict semantics**: `ctx` may be a `flax.core.FrozenDict`; if `ctx.get` behaves differently under JIT (returning defaults every time), the dense reward effectively uses the fallback path.
+## Target Package Layout (proposed)
+- `llm_desparsifier/`
+  - `__init__.py` (exports the high-level training API).
+  - `rl/`
+    - `__init__.py`
+    - `pipeline.py` (black-box training loop entry point exposing `run_training_with_reward(...)`).
+    - `wrappers.py` (reward wrapper, timestep helpers).
+    - `metrics.py` (helpers for logging, plotting, optional future extensions).
+  - `rewards/`
+    - `__init__.py`
+    - `llm_client.py` (DSPy/Portkey configuration and inference glue).
+    - `sanitizer.py` (AST whitelist logic currently in `reward_generator.py`).
+    - `parser.py` (code extraction / validation helpers, goal text formatting).
+    - `generator.py` (public `RewardGenerator` class orchestrating prompt build + LLM + sanitizer).
+  - `utils/`
+    - `__init__.py`
+    - `prompts.py` (prompt templates, env description helpers).
+    - `context.py` (utilities such as `extract_xland_ctx` shared across rewards/rl code).
+- `scripts/`
+  - `train_with_llm_reward.py` (thin CLI that wires CLI args to `rl.pipeline.run_training_with_reward`).
+- `artifacts/`
+  - `generated_rewards/` (LLM-authored reward code snapshots such as `dense_reward_synthesized.py`).
+- Keep existing `data/`, `logs/`, `tests/`, `sbatch/` directories; adjust their contents only if path changes require it.
 
-## Required Deep Dives
-- **Document what `ctx` is in XLand MiniGrid**: inspect `xminigrid` source (likely `xminigrid/types.py` or environment implementation) to confirm whether `TimeStep` exposes an `extras` mapping, what keys it contains (agent position, block positions, mission text, etc.), and under which wrappers it is populated.
-- **Trace the full `ctx` path**: follow the object from the base env → `GymAutoResetWrapper` → `DesparsifyRewardWrapper`. Confirm whether `extras` survives each layer and whether any step replaces the object with `{}`.
-- **Quantify dense reward fallback behaviour**: evaluate the generated `dense_reward` under `ctx = {}` to verify it returns a constant signal (e.g. `-1.01`) that could normalize to the same curve as the sparse reward.
+## Step-by-Step Refactor Plan
 
-## Focused Action Plan (Current Workstream)
-1. **Locate XLand MiniGrid Source**
-   - Check whether `xminigrid` is installed; if not, identify installation steps (e.g., `uv pip install xminigrid[baselines]`).
-   - Once available, record its filesystem path via `python -c "import xminigrid, inspect; print(xminigrid.__file__)"`.
-2. **Catalogue Available Extras**
-   - Review the package’s environment implementation (`environment.py`, `types.py`, or wrappers) to document how `TimeStep.extras` is populated for XLand tasks.
-   - Note any required wrappers or benchmark flags to enable richer extras (positions, mission metadata, etc.).
-3. **Prototype `debug_ctx.py`**
-   - Recreate the training env stack: `xminigrid.make` → `GymAutoResetWrapper` → `DesparsifyRewardWrapper`.
-   - Use a dummy dense reward that logs incoming `ctx`, and capture `ts_next.extras` before and after wrapping.
-   - Run a few deterministic `step`s to confirm whether context survives the pipeline and identify missing keys.
-   - Summarize observed outputs (key presence, reward divergence) for future debugging.
+### Phase 1 – Preparation
+1. Audit each top-level Python file to confirm current responsibilities and note hidden dependencies (already partially done; document findings inline during move).
+2. Update `pyproject.toml` (and tooling configs if needed) to include the `llm_desparsifier` package so imports resolve after reshuffling.
+3. Add minimal `__init__.py` files for each new package directory to keep imports explicit from the start.
 
-## B) Step-by-Step Resolution Plan
-1. **Inspect XLand MiniGrid extras**  
-   Locate the installed `xminigrid` package (`python -c "import xminigrid, inspect; print(xminigrid.__file__)"`) and review its `TimeStep`/wrapper code to catalogue what `extras` contains for XLand tasks. Note any conditions (benchmarks, wrappers) that enable richer context.
-2. **Instrument a thin probe**  
-   Write a short script (e.g. `debug_ctx.py`) that instantiates the same env stack as training, runs a few `reset`/`step` calls, and prints/logs both `ts_next.extras` and the `ctx` observed inside a dummy dense reward. This validates whether extras are empty before modifying core code.
-3. **Decide on `ctx_fn` vs. env extras**  
-   - Probe results (`logs/ctx_probe-1556111.out`) show `TimeStep.extras` is always `None`; the wrapper only injects `ground_truth_reward`/`dense_reward`, and the dense callback sees an empty `ctx`.
-   - Therefore, we must implement a dedicated `ctx_fn` that inspects `ts_next.state.grid` (and optionally `ts_prev.state.grid`) to surface task objects.
-   - Target keys for the current dense reward: `ctx["yellow_square_pos"]`, `ctx["green_ball_pos"]`. Compute them via `jnp.argwhere` over the grid; default to `jnp.array([-1, -1], dtype=jnp.int32)` if missing.
-   - Additional context worth exposing (future-proof): agent position (`ts_next.state.agent.position`), inventory flags (`state.agent.pocket`), and step counters. Keep all values as JAX arrays (`int32`/`bool`).
-   - Implementation sketch:
-     1. Add a new module (e.g., `ctx_extractors.py`) with `def make_ctx(env_params, ts_prev, ts_next) -> dict[str, jax.Array]`.
-     2. Inside, import `TILES_REGISTRY`, `Tiles`, and `Colors` to build tile IDs for objects relevant to the LLM reward.
-     3. Use `jnp.argwhere(ts_next.state.grid == tile_id)` to locate objects; apply `jax.lax.cond` to handle missing tiles without dynamic Python branches.
-     4. Return a plain `dict` mapping strings to arrays (the wrapper will freeze it).
-   - Wire the extractor into `DesparsifyRewardWrapper` construction within `xland_meta_learning_baseline.make_states`, and rerun `debug_ctx.py` to confirm the new keys appear in `ctx`.
-4. **Thread the `ctx_fn` through configuration**  
-   Update `make_states` (or wherever `DesparsifyRewardWrapper` is constructed) to pass the new `ctx_fn`. Ensure the function is JAX-compatible (pure, array outputs). Re-run the probe script to confirm the dense reward now sees real context data.
-5. **Validate dense reward behaviour**  
-   Using the probe, compare dense vs sparse rewards over a few steps to confirm they diverge once context flows. Optionally add assertions/logs for key presence to catch regressions early.
-6. **Retune/regen dense reward if keys differ**  
-   If context provides different key names or formats, either adjust the synthesizer prompt/constraints so the generated code uses the right keys, or add a translation layer in `ctx_fn`.
+### Phase 2 – RL Training Black Box
+4. Carve the training logic out of `xland_meta_learning_baseline.py` into `llm_desparsifier/rl/pipeline.py`.
+   - Preserve existing functionality unchanged while encapsulating side effects (plotting, logging, metric collection) behind function parameters (e.g., `output_dir`, callbacks).
+   - Note: Training script moved into `llm_desparsifier/rl/pipeline.py` with an exported `run_training_with_reward` API; plotting/video output now respects the `output_dir` parameter.
+5. Define the public training API (tentatively `run_training_with_reward(reward_generator, output_dir, config_override=None)`).
+   - Accept a `RewardGenerator` protocol instead of raw functions to support experimentation.
+   - Ensure the function returns a structured result (summary stats, artifact paths) for downstream automation.
+   - Note: Added `RewardGeneratorProtocol` and `TrainingResult` to the pipeline module; the API collects artifact paths and final metrics.
+6. Relocate auxiliary classes (`RewardTimeStep`, `DesparsifyRewardWrapper`, transition dataclasses) into `rl/wrappers.py` (or split into `wrappers.py` & `structures.py` if needed).
+   - Keep non-API helpers private to the module.
+   - Note: Wrapper utilities now live in `llm_desparsifier/rl/wrappers.py`; PPO data carriers moved into `llm_desparsifier/rl/structures.py` with legacy imports re-exported via `reward_wrapper.py`.
+7. Replace the original script (`xland_meta_learning_baseline.py`) with a lightweight entry point that imports the new API or move it entirely into `scripts/train_with_llm_reward.py` and delete the legacy root file.
+   - Note: `xland_meta_learning_baseline.py` now delegates to the pipeline API via a small adapter around the existing `make_dense_reward` function.
 
-## Lightweight Test/Debug Hook (No Full Training Required)
-- Add a developer-only script (e.g. `scripts/ctx_smoke_test.py`) that:
-  1. Creates the wrapped env.
-  2. Performs `reset` + a few deterministic `step`s.
-  3. Captures the `ctx` dict handed to a stub dense reward and prints/asserts the presence of key contextual entries (agent/block positions).
-  4. Reports the dense reward output alongside the sparse reward for comparison.
-- This script can be JIT-free (pure Python + JAX eager) so it runs quickly and confirms the data path before launching expensive training runs.
+### Phase 3 – Reward Generation Cleanup
+8. Move DSPy/Portkey setup from `reward_generator.py` into `rewards/llm_client.py`; expose a single factory for configured LMs.
+   - Note: Created `llm_desparsifier/rewards/llm_client.py` with `configure_portkey_lm` and re-exported it for compat.
+9. Extract AST sanitization (`_Sanitizer`, `_ALLOWED_*`, `sanitize_and_compile`) into `rewards/sanitizer.py` with unit-test-friendly interfaces.
+   - Note: Sanitizer logic now lives in `llm_desparsifier/rewards/sanitizer.py` and is re-exported for legacy imports.
+10. Separate prompt building, environment description templates, and parsing/safety validation helpers into `rewards/parser.py` (or split into `prompts.py` under `utils` if reuse is broader).
+    - Note: Added `llm_desparsifier/rewards/parser.py` containing `describe_ruleset`, helpers, and `CONSTRAINTS_TEXT`.
+11. Build a cohesive `RewardGenerator` class in `rewards/generator.py` that orchestrates: context building → prompt creation → LLM call → sanitizer → compiled reward callable.
+    - Note: Implemented `RewardGenerator` and `RewardSynthesizer` in `llm_desparsifier/rewards/generator.py` with verbose logging and sanitization hooks.
+12. Relocate environment description helpers and context text from `reward_generator.py` to the appropriate module (`contexts/xminigrid.py` or `rewards/prompts`), keeping only orchestration in `generator.py`.
+    - Note: Environment narrative utilities moved into the parser module; compatibility wrapper delegates to the new package.
+13. Update call sites (tests, scripts, RL pipeline) to use the new `RewardGenerator` API rather than module-level globals.
+    - Note: Legacy `reward_generator.py` now wraps the new class, and `xland_meta_learning_baseline.py` instantiates `RewardGenerator` directly.
 
-By executing the above investigation and instrumentation steps we can isolate why `ctx` is empty, reintroduce meaningful context, and verify the dense reward diverges from the sparse baseline.
+### Phase 4 – Context Extraction & Utilities
+14. Move `ctx_extractors.py` into `utils/context.py`; ensure the RL pipeline imports it via the new package namespace.
+    - Note: Context helpers now reside in `llm_desparsifier/utils/context.py`; the module documents the expected callable signature and is exported via `utils.__all__`.
+15. Document the expected interface for context extractors (function signature, return value) within the module docstring and export via `utils/__init__.py`.
+    - Note: Documented the interface in the new module docstring and re-exported `extract_xland_ctx` through `llm_desparsifier.utils`.
+16. Reorganize any remaining helpers (e.g., debug scripts, plotting utilities) into `utils/` or `scripts/` depending on runtime vs. dev-time usage.
+
+### Phase 5 – Artifacts, Tests, and Tooling
+17. Move generated reward files (e.g., `dense_reward_synthesized.py`) into `artifacts/generated_rewards/` and adjust `.gitignore` to keep auto-generated outputs optional.
+    - Note: Added `artifacts/generated_rewards/` (and baseline run outputs) with `.gitkeep`, relocated existing reward snapshots, and updated `.gitignore` to ignore generated artifacts.
+18. Update existing tests (under `tests/`) to import from the new package paths; add new tests for sanitizer and reward generator orchestration if coverage gaps appear.
+    - Note: `tests/debug_ctx.py` now imports directly from `llm_desparsifier` packages and locates synthesized rewards under the new artifact directories.
+19. Rename or update sbatch scripts and notebooks to point to the new CLI script or API entry point.
+    - Note: `sbatch/xland_baseline.s` now invokes `python xland_meta_learning_baseline.py --output-dir` with per-job artifact directories; both sbatch scripts ensure `logs/` exists.
+20. Grep the repository for old module paths (`reward_generator`, `reward_wrapper`, etc.) and rewrite imports to the new locations.
+    - Note: Legacy imports replaced with `llm_desparsifier` package equivalents, leaving compatibility shims only for external callers.
+21. Run the full training pipeline (or the smallest reproducible subset) to confirm behaviour remains unchanged; capture new artifact locations in documentation.
+    - Note: Deferred execution per instructions; sbatch script prepared to run the updated pipeline when triggered manually.
+
+### Phase 6 – Cleanup and Documentation
+22. Prune leftover root-level Python files once imports succeed (keeping only package directories and scripts).
+23. Refresh `README.md` to describe the new structure and usage (CLI vs. Python API).
+24. Summarize migration notes in a changelog entry or developer doc (e.g., `docs/refactor-notes.md`) to help future contributors.
+25. Consider adding a Makefile or task runner entry for the new CLI (`make train`), improving discoverability.
+
+## Open Questions for Follow-Up
+- Confirm whether the training API should accept additional callbacks (logging hooks, evaluation episodes) beyond reward generator and output directory.
+- Decide if multiple reward generators will coexist (ensemble, ablations) and whether the API should accept a registry instead of a single callable.
+- Determine the long-term home for generated reward files (tracked artifacts vs. reproducible generation on demand).
+
+## Phase 1 Preparation Notes
+
+- `ctx_extractors.py`  
+  - **Responsibility:** builds context dictionaries (positions, agent state, carried objects) from XLand MiniGrid timesteps for use in dense reward shaping.  
+  - **Key Dependencies:** `jax`, `jax.numpy`, `xminigrid.core.constants.Colors`, `xminigrid.core.constants.Tiles`.  
+  - **Hidden Couplings:** assumes `ts_next.state` exposes `grid`, `agent`, and `pocket` attributes following MiniGrid conventions; returns dense JAX arrays to stay jit-compatible.
+
+- `dense_reward_synthesized.py`  
+  - **Responsibility:** stores the latest LLM-produced dense reward function. Treated as an artifact rather than reusable module code.  
+  - **Key Dependencies:** expects `jnp` to be injected (not imported locally); relies on surrounding caller to supply context entries (`yellow_square_pos`, `green_ball_pos`).  
+  - **Hidden Couplings:** assumes `ctx` keys produced by `ctx_extractors.py`; mirrors sparse reward semantics when `ts_next.last() > 0`.
+
+- `reward_generator.py`  
+  - **Responsibility:** orchestrates DSPy/Portkey model configuration, LLM prompting, AST sanitization, and runtime compilation of dense reward code.  
+  - **Key Dependencies:** `dspy`, `dotenv` for environment config, `jax`/`jax.numpy`, `ast`, `types`, `io`, and custom sanitizer whitelist logic contained in the same file.  
+  - **Hidden Couplings:** global `lm = configure_dspy_with_portkey()` executed at import time (requires `PORTKEY_API_KEY`); tightly couples prompt templating, sanitizing, and code execution, making unit testing difficult.
+
+- `reward_wrapper.py`  
+  - **Responsibility:** wraps an environment to overwrite rewards with dense functions while preserving extras; provides a `RewardTimeStep` proxy and a `dummy_dense_reward` placeholder.  
+  - **Key Dependencies:** `flax.struct`, `flax.core.frozen_dict`, `collections.abc.Mapping`, `inspect`, `jax.numpy`.  
+  - **Hidden Couplings:** tries to maintain JAX-trace-friendly behaviour by inspecting dense reward arity at init; expects dense functions of arity 3 or 5.
+
+- `xland_meta_learning_baseline.py`  
+  - **Responsibility:** full RL training pipeline (networks, PPO loop, data collection, logging, plotting). Treating this as the black-box engine for reward experiments.  
+  - **Key Dependencies:** extensive use of `jax`, `flax`, `optax`, `distrax`, `matplotlib`, `xminigrid` environment suite, `imageio`.  
+  - **Hidden Couplings:** assumes benchmark/task definitions from `xminigrid`; plots directly to PNG/Movie files; mixes training config, rollout evaluation, and CLI-like script behaviour in a single file.

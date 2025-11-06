@@ -10,6 +10,7 @@
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
+mkdir -p logs
 
 # Keep XLand-MiniGrid data in the project, not $HOME
 export XLAND_MINIGRID_DATA="$PWD/.xland_minigrid"
@@ -55,4 +56,6 @@ except Exception as e:
 PY
 
 # Run training
-uv run xland_meta_learning_baseline.py
+OUTPUT_DIR="${OUTPUT_DIR:-$PWD/artifacts/runs/${SLURM_JOB_ID}}"
+mkdir -p "$OUTPUT_DIR"
+uv run python xland_meta_learning_baseline.py --output-dir "$OUTPUT_DIR"

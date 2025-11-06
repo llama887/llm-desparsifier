@@ -1,0 +1,184 @@
+"""Prompt construction helpers for reward synthesis."""
+
+from __future__ import annotations
+
+import io
+import re
+from contextlib import redirect_stdout
+from typing import List, Optional, Tuple
+
+try:
+    from xminigrid.rendering.text_render import print_ruleset as _print_ruleset
+except Exception:  # pragma: no cover - optional dependency guard
+    _print_ruleset = None
+
+
+__all__ = ["describe_ruleset", "CONSTRAINTS_TEXT"]
+
+_LAYOUT_HINTS = {
+    "R1": "a single rectangular room (no interior walls)",
+    "R2": "two rooms separated by an interior wall with one doorway",
+    "R4": "four rooms separated by interior walls (the classic Four Rooms layout)",
+    "R6": "six rooms separated by interior walls and doors",
+    "R9": "nine rooms in a 3×3 arrangement with interior doors",
+}
+
+_ACTIONS_LINE = (
+    "Actions: move_forward, turn_left, turn_right, pick_up, put_down, toggle (one object carried at a time)."
+)
+
+_GOAL_TILE_NEAR_RIGHT_RE = re.compile(
+    r"TileNearRightGoal\s*\(\s*([^) ,]+(?:\s+[^\),]+)?)\s*,\s*([^) ,]+(?:\s+[^\),]+)?)\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _safe_getattr(obj, name: str, default: str) -> str:
+    try:
+        value = getattr(obj, name, default)
+        return str(value if value is not None else default)
+    except Exception:
+        return default
+
+
+def _parse_ruleset_text(text: str) -> tuple[Optional[str], List[str], List[str]]:
+    goal_line = None
+    rule_lines: List[str] = []
+    init_lines: List[str] = []
+
+    lines = [ln.strip() for ln in text.splitlines()]
+    section = None
+    for ln in lines:
+        if not ln:
+            continue
+        key = ln.upper().rstrip(":")
+        if key == "GOAL":
+            section = "GOAL"
+            continue
+        if key == "RULES":
+            section = "RULES"
+            continue
+        if key.startswith("INIT TILES"):
+            section = "INIT"
+            continue
+
+        if section == "GOAL" and goal_line is None:
+            goal_line = ln
+        elif section == "RULES":
+            rule_lines.append(ln)
+        elif section == "INIT":
+            init_lines.append(ln)
+
+    return goal_line, rule_lines, init_lines
+
+
+def _explain_goal(goal_line: Optional[str]) -> Optional[str]:
+    if not goal_line:
+        return None
+    match = _GOAL_TILE_NEAR_RIGHT_RE.search(goal_line)
+    if match:
+        left_obj, right_obj = match.group(2).strip(), match.group(1).strip()
+        return (
+            f"SUCCESS when **{right_obj}** is immediately to the **left** of **{left_obj}** "
+            f"(i.e., {left_obj} is exactly one cell to the right of {right_obj}, same row, adjacent columns)."
+        )
+    return f"SUCCESS when condition holds: {goal_line}"
+
+
+def describe_ruleset(env, env_params) -> str:
+    """Produce an LLM-friendly description of the current task."""
+    height = _safe_getattr(env_params, "height", "?")
+    width = _safe_getattr(env_params, "width", "?")
+    view = _safe_getattr(env_params, "view_size", "?")
+    max_steps = _safe_getattr(env_params, "max_steps", "?")
+    grid_type = _safe_getattr(env_params, "grid_type", "unknown")
+
+    layout_hint = _LAYOUT_HINTS.get(str(grid_type), "a grid-world layout with interior walls and doors")
+
+    goal_line = None
+    rule_lines: List[str] = []
+    init_lines: List[str] = []
+    if _print_ruleset is not None:
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                _print_ruleset(getattr(env_params, "ruleset", None))
+            summary = buf.getvalue().strip()
+            if summary:
+                goal_line, rule_lines, init_lines = _parse_ruleset_text(summary)
+        except Exception:
+            pass
+
+    goal_expl = _explain_goal(goal_line)
+
+    init_obj_list = ", ".join(init_lines[:10]) if init_lines else "unknown (randomized at reset)"
+    if init_lines and len(init_lines) > 10:
+        init_obj_list += f", ... (+{len(init_lines) - 10} more)"
+
+    rules_summary = "\n".join(f"- {r}" for r in rule_lines[:8]) if rule_lines else "No explicit transformation rules provided."
+    if rule_lines and len(rule_lines) > 8:
+        rules_summary += f"\n- ... (+{len(rule_lines) - 8} more)"
+
+    lines = [
+        f"grid_type={grid_type} → {layout_hint}",
+        f"size={height}x{width}, view={view} (agent-centered egocentric  {view}×{view}  symbolic grid), max_steps={max_steps}.",
+        _ACTIONS_LINE,
+        "",
+    ]
+
+    if goal_line:
+        lines.append("GOAL:")
+        lines.append(goal_line)
+        if goal_expl:
+            lines.append(goal_expl)
+        lines.append("")
+
+    lines.append("RULES:")
+    lines.append(rules_summary)
+    lines.append("")
+
+    lines.append("INITIAL OBJECTS:")
+    lines.append(init_obj_list)
+    lines.append("")
+
+    lines.append("Observations are partially observable and symbolic (not pixels). Use distances and spatial relations; avoid Python-side branching.")
+
+    return "\n".join(lines)
+
+
+CONSTRAINTS_TEXT = """
+You are designing a dense reward function for the Xland-Minigrid environment
+You must output exactly ONE function:
+  def dense_reward(env_params, ts_prev, action, ts_next, ctx):
+    # returns a scalar jnp.float32
+
+Context:
+- The function will be installed as `dense_fn` inside `DesparsifyRewardWrapper` (see snippet below) and invoked either with three args `(ts_prev, action, ts_next)` or the five-arg signature shown above. Always implement the five-arg form; the wrapper detects it via `inspect.signature`.
+- `ctx` is produced (when configured) by a pure `ctx_fn(env_params, ts_prev, ts_next)` that runs right after `env.step`. It returns a dictionary mapping strings to JAX arrays. Each entry is derived from the `xminigrid.types.TimeStep` objects:
+    - `ts_prev.state` / `ts_next.state` expose the full grid (`grid` shaped `[height, width, 2]` with `(tile_id, color_id)`), the agent (`agent.position` as zero-based `[row, col]`, `agent.direction` in {0: up, 1: right, 2: down, 3: left}, and `agent.pocket`), plus goal and rule encodings.
+    - We commonly precompute arrays such as `ctx["agent_pos_prev"] = ts_prev.state.agent.position`, `ctx["agent_pos"] = ts_next.state.agent.position`, object positions extracted from the grid (e.g., `ctx["yellow_square_pos"]`), boolean masks (`ctx["has_key"]`), or scalar distances between entities. Every value is a `jnp` array (often `jnp.int32` positions or `jnp.float32` distances).
+    - When no `ctx_fn` is provided the wrapper hands you `{}`; your code must therefore tolerate missing keys and supply reasonable defaults via `ctx.get("name", fallback)`.
+- When the wrapper runs, it replaces the environment's sparse reward with your dense value: `ts_next = env.step(...)`, then `dense_reward` is called and its output stored in `ts_next.reward`.
+- Existing placeholder reward (for reference only):
+
+```python
+def dummy_dense_reward(ts_prev, action, ts_next):
+    ones = jnp.ones_like(ts_next.reward)
+    zeros = jnp.full_like(ts_next.reward, 0.0)
+    return jnp.where(ts_next.last() > 0, zeros, zeros)
+```
+
+Rules:
+- Use ONLY jax.numpy as jnp (import not needed) and jax.lax if necessary.
+- Do NOT add import statements; jnp and jax are already available.
+- Use ONLY values in 'ctx' (e.g., ctx['agent_pos'], ctx['goal_pos'], ctx['has_key'], distances).
+- Access ctx via ctx.get("key", default) and timestep helpers like ts_next.last(); avoid other Python-only methods (e.g., .item(), .tolist()).
+- If you define helper functions inside dense_reward, ensure they are pure, side-effect free, and only call jnp/jax operations.
+- Do NOT access Python globals, files, network, randomness, or environment internals.
+- The function must be pure and JIT-friendly: no Python branching on array values; use jnp.where / lax.cond.
+- Reward should be shaped dense potential: positive when closer to achieving the goal; small step penalty ok.
+- Must gracefully handle episode termination: set to 0 after terminal or add a success bonus that is consistent with sparse=1.
+- Return jnp.asarray(<scalar>, dtype=jnp.float32).
+
+YOU MUST WRITE VALID JITTABLE JAX CODE
+"""

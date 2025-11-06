@@ -11,8 +11,20 @@ Any assertion failure means the ctx plumbing broke or the task definition change
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# Make project modules importable when invoked from subdirectories / SLURM.
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# Prefer local cache/data directories so the script can run on shared nodes.
+DATA_ROOT = ROOT / "data" / "xland_minigrid"
+os.environ.setdefault("XLAND_MINIGRID_DATA", str(DATA_ROOT))
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 import jax
 import jax.numpy as jnp
@@ -20,14 +32,9 @@ import jax.numpy as jnp
 import xminigrid
 from xminigrid.wrappers import GymAutoResetWrapper
 
-# Make project modules importable when invoked from subdirectories / SLURM.
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from reward_wrapper import DesparsifyRewardWrapper
-from ctx_extractors import extract_xland_ctx
-from reward_generator import sanitize_and_compile
+from llm_desparsifier.rewards import sanitize_and_compile
+from llm_desparsifier.rl.wrappers import DesparsifyRewardWrapper
+from llm_desparsifier.utils import extract_xland_ctx
 
 # Keep these constants in sync with training so the probe exercises the same task.
 BENCHMARK_NAME = "trivial-1m"
@@ -46,6 +53,24 @@ CTX_KEYS = (
 
 # Sentinel used by the extractor when an object is missing; we assert it never appears.
 MISSING_POS = jnp.array([-1, -1], dtype=jnp.int32)
+
+
+def _candidate_reward_paths() -> list[Path]:
+    runs_dir = ROOT / "artifacts" / "runs"
+    if runs_dir.exists():
+        run_candidates = sorted(
+            runs_dir.glob("*/dense_reward_synthesized.py"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    else:
+        run_candidates = []
+    base_candidates = [
+        ROOT / "artifacts" / "generated_rewards" / "dense_reward_synthesized.py",
+        ROOT / "artifacts" / "baseline_run" / "dense_reward_synthesized.py",
+        ROOT / "dense_reward_synthesized.py",
+    ]
+    return run_candidates + base_candidates
 
 
 def _safe_extras(ts):
@@ -67,6 +92,19 @@ def _print_with_values(label: str, ts) -> None:
     print(f"{label}: reward={reward:.3f}, step_type={step_type}, {extras_msg}")
 
 
+def _load_dense_code() -> str:
+    candidates = [path for path in _candidate_reward_paths() if path.exists()]
+    if not candidates:
+        search_list = "\n".join(str(path) for path in _candidate_reward_paths())
+        raise RuntimeError(
+            "dense_reward_synthesized.py not found in expected artifact directories:\n"
+            f"{search_list}\nRun the reward generator before this check."
+        )
+    chosen = candidates[0]
+    print(f"Using generated reward from: {chosen}")
+    return chosen.read_text(encoding="utf-8")
+
+
 def main() -> None:
     # 1) Build the environment stack exactly like training does.
     env, env_params = xminigrid.make("XLand-MiniGrid-R1-9x9")
@@ -75,13 +113,7 @@ def main() -> None:
     env = GymAutoResetWrapper(env)
 
     # 2) Compile the synthesized dense reward exactly like training does.
-    try:
-        with open("dense_reward_synthesized.py", "r", encoding="utf-8") as f:
-            dense_code = f.read()
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "dense_reward_synthesized.py not found. Run the reward generator before this check."
-        ) from exc
+    dense_code = _load_dense_code()
     generated_dense_reward = sanitize_and_compile(dense_code)
 
     rng = jax.random.PRNGKey(0)

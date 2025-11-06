@@ -10,6 +10,7 @@
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
+mkdir -p logs
 
 # Keep benchmark assets alongside the project.
 export XLAND_MINIGRID_DATA="$PWD/.xland_minigrid"
@@ -22,5 +23,5 @@ mkdir -p "$XDG_CACHE_HOME"
 # Ensure dependencies match pyproject/uv lock.
 uv sync
 
-# Run the lightweight context probe.
-uv run python tests/debug_ctx.py
+# Run the lightweight context probe inside the project venv.
+.venv/bin/python tests/debug_ctx.py
