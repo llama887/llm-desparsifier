@@ -173,10 +173,11 @@ Rules:
 - Do NOT add import statements; jnp and jax are already available.
 - Use ONLY values in 'ctx' (e.g., ctx['agent_pos'], ctx['goal_pos'], ctx['has_key'], distances).
 - Access ctx via ctx.get("key", default) and timestep helpers like ts_next.last(); avoid other Python-only methods (e.g., .item(), .tolist()).
+- Call **only** JAX primitives (`jnp.*`, `jax.lax.*`) or helper functions you define inside `dense_reward`. Do **not** invoke Python `math.*`, `numpy.*`, or arbitrary library functions; the sanitizer will reject them.
 - If you define helper functions inside dense_reward, ensure they are pure, side-effect free, and only call jnp/jax operations.
 - Do NOT access Python globals, files, network, randomness, or environment internals.
 - The function must be pure and JIT-friendly: no Python branching on array values; use jnp.where / lax.cond.
-- Reward should be shaped dense potential: positive when closer to achieving the goal; small step penalty ok.
+- Reward should be shaped dense potential: make partial progress yield **positive** rewards (e.g., `potential - potential_prev`), and penalize regress/idle steps; small per-step penalty ok.
 - Must gracefully handle episode termination: set to 0 after terminal or add a success bonus that is consistent with sparse=1.
 - Return jnp.asarray(<scalar>, dtype=jnp.float32).
 

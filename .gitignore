@@ -219,3 +219,4 @@ artifacts/baseline_run/
 !artifacts/baseline_run/.gitkeep
 llm_plans
 plan.md
+artifacts

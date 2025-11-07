@@ -4,9 +4,12 @@ from __future__ import annotations
 import math
 import os
 import time
+import csv
+import json
 from dataclasses import dataclass, asdict
 from functools import partial
-from typing import Any, Callable, Mapping, Optional, Protocol, TypedDict
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, TypedDict
+from typing import Literal
 
 import flax
 import flax.linen as nn
@@ -15,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import matplotlib.pyplot as plt
+import numpy as np
 import optax
 import distrax
 from flax.jax_utils import replicate, unreplicate
@@ -26,8 +30,16 @@ from xminigrid.benchmarks import Benchmark
 from xminigrid.environment import EnvParams, Environment
 from xminigrid.wrappers import GymAutoResetWrapper
 
+from llm_desparsifier.rl.eval import GroundTruthEvalConfig, run_ground_truth_eval
+from llm_desparsifier.rl.metrics import (
+    GroundTruthLogRow,
+    compute_ground_truth_summary,
+    dump_ground_truth_logs,
+    dump_ground_truth_summary,
+)
 from llm_desparsifier.rl.structures import RolloutStats, Transition
 from llm_desparsifier.rl.wrappers import DesparsifyRewardWrapper
+from llm_desparsifier.utils import extract_xland_ctx
 
 
 class RewardGeneratorProtocol(Protocol):
@@ -35,6 +47,8 @@ class RewardGeneratorProtocol(Protocol):
 
     def generate(self, env: Environment, env_params: EnvParams) -> tuple[Callable[..., Any], str]:
         """Return a dense reward function and the emitted source code."""
+
+RewardMode = Literal["dense", "sparse"]
 
 
 @dataclass
@@ -46,6 +60,8 @@ class TrainingResult:
     artifacts: Mapping[str, str]
     final_metrics: Mapping[str, float]
     emitted_reward_code: str
+    reward_mode: RewardMode = "dense"
+    ground_truth_eval: Optional[Mapping[str, Any]] = None
 
 
 # ======================
@@ -314,6 +330,131 @@ def rollout(
     final_carry = jax.lax.while_loop(_cond_fn, _body_fn, init_val=init_carry)
     return final_carry[1]
 
+
+def _load_ground_truth_series(csv_path: str):
+    steps, returns, stds = [], [], []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            steps.append(float(row["global_step"]))
+            returns.append(float(row["gt_return"]))
+            stds.append(float(row.get("gt_return_std", 0.0)))
+    if not steps:
+        return None
+    return {
+        "steps": np.asarray(steps),
+        "returns": np.asarray(returns),
+        "std": np.asarray(stds),
+    }
+
+
+def _load_summary(summary_path: str):
+    if not summary_path:
+        return None
+    with open(summary_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def plot_gt_comparison(csv_paths: Mapping[str, str], summary_paths: Mapping[str, str], out_path: str) -> Optional[str]:
+    run_series: dict[str, dict[str, np.ndarray]] = {}
+    run_summaries: dict[str, Mapping[str, Any]] = {}
+    for mode, csv_path in csv_paths.items():
+        if not csv_path or not os.path.exists(csv_path):
+            continue
+        series = _load_ground_truth_series(csv_path)
+        if series is None:
+            continue
+        run_series[mode] = series
+        summary_path = summary_paths.get(mode)
+        if summary_path and os.path.exists(summary_path):
+            run_summaries[mode] = _load_summary(summary_path)
+
+    if not run_series:
+        return None
+
+    modes = sorted(run_series.keys())
+    colors = {
+        "dense": "tab:blue",
+        "sparse": "tab:orange",
+    }
+
+    fig = plt.figure(figsize=(10, 8))
+    grid = fig.add_gridspec(2, 1, height_ratios=[3, 1])
+    ax_main = fig.add_subplot(grid[0])
+    ax_diff = fig.add_subplot(grid[1], sharex=ax_main)
+
+    for mode in modes:
+        series = run_series[mode]
+        steps = series["steps"]
+        returns = series["returns"]
+        std = series["std"]
+        color = colors.get(mode, None)
+        label = f"{mode.capitalize()} GT"
+        ax_main.plot(steps, returns, label=label, color=color)
+        if np.any(std):
+            ax_main.fill_between(steps, returns - std, returns + std, color=color, alpha=0.2)
+
+        summary = run_summaries.get(mode)
+        if summary and summary.get("max_return") is not None and summary.get("argmax_step") is not None:
+            ax_main.scatter(summary["argmax_step"], summary["max_return"], color=color, marker="o")
+            ax_main.annotate(
+                f"max {summary['max_return']:.1f}",
+                xy=(summary["argmax_step"], summary["max_return"]),
+                xytext=(5, 5),
+                textcoords="offset points",
+                color=color,
+                fontsize=8,
+            )
+
+    ax_main.set_title("Ground-truth Returns vs Environment Steps")
+    ax_main.set_ylabel("Return")
+    ax_main.legend()
+    ax_main.grid(True, alpha=0.3)
+
+    if "dense" in run_series and "sparse" in run_series:
+        dense_steps = run_series["dense"]["steps"]
+        dense_returns = run_series["dense"]["returns"]
+        sparse_steps = run_series["sparse"]["steps"]
+        sparse_returns = run_series["sparse"]["returns"]
+        shared_steps = np.intersect1d(dense_steps, sparse_steps)
+        if shared_steps.size:
+            dense_interp = np.interp(shared_steps, dense_steps, dense_returns)
+            sparse_interp = np.interp(shared_steps, sparse_steps, sparse_returns)
+            diff = dense_interp - sparse_interp
+            ax_diff.plot(shared_steps, diff, color="tab:purple", label="Dense - Sparse")
+            ax_diff.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
+            ax_diff.set_ylabel("Δ Return")
+            ax_diff.set_xlabel("Environment Steps")
+            ax_diff.grid(True, alpha=0.3)
+            ax_diff.legend()
+        else:
+            ax_diff.set_visible(False)
+    else:
+        ax_diff.set_visible(False)
+
+    if run_summaries:
+        table_lines = ["Run | Final | Max | Argmax | AUC | T_thresh"]
+        for mode in modes:
+            summary = run_summaries.get(mode)
+            if summary:
+                table_lines.append(
+                    (
+                        f"{mode:<5}| "
+                        f"{summary.get('final_return', '-')!s:<6} | "
+                        f"{summary.get('max_return', '-')!s:<6} | "
+                        f"{summary.get('argmax_step', '-')!s:<7} | "
+                        f"{summary.get('auc_ground_truth', '-')!s:<6} | "
+                        f"{summary.get('time_to_threshold', '-')!s:<8}"
+                    )
+                )
+        fig.text(0.02, 0.01, "\n".join(table_lines), fontsize=8, family="monospace")
+
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
 # ======================
 # Training
 # ======================
@@ -346,6 +487,7 @@ class TrainConfig:
     eval_num_episodes: int = 50
     eval_seed: int = 42
     train_seed: int = 42
+    gt_success_threshold: Optional[float] = None
 
     def __post_init__(self):
         num_devices = jax.local_device_count()
@@ -366,6 +508,8 @@ def make_states(
     reward_generator: RewardGeneratorProtocol,
     output_dir: str,
     ctx_fn: Optional[Callable[..., Mapping[str, Any]]] = None,
+    *,
+    reward_mode: RewardMode = "dense",
 ):
     # for learning rage scheduling
     def linear_schedule(count):
@@ -390,12 +534,21 @@ def make_states(
     example_ruleset = benchmark.get_ruleset(0)
     env_params = env_params.replace(ruleset=example_ruleset)
 
-    dense_reward, emitted_code = reward_generator.generate(env, env_params)
-    os.makedirs(output_dir, exist_ok=True)
-    dense_path = os.path.join(output_dir, "dense_reward_synthesized.py")
-    with open(dense_path, "w", encoding="utf-8") as f:
-        f.write(emitted_code)
-    env = DesparsifyRewardWrapper(env, dense_fn=dense_reward, ctx_fn=ctx_fn)
+    emitted_code = ""
+    dense_path = ""
+    ctx_fn_used = ctx_fn if reward_mode == "dense" else None
+
+    if reward_mode == "dense":
+        if reward_generator is None:
+            raise ValueError("reward_generator must be provided for dense training runs")
+        dense_reward, emitted_code = reward_generator.generate(env, env_params)
+        os.makedirs(output_dir, exist_ok=True)
+        dense_path = os.path.join(output_dir, "dense_reward_synthesized.py")
+        with open(dense_path, "w", encoding="utf-8") as f:
+            f.write(emitted_code)
+        env = DesparsifyRewardWrapper(env, dense_fn=dense_reward, ctx_fn=ctx_fn)
+    else:
+        os.makedirs(output_dir, exist_ok=True)
 
     # enabling image observations if needed
     if config.img_obs:
@@ -430,7 +583,7 @@ def make_states(
     )
     train_state = TrainState.create(apply_fn=network.apply, params=network_params, tx=tx)
 
-    return rng, env, env_params, benchmark, init_hstate, train_state, emitted_code, dense_path
+    return rng, env, env_params, benchmark, init_hstate, train_state, emitted_code, dense_path, ctx_fn_used
 
 
 def make_train(
@@ -596,8 +749,10 @@ def make_train(
                 {
                     "eval/returns_mean": eval_stats.reward.mean(0),
                     "eval/returns_median": jnp.median(eval_stats.reward),
+                    "eval/returns_std": jnp.std(eval_stats.reward),
                     "eval/ground_truth_returns_mean": eval_stats.ground_truth_reward.mean(0),
                     "eval/ground_truth_returns_median": jnp.median(eval_stats.ground_truth_reward),
+                    "eval/ground_truth_returns_std": jnp.std(eval_stats.ground_truth_reward),
                     "eval/lengths": eval_stats.length.mean(0),
                     "eval/lengths_20percentile": jnp.percentile(eval_stats.length, q=20),
                     "eval/returns_20percentile": jnp.percentile(eval_stats.reward, q=20),
@@ -627,11 +782,22 @@ def run_training_with_reward(
     ctx_fn: Optional[Callable[..., Mapping[str, Any]]] = None,
     config_override: Optional[Mapping[str, Any]] = None,
     progress_callback: Optional[Callable[[int, Mapping[str, float]], None]] = None,
+    reward_mode: RewardMode = "dense",
 ) -> TrainingResult:
     """Execute the full RL pipeline with a supplied dense reward generator."""
 
+    if reward_mode not in ("dense", "sparse"):
+        raise ValueError(f"Unsupported reward_mode '{reward_mode}'. Expected 'dense' or 'sparse'.")
+
     config_kwargs = dict(config_override or {})
     config = TrainConfig(**config_kwargs)
+
+    ctx_fn_to_use = ctx_fn
+    if reward_mode == "dense":
+        if ctx_fn_to_use is None and "XLand" in config.env_id:
+            ctx_fn_to_use = extract_xland_ctx
+    else:
+        ctx_fn_to_use = None
 
     (
         rng,
@@ -642,7 +808,14 @@ def run_training_with_reward(
         train_state,
         emitted_code,
         dense_path,
-    ) = make_states(config, reward_generator, output_dir, ctx_fn=ctx_fn)
+        ctx_fn_used,
+    ) = make_states(
+        config,
+        reward_generator,
+        output_dir,
+        ctx_fn=ctx_fn_to_use,
+        reward_mode=reward_mode,
+    )
 
     # Replicate args across devices.
     rng_devices = jax.random.split(rng, num=jax.local_device_count())
@@ -666,12 +839,15 @@ def run_training_with_reward(
     train_info = unreplicate(train_info)
     loss_info = jtu.tree_map(lambda x: jnp.asarray(x), train_info["loss_info"])
 
-    final_dense_return = float(loss_info["eval/returns_mean"][-1])
+    final_train_reward = float(loss_info["eval/returns_mean"][-1])
     final_gt_return = float(loss_info["eval/ground_truth_returns_mean"][-1])
     final_abs_gap = float(loss_info["eval/returns_abs_gap_mean"][-1])
-    print("Final dense return:", final_dense_return)
-    print("Final ground-truth return:", final_gt_return)
-    print("Final |dense-ground| mean gap:", final_abs_gap)
+    if reward_mode == "dense":
+        print("Final dense return:", final_train_reward)
+        print("Final ground-truth return:", final_gt_return)
+        print("Final |dense-ground| mean gap:", final_abs_gap)
+    else:
+        print("Final sparse (ground-truth) return:", final_gt_return)
 
     if progress_callback is not None:
         steps = loss_info["eval/returns_mean"].shape[0]
@@ -688,6 +864,30 @@ def run_training_with_reward(
     meta_updates = jnp.arange(config.num_meta_updates)
     dense_series = loss_info["eval/returns_mean"]
     gt_series = loss_info["eval/ground_truth_returns_mean"]
+    gt_std_series = loss_info.get("eval/ground_truth_returns_std")
+
+    steps_per_meta = config.num_envs * config.num_steps_per_env
+    total_meta_updates = int(meta_updates.shape[0]) if meta_updates.size else 0
+    run_id = os.path.basename(os.path.normpath(output_dir)) or "run"
+    ground_truth_rows: list[GroundTruthLogRow] = []
+    if total_meta_updates > 0:
+        for idx in range(total_meta_updates):
+            global_step = int((idx + 1) * steps_per_meta)
+            wall_time = float(train_elapsed * ((idx + 1) / total_meta_updates)) if total_meta_updates else 0.0
+            gt_return = float(gt_series[idx])
+            gt_std = float(gt_std_series[idx]) if gt_std_series is not None else 0.0
+            ground_truth_rows.append(
+                GroundTruthLogRow(
+                    run_id=run_id,
+                    reward_mode=reward_mode,
+                    global_step=global_step,
+                    episode=idx,
+                    gt_return=gt_return,
+                    gt_return_std=gt_std,
+                    wall_time=wall_time,
+                    checkpoint_path="",
+                )
+            )
 
     gt_curve_path = os.path.join(output_dir, "training_curve_ground_truth.png")
     dense_curve_path = os.path.join(output_dir, "training_curve_dense.png")
@@ -703,8 +903,9 @@ def run_training_with_reward(
     plt.close()
 
     plt.figure()
-    plt.plot(meta_updates, dense_series, label="Dense reward", color="tab:orange")
-    plt.title("Dense Eval Returns over Meta Updates")
+    dense_label = "Dense reward" if reward_mode == "dense" else "Training reward"
+    plt.plot(meta_updates, dense_series, label=dense_label, color="tab:orange")
+    plt.title(f"{dense_label} Eval Returns over Meta Updates")
     plt.xlabel("Meta Update")
     plt.ylabel("Return")
     plt.legend()
@@ -726,7 +927,7 @@ def run_training_with_reward(
     plt.plot(
         meta_updates,
         dense_series_norm,
-        label="Dense reward (normalized)",
+        label=("Dense reward (normalized)" if reward_mode == "dense" else "Training reward (normalized)"),
         linestyle="--",
     )
     plt.title("Normalized Eval Returns over Meta Updates")
@@ -736,83 +937,67 @@ def run_training_with_reward(
     plt.savefig(combined_curve_path, dpi=150)
     plt.close()
 
-    # ========== Evaluation ==========
-    from xminigrid.rendering.text_render import print_ruleset
+    metrics_csv_path = None
+    metrics_summary_path = None
+    if ground_truth_rows:
+        metrics_csv_path = dump_ground_truth_logs(output_dir, ground_truth_rows)
+        summary_payload = compute_ground_truth_summary(
+            ground_truth_rows, threshold=config.gt_success_threshold
+        )
+        summary_payload.update({
+            "run_id": run_id,
+            "reward_mode": reward_mode,
+            "threshold": config.gt_success_threshold,
+        })
+        metrics_summary_path = dump_ground_truth_summary(output_dir, summary_payload)
 
-    META_EPISODES = 10
-
-    env_local, env_params_local = xminigrid.make(config.env_id)
-    env_local = GymAutoResetWrapper(env_local)
-
-    if config.img_obs:
-        from xminigrid.experimental.img_obs import RGBImgObservationWrapper
-
-        env_local = RGBImgObservationWrapper(env_local)
-
-    ruleset = xminigrid.load_benchmark(config.benchmark_id).get_ruleset(ruleset_id=0)
-    env_params_local = env_params_local.replace(ruleset=ruleset)
-
-    params = train_info["state"].params
-    model = ActorCriticRNN(
-        num_actions=env_local.num_actions(env_params_local),
+    # ========== Evaluation via ground-truth harness ==========
+    eval_model = ActorCriticRNN(
+        num_actions=env.num_actions(env_params),
         action_emb_dim=config.action_emb_dim,
         rnn_hidden_dim=config.rnn_hidden_dim,
         rnn_num_layers=config.rnn_num_layers,
         head_hidden_dim=config.head_hidden_dim,
         img_obs=config.img_obs,
     )
-
-    apply_fn = jax.jit(model.apply)
-    reset_fn = jax.jit(env_local.reset)
-    step_fn = jax.jit(env_local.step)
-
-    total_reward, num_episodes = 0.0, 0
-    rendered_imgs = []
-
-    eval_rng = jax.random.key(1)
-    eval_rng, _rng = jax.random.split(eval_rng)
-
-    hidden = model.initialize_carry(1)
-    prev_reward = jnp.asarray(0)
-    prev_action = jnp.asarray(0)
-
-    timestep = reset_fn(env_params_local, _rng)
-    rendered_imgs.append(env_local.render(env_params_local, timestep))
-
-    while num_episodes < META_EPISODES:
-        eval_rng, _rng = jax.random.split(eval_rng)
-        dist, _, hidden = apply_fn(
-            params,
-            {
-                "observation": timestep.observation[None, None, ...],
-                "prev_action": prev_action[None, None, ...],
-                "prev_reward": prev_reward[None, None, ...],
-            },
-            hidden,
-        )
-        action = dist.sample(seed=_rng).squeeze()
-
-        timestep = step_fn(env_params_local, timestep, action)
-        prev_action = action
-        prev_reward = timestep.reward
-
-        total_reward += float(timestep.reward)
-        num_episodes += int(timestep.last())
-        rendered_imgs.append(env_local.render(env_params_local, timestep))
+    eval_cfg = GroundTruthEvalConfig(
+        env_id=config.env_id,
+        benchmark_id=config.benchmark_id,
+        num_episodes=config.eval_num_episodes,
+        seed=config.eval_seed,
+        img_obs=config.img_obs,
+        capture_video=True,
+    )
+    gt_eval_result = run_ground_truth_eval(
+        train_state=train_info["state"],
+        model=eval_model,
+        cfg=eval_cfg,
+    )
 
     rollout_path = os.path.join(output_dir, "eval_rollout.mp4")
-    print("Reward:", total_reward)
-    print("Ruleset:")
-    print_ruleset(ruleset)
-    imageio.mimsave(rollout_path, rendered_imgs, fps=16, format="mp4")
-    print(f"Saved artifacts to {output_dir}")
+    if gt_eval_result.frames:
+        imageio.mimsave(rollout_path, gt_eval_result.frames, fps=16, format="mp4")
+    else:
+        rollout_path = ""
+    print(
+        "Ground-truth eval: mean=%.4f ± %.4f over %d episodes"
+        % (gt_eval_result.mean_return, gt_eval_result.std_return, len(gt_eval_result.returns))
+    )
+
+    ground_truth_eval = {
+        "returns": gt_eval_result.returns,
+        "lengths": gt_eval_result.lengths,
+        "mean": gt_eval_result.mean_return,
+        "std": gt_eval_result.std_return,
+        "total_steps": gt_eval_result.total_steps,
+    }
 
     final_metrics = {
-        "dense_return": final_dense_return,
+        "dense_return": final_train_reward,
         "ground_truth_return": final_gt_return,
         "dense_ground_abs_gap": final_abs_gap,
-        "total_eval_reward": total_reward,
-        "num_eval_episodes": num_episodes,
+        "total_eval_reward": gt_eval_result.mean_return,
+        "num_eval_episodes": len(gt_eval_result.returns),
     }
 
     artifacts = {
@@ -821,6 +1006,10 @@ def run_training_with_reward(
         "training_curve_dense": dense_curve_path,
         "training_curve_combined": combined_curve_path,
         "eval_rollout": rollout_path,
+        "ctx_fn": "None" if ctx_fn_used is None else f"{ctx_fn_used.__module__}.{ctx_fn_used.__name__}",
+        "reward_mode": reward_mode,
+        "ground_truth_metrics_csv": "" if metrics_csv_path is None else str(metrics_csv_path),
+        "ground_truth_summary": "" if metrics_summary_path is None else str(metrics_summary_path),
     }
 
     return TrainingResult(
@@ -829,4 +1018,66 @@ def run_training_with_reward(
         artifacts=artifacts,
         final_metrics=final_metrics,
         emitted_reward_code=emitted_code,
+        reward_mode=reward_mode,
+        ground_truth_eval=ground_truth_eval,
     )
+
+
+def run_dense_and_sparse(
+    reward_generator: RewardGeneratorProtocol,
+    output_dir: str,
+    *,
+    ctx_fn: Optional[Callable[..., Mapping[str, Any]]] = None,
+    config_override: Optional[Mapping[str, Any]] = None,
+    progress_callback: Optional[Callable[[int, Mapping[str, float]], None]] = None,
+    compare_dense_vs_sparse: bool = False,
+    default_reward_mode: RewardMode = "dense",
+) -> list[TrainingResult]:
+    """Run one or two training jobs sequentially depending on the compare flag.
+
+    When ``compare_dense_vs_sparse`` is True, runs the dense configuration first and
+    the sparse baseline second, writing each run into ``output_dir/<mode>``.
+    Otherwise runs a single job using ``default_reward_mode`` and writes to
+    ``output_dir`` directly (preserving legacy behavior).
+    """
+
+    if default_reward_mode not in ("dense", "sparse"):
+        raise ValueError(
+            f"Unsupported default_reward_mode '{default_reward_mode}'. Expected 'dense' or 'sparse'."
+        )
+
+    reward_modes: Sequence[RewardMode]
+    if compare_dense_vs_sparse:
+        reward_modes = ("dense", "sparse")
+    else:
+        reward_modes = (default_reward_mode,)
+
+    multi_run = len(reward_modes) > 1
+    results: list[TrainingResult] = []
+    for mode in reward_modes:
+        mode_output_dir = os.path.join(output_dir, mode) if multi_run else output_dir
+        result = run_training_with_reward(
+            reward_generator,
+            output_dir=mode_output_dir,
+            ctx_fn=ctx_fn,
+            config_override=config_override,
+            progress_callback=progress_callback,
+            reward_mode=mode,
+        )
+        results.append(result)
+
+    if multi_run:
+        csv_paths = {}
+        summary_paths = {}
+        for result in results:
+            csv_path = result.artifacts.get("ground_truth_metrics_csv")
+            summary_path = result.artifacts.get("ground_truth_summary")
+            csv_paths[result.reward_mode] = csv_path
+            summary_paths[result.reward_mode] = summary_path
+        comparison_plot_path = os.path.join(output_dir, "plots", "dense_vs_sparse_gt.png")
+        plotted = plot_gt_comparison(csv_paths, summary_paths, comparison_plot_path)
+        if plotted:
+            for result in results:
+                result.artifacts["dense_vs_sparse_gt_plot"] = plotted
+
+    return results

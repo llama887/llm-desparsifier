@@ -55,7 +55,19 @@ except Exception as e:
     print("ldd failed:", e)
 PY
 
-# Run training
+# Run training (dense vs sparse comparison by default)
 OUTPUT_DIR="${OUTPUT_DIR:-$PWD/artifacts/runs/${SLURM_JOB_ID}}"
 mkdir -p "$OUTPUT_DIR"
-uv run python xland_meta_learning_baseline.py --output-dir "$OUTPUT_DIR"
+
+COMPARE_DENSE_VS_SPARSE=${COMPARE_DENSE_VS_SPARSE:-1}
+REWARD_MODE=${REWARD_MODE:-dense}
+
+COMPARE_FLAG=()
+if [[ "$COMPARE_DENSE_VS_SPARSE" == "1" ]]; then
+  COMPARE_FLAG+=("--compare-dense-vs-sparse")
+fi
+
+uv run xland_meta_learning_baseline.py \
+  --output-dir "$OUTPUT_DIR" \
+  --reward-mode "$REWARD_MODE" \
+  "${COMPARE_FLAG[@]}"
