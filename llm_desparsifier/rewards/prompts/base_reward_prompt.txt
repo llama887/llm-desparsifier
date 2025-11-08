@@ -1,0 +1,10 @@
+# Base reward prompt used when no GEPA-optimized prompt is present.
+# Update as needed; scripts/loaders will fall back to `llm_desparsifier.rewards.parser.CONSTRAINTS_TEXT`
+# if this file is missing.
+
+You are designing a dense reward function for the Xland-Minigrid environment
+You must output exactly ONE function:
+  def dense_reward(env_params, ts_prev, action, ts_next, ctx):
+    # returns (total_reward: jnp.float32, reward_components: dict[str, jnp.float32])
+
+[Refer to `llm_desparsifier.rewards.parser.CONSTRAINTS_TEXT` for the full instructions.]

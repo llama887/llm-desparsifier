@@ -57,7 +57,7 @@ class DesparsifyRewardWrapper:
     def _unwrap(self, ts):
         return ts.base if isinstance(ts, RewardTimeStep) else ts
 
-    def _augment_extras(self, ts, original_reward, dense_reward):
+    def _augment_extras(self, ts, original_reward, dense_reward, reward_components):
         source = ts.extras if isinstance(ts, RewardTimeStep) else getattr(ts, "extras", None)
         if source is not None:
             extras = source
@@ -80,10 +80,16 @@ class DesparsifyRewardWrapper:
             extras_out = {}
         extras_out["ground_truth_reward"] = original_reward
         extras_out["dense_reward"] = dense_reward
+        if reward_components is not None:
+            extras_out["reward_components"] = (
+                reward_components
+                if isinstance(reward_components, FrozenDict)
+                else freeze(reward_components)
+            )
         return freeze(extras_out)
 
-    def _wrap_timestep(self, ts, original_reward, dense_reward):
-        extras = self._augment_extras(ts, original_reward, dense_reward)
+    def _wrap_timestep(self, ts, original_reward, dense_reward, reward_components=None):
+        extras = self._augment_extras(ts, original_reward, dense_reward, reward_components)
         if hasattr(ts, "replace"):
             base = ts.replace(reward=dense_reward)
         else:
@@ -106,13 +112,24 @@ class DesparsifyRewardWrapper:
             ctx = extras if extras is not None else {}
 
         if self._dense_nargs == 3:
-            r_dense = self.dense_fn(ts, action, ts_next)
+            dense_output = self.dense_fn(ts, action, ts_next)
         elif self._dense_nargs == 5:
-            r_dense = self.dense_fn(env_params, ts, action, ts_next, ctx)
+            dense_output = self.dense_fn(env_params, ts, action, ts_next, ctx)
         else:  # fallback: keep sparse reward
-            r_dense = ts_next.reward
+            dense_output = ts_next.reward
 
-        return self._wrap_timestep(ts_next, original_reward, r_dense)
+        dense_reward, reward_components = self._extract_reward_output(dense_output)
+        return self._wrap_timestep(ts_next, original_reward, dense_reward, reward_components)
+
+    def _extract_reward_output(self, dense_output):
+        reward_components = None
+        if isinstance(dense_output, tuple) and len(dense_output) == 2:
+            dense_reward, reward_components = dense_output
+            if reward_components is not None and not isinstance(reward_components, Mapping):
+                raise TypeError("reward_components must be a mapping of component_name -> value")
+        else:
+            dense_reward = dense_output
+        return dense_reward, reward_components
 
     def num_actions(self, env_params):
         return self.env.num_actions(env_params)

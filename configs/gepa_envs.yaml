@@ -1,0 +1,14 @@
+# Default batch of environments for GEPA data collection.
+jobs:
+  - name: trivial-r4-seed0
+    env_id: XLand-MiniGrid-R4-9x9
+    benchmark_id: trivial-1m
+    total_timesteps: 1000000
+    train_seed: 0
+    eval_seed: 0
+  - name: trivial-r6-seed1
+    env_id: XLand-MiniGrid-R6-9x9
+    benchmark_id: trivial-1m
+    total_timesteps: 1000000
+    train_seed: 1
+    eval_seed: 1

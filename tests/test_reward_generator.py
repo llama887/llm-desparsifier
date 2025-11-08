@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import jax.numpy as jnp
+
 from llm_desparsifier.rewards.generator import RewardGenerator
 
 
@@ -9,7 +11,12 @@ class _DummySynth:
     def __call__(self, env_description: str, constraints: str) -> str:
         self.env_description = env_description
         self.constraints = constraints
-        return "def dense_reward(env_params, ts_prev, action, ts_next, ctx):\n    return 1.0\n"
+        return (
+            "def dense_reward(env_params, ts_prev, action, ts_next, ctx):\n"
+            "    progress = jnp.asarray(0.0, dtype=jnp.float32)\n"
+            "    reward_components = {'progress': progress}\n"
+            "    return progress, reward_components\n"
+        )
 
 
 class _TestableRewardGenerator(RewardGenerator):
@@ -30,7 +37,7 @@ def test_reward_generator_invokes_components():
         captured["code"] = code
 
         def dense_reward(*_args, **_kwargs):
-            return 42
+            return 42.0, {"progress": 42.0}
 
         return dense_reward
 
@@ -47,4 +54,4 @@ def test_reward_generator_invokes_components():
     assert emitted == captured["code"]
     assert synth.env_description == "env description"
     assert "dense_reward" in emitted
-    assert dense_fn(None, None, None, None, {}) == 42
+    assert dense_fn(None, None, None, None, {})[0] == 42.0

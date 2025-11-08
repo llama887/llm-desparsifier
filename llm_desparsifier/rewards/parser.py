@@ -150,7 +150,7 @@ CONSTRAINTS_TEXT = """
 You are designing a dense reward function for the Xland-Minigrid environment
 You must output exactly ONE function:
   def dense_reward(env_params, ts_prev, action, ts_next, ctx):
-    # returns a scalar jnp.float32
+    # returns (total_reward: jnp.float32, reward_components: dict[str, jnp.float32])
 
 Context:
 - The function will be installed as `dense_fn` inside `DesparsifyRewardWrapper` (see snippet below) and invoked either with three args `(ts_prev, action, ts_next)` or the five-arg signature shown above. Always implement the five-arg form; the wrapper detects it via `inspect.signature`.
@@ -158,17 +158,20 @@ Context:
     - `ts_prev.state` / `ts_next.state` expose the full grid (`grid` shaped `[height, width, 2]` with `(tile_id, color_id)`), the agent (`agent.position` as zero-based `[row, col]`, `agent.direction` in {0: up, 1: right, 2: down, 3: left}, and `agent.pocket`), plus goal and rule encodings.
     - We commonly precompute arrays such as `ctx["agent_pos_prev"] = ts_prev.state.agent.position`, `ctx["agent_pos"] = ts_next.state.agent.position`, object positions extracted from the grid (e.g., `ctx["yellow_square_pos"]`), boolean masks (`ctx["has_key"]`), or scalar distances between entities. Every value is a `jnp` array (often `jnp.int32` positions or `jnp.float32` distances).
     - When no `ctx_fn` is provided the wrapper hands you `{}`; your code must therefore tolerate missing keys and supply reasonable defaults via `ctx.get("name", fallback)`.
-- When the wrapper runs, it replaces the environment's sparse reward with your dense value: `ts_next = env.step(...)`, then `dense_reward` is called and its output stored in `ts_next.reward`.
+- When the wrapper runs, it replaces the environment's sparse reward with your dense value: `ts_next = env.step(...)`, `dense_reward` executes, and the wrapper expects a tuple `(total_reward, reward_components)`.
+- `reward_components` MUST be a Python dict literal whose keys are descriptive strings (`"progress"`, `"penalty"`, `"shaping"`, etc.) and whose values are scalar jnp arrays produced in the same function. These components will be logged individually for EUREKA reward reflection.
 - Existing placeholder reward (for reference only):
 
 ```python
-def dummy_dense_reward(ts_prev, action, ts_next):
-    ones = jnp.ones_like(ts_next.reward)
+def dummy_dense_reward(env_params, ts_prev, action, ts_next, ctx):
     zeros = jnp.full_like(ts_next.reward, 0.0)
-    return jnp.where(ts_next.last() > 0, zeros, zeros)
+    reward_components = {
+        "progress": zeros,
+        "penalty": zeros,
+    }
+    return zeros, reward_components
 ```
 
-Rules:
 - Use ONLY jax.numpy as jnp (import not needed) and jax.lax if necessary.
 - Do NOT add import statements; jnp and jax are already available.
 - Use ONLY values in 'ctx' (e.g., ctx['agent_pos'], ctx['goal_pos'], ctx['has_key'], distances).
@@ -179,7 +182,7 @@ Rules:
 - The function must be pure and JIT-friendly: no Python branching on array values; use jnp.where / lax.cond.
 - Reward should be shaped dense potential: make partial progress yield **positive** rewards (e.g., `potential - potential_prev`), and penalize regress/idle steps; small per-step penalty ok.
 - Must gracefully handle episode termination: set to 0 after terminal or add a success bonus that is consistent with sparse=1.
-- Return jnp.asarray(<scalar>, dtype=jnp.float32).
+- Build `reward_components = {"name": component_value, ...}` (string keys only) and return `(total_reward, reward_components)`.
 
 YOU MUST WRITE VALID JITTABLE JAX CODE
 """
