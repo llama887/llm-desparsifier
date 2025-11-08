@@ -1,7 +1,10 @@
-# file: reward_wrapper.py
-from dataclasses import replace as _py_replace
+"""Environment wrappers for integrating dense rewards."""
+
+from __future__ import annotations
+
 import inspect
 from collections.abc import Mapping
+from dataclasses import replace as _py_replace
 
 from flax import struct
 
@@ -19,7 +22,7 @@ except ImportError:  # pragma: no cover - flax always available during training
 
 @struct.dataclass
 class RewardTimeStep(struct.PyTreeNode):
-    """Wrapper that keeps the original dm_env.TimeStep immutable but adds extras."""
+    """Keeps the original dm_env.TimeStep immutable while attaching extras."""
 
     base: object
     extras: Mapping = struct.field(default_factory=dict)
@@ -32,19 +35,23 @@ class RewardTimeStep(struct.PyTreeNode):
     def __getattr__(self, name):
         return getattr(self.base, name)
 
+
 class DesparsifyRewardWrapper:
-    """Overwrite env reward with a dense heuristic but keep the original env API."""
+    """Overwrite env rewards with dense functions while preserving the env API."""
+
     def __init__(self, env, dense_fn, ctx_fn=None):
         """
-        dense_fn: fn(ts_prev, action, ts_next) or fn(env_params, ts_prev, action, ts_next, ctx)
-        ctx_fn: optional fn(env_params, ts_prev, ts_next) -> dict[str, jax.Array]
-                Must be JAX-compatible if used under jit/vmap.
+        Args:
+            env: Base environment following the dm_env API.
+            dense_fn: Callable with signature
+                `(ts_prev, action, ts_next)` or
+                `(env_params, ts_prev, action, ts_next, ctx)`.
+            ctx_fn: Optional callable returning a context dict from
+                `(env_params, ts_prev, ts_next)`. Must be JAX-compatible if used under jit/vmap.
         """
         self.env = env
         self.dense_fn = dense_fn
         self.ctx_fn = ctx_fn
-
-        # detect arity once (jit-friendly)
         self._dense_nargs = len(inspect.signature(dense_fn).parameters)
 
     def _unwrap(self, ts):
@@ -98,18 +105,15 @@ class DesparsifyRewardWrapper:
             extras = getattr(ts_next, "extras", None)
             ctx = extras if extras is not None else {}
 
-        # Call the user/LLM reward in a way that preserves JIT traces.
         if self._dense_nargs == 3:
             r_dense = self.dense_fn(ts, action, ts_next)
         elif self._dense_nargs == 5:
             r_dense = self.dense_fn(env_params, ts, action, ts_next, ctx)
-        else:
-            # Safe fallback – keep env reward (sparse) rather than crash inside jit
+        else:  # fallback: keep sparse reward
             r_dense = ts_next.reward
 
         return self._wrap_timestep(ts_next, original_reward, r_dense)
 
-    # Convenience passthroughs
     def num_actions(self, env_params):
         return self.env.num_actions(env_params)
 
@@ -123,10 +127,4 @@ class DesparsifyRewardWrapper:
         return getattr(self.env, name)
 
 
-
-import jax.numpy as jnp
-
-def dummy_dense_reward(ts_prev, action, ts_next):
-    ones = jnp.ones_like(ts_next.reward)
-    zeros = jnp.full_like(ts_next.reward, 0.0)
-    return jnp.where(ts_next.last() > 0, zeros, zeros)
+__all__ = ["RewardTimeStep", "DesparsifyRewardWrapper"]
