@@ -15,4 +15,4 @@ export JAX_PLATFORMS=cpu
 STATE_ROOT="${STATE_ROOT:-$PWD/artifacts/gepa_state}"
 
 uv sync
-uv run python scripts/run_gepa_opt.py --state-root "$STATE_ROOT"
+uv run scripts/run_gepa_opt.py --state-root "$STATE_ROOT"

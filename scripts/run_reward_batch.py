@@ -174,6 +174,9 @@ def run_batch() -> None:
     }
 
     reward_generator = build_reward_generator(constraints_text, synthesizer_state)
+    failure_dir = iteration_dir / "failed_rewards"
+    failure_dir.mkdir(exist_ok=True)
+    reward_generator.failure_artifact_dir = failure_dir
     reflection_module = create_reward_reflection_module()
 
     with dataset_path.open("w", encoding="utf-8") as dataset_file:

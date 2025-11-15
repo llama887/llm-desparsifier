@@ -56,6 +56,8 @@ This job:
 3. Loads environment specs from `configs/gepa_envs.yaml` and runs each job with dense rewards only.
 4. Logs `train_dense.jsonl`, `metadata.json`, and `ready_for_gepa` in a fresh `iter-*/` directory.
 
+> **Cold start:** When the state directory is empty, run the GPU batch first. It seeds `active_prompt.json` with the default prompt and produces the initial dataset that GEPA needs. Subsequent iterations alternate GPU → CPU.
+
 ### CPU Batch (GEPA Optimization)
 ```
 sbatch sbatch/gepa_opt.s
