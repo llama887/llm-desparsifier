@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=gepa_dense_batch
+#SBATCH --job-name=reward_dense_batch
 #SBATCH --account=pr_100_tandon_priority
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G

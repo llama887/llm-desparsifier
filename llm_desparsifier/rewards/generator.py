@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import dspy
+import jax.numpy as jnp
 
 from llm_desparsifier.rewards.llm_client import configure_portkey_lm
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT, describe_ruleset
@@ -81,6 +82,7 @@ class RewardGenerator:
 
             try:
                 dense_fn = self.sanitize_fn(code)
+                self._run_smoke_test(dense_fn)
             except ValueError as exc:
                 error_text = f"{exc.__class__.__name__}: {exc}"
                 timestamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -102,6 +104,52 @@ class RewardGenerator:
 
         # This line is unreachable, but satisfies type checkers.
         raise RuntimeError("Reward generation loop exited unexpectedly")
+
+    def _run_smoke_test(self, dense_fn: Callable) -> None:
+        """Execute a minimal, eager reward call to catch obvious runtime errors.
+
+        The test is intentionally lightweight (single call, small tensors) to avoid
+        noticeable overhead. Any exception is converted to ValueError so it enters
+        the existing retry path.
+        """
+
+        class _SmokeTimeStep:
+            def __init__(self):
+                self.reward = jnp.asarray(0.0)
+                self.observation = jnp.zeros((1, 1, 1))
+
+            def last(self):
+                return False
+
+        dummy_env_params = type("DummyEnvParams", (), {
+            "height": 1,
+            "width": 1,
+            "view_size": 1,
+            "max_steps": 1,
+            "ruleset": None,
+        })()
+
+        ts_prev = _SmokeTimeStep()
+        ts_next = _SmokeTimeStep()
+        action = jnp.asarray(0, dtype=jnp.int32)
+        ctx = {
+            "agent_pos": jnp.asarray([0, 0]),
+            "agent_direction": jnp.asarray(0),
+            "step_num": jnp.asarray(0),
+            "is_carrying": jnp.asarray(0),
+            "carried_item": jnp.asarray(-1),
+            "yellow_square_pos": jnp.asarray([0, 0]),
+            "green_ball_pos": jnp.asarray([1, 0]),
+            "object_positions": {
+                "yellow_square": jnp.asarray([0, 0]),
+                "green_ball": jnp.asarray([1, 0]),
+            },
+        }
+
+        try:
+            dense_fn(dummy_env_params, ts_prev, action, ts_next, ctx)
+        except Exception as exc:
+            raise ValueError(f"Smoke test failed: {exc}") from exc
 
     def _build_feedback_block(self, attempts: List[_AttemptRecord]) -> str:
         if not attempts:

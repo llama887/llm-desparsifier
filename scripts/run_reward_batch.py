@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -184,12 +185,44 @@ def run_batch() -> None:
             print(f"[run_reward_batch] Starting job {job.name} ({job.env_id})")
             job_output_dir = iteration_dir / "runs" / job.name
             job_output_dir.mkdir(parents=True, exist_ok=True)
-            result = run_training_with_reward(
-                reward_generator,
-                output_dir=str(job_output_dir),
-                config_override=job.to_config(),
-                reward_mode="dense",
-            )
+
+            result = None
+            for attempt_idx in range(1, reward_generator.max_sanitize_attempts + 1):
+                try:
+                    result = run_training_with_reward(
+                        reward_generator,
+                        output_dir=str(job_output_dir),
+                        config_override=job.to_config(),
+                        reward_mode="dense",
+                    )
+                    break
+                except Exception:
+                    err_text = traceback.format_exc()
+                    timestamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                    prefix = f"runtime-{job.name}-attempt{attempt_idx:02d}-{timestamp}"
+
+                    dense_path = job_output_dir / "dense_reward_synthesized.py"
+                    if dense_path.exists():
+                        try:
+                            (failure_dir / f"{prefix}.py").write_text(dense_path.read_text(), encoding="utf-8")
+                        except Exception:
+                            pass
+                    try:
+                        (failure_dir / f"{prefix}.err.txt").write_text(err_text, encoding="utf-8")
+                    except Exception:
+                        pass
+
+                    print(
+                        f"[run_reward_batch] Runtime failure on job {job.name} attempt {attempt_idx}: "
+                        f"see failed_rewards/{prefix}.*"
+                    )
+                    if attempt_idx >= reward_generator.max_sanitize_attempts:
+                        print(f"[run_reward_batch] Giving up on job {job.name} after {attempt_idx} attempts")
+                        break
+
+            if result is None:
+                continue
+
             row = build_dataset_row(job, result)
             row["reflection_text"] = build_reward_reflection(row, reflection_module=reflection_module)
             dataset_file.write(json.dumps(row) + "\n")
