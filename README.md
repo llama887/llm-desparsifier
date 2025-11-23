@@ -35,37 +35,22 @@ Environment variables:
 The script automatically sets `XLAND_MINIGRID_DATA` and `XDG_CACHE_HOME` inside the job and uses `uv run` for every invocation.
 
 ## GEPA Automation Workflow
-The GEPA loop runs as two alternating SLURM jobs that read/write shared state under `artifacts/gepa_state`.
+GEPA now runs on-policy inside a single job. For each GEPA candidate prompt, we run the existing RL training loop (same budget as before), capture the achieved reward plus Eureka-style reflection, and let GEPA mutate the prompt immediately—no intermediate JSONL datasets or marker files.
 
 ### State Layout
-- `active_prompt.json`: current `RewardSynthesizer` state (`constraints_text` + DSPy predictor dump). GPU jobs load this automatically.
-- `iter-<timestamp>/runs/<job_name>`: per-environment training artifacts, identical to the single-run outputs.
-- `iter-<timestamp>/train_dense.jsonl`: JSONL dataset containing env description, reward code, sparse-return curves, component curves, and reflection text for each job.
-- `iter-<timestamp>/metadata.json`: provenance info (prompt source, env grid, timestamps).
-- Marker files:
-  - `ready_for_gepa`: GPU batch finished logging and dataset is ready.
-  - `prompt_ready`: GEPA optimization finished and wrote `optimized_prompt.json` for that iteration.
+- `active_prompt.json`: current `RewardSynthesizer` state (`constraints_text` + DSPy predictor dump). Jobs load and overwrite this atomically.
+- `gepa_runs/`: per-candidate training artifacts written during a GEPA session (one subdir per candidate).
+- `gepa_runs/gepa_stats.json`: DSPy GEPA stats from the latest session.
 
-### GPU Batch (Dense Training)
+### Run it
 ```
 sbatch sbatch/train_dense_batch.s
 ```
 This job:
 1. Syncs dependencies, sets cache directories, and determines `STATE_ROOT` (defaults to `artifacts/gepa_state`).
-2. Reads `active_prompt.json` (or the fallback base prompt) to seed the `RewardGenerator`.
-3. Loads environment specs from `configs/gepa_envs.yaml` and runs each job with dense rewards only.
-4. Logs `train_dense.jsonl`, `metadata.json`, and `ready_for_gepa` in a fresh `iter-*/` directory.
+2. Loads `active_prompt.json` (or the base prompt) to seed the reward synthesizer.
+3. Loads environment specs from `configs/gepa_envs.yaml`.
+4. Invokes GEPA; each candidate prompt is evaluated by running the full RL training/eval loop with the same budget as before. Feedback comes from `build_reward_reflection` on the candidate’s own rollout.
+5. Writes the updated prompt to `active_prompt.json` and logs GEPA stats under `gepa_runs/`.
 
-> **Cold start:** When the state directory is empty, run the GPU batch first. It seeds `active_prompt.json` with the default prompt and produces the initial dataset that GEPA needs. Subsequent iterations alternate GPU → CPU.
-
-### CPU Batch (GEPA Optimization)
-```
-sbatch sbatch/gepa_opt.s
-```
-This job:
-1. Forces `JAX_PLATFORMS=cpu`, syncs dependencies, and points at the same `STATE_ROOT`.
-2. Finds the latest iteration with `ready_for_gepa` but no `prompt_ready` and loads its dataset.
-3. Builds DSPy examples with sparse-return curves + reflection text, then runs `dspy.GEPA` using `o3-mini` via Portkey for both the program LM and reflection LM.
-4. Writes the optimized synthesizer state to `active_prompt.json` (atomic swap) and `iter-*/optimized_prompt.json`, then touches `prompt_ready`.
-
-Repeat the two sbatch commands to iterate on prompts without any manual copying. The GPU job always consumes the newest optimized prompt; the CPU job always optimizes the newest dataset.
+Repeat the single sbatch command to iterate on prompts; the job always consumes the latest `active_prompt.json` and replaces it with the newly optimized state.

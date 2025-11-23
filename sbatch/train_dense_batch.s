@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=reward_dense_batch
+#SBATCH --job-name=gepa_onpolicy
 #SBATCH --account=pr_100_tandon_priority
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:rtx8000:1
-#SBATCH --time=01:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 

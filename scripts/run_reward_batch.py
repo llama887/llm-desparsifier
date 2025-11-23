@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
-"""Run dense-only training for a batch of environments and log GEPA datasets."""
+"""Run integrated GEPA prompt optimization with on-policy RL training.
+
+This replaces the previous two-job pipeline (dataset writer + offline GEPA
+optimizer). GEPA now proposes reward prompts, we evaluate them with the
+existing RL training loop (same budget as before), and feed live rewards +
+Eureka-style reflections back into GEPA. No intermediate JSONL datasets or
+marker files are produced.
+"""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import itertools
 import json
-import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
+import dspy
 import numpy as np
 import yaml
 
 from llm_desparsifier.rewards import (
-    RewardGenerator,
     RewardSynthesizer,
     build_reward_reflection,
     create_reward_reflection_module,
+    sanitize_and_compile,
+    configure_portkey_lm,
 )
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT
 from llm_desparsifier.rl.pipeline import TrainingResult, run_training_with_reward
-from llm_desparsifier.utils import get_active_prompt_path
+from llm_desparsifier.utils import get_active_prompt_path, write_active_prompt
 
 DEFAULT_ENV_GRID = Path("configs/gepa_envs.yaml")
 BASE_PROMPT_PATH = Path("llm_desparsifier/rewards/prompts/base_reward_prompt.txt")
@@ -60,18 +69,24 @@ class EnvJob:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run dense reward batch and log GEPA dataset")
+    parser = argparse.ArgumentParser(description="Run GEPA with on-policy RL evaluation")
     parser.add_argument(
         "--state-root",
         type=Path,
         required=True,
-        help="Directory for shared GEPA state (active prompt, iteration folders)",
+        help="Directory for shared GEPA state (active prompt, optimizer logs)",
     )
     parser.add_argument(
         "--env-grid",
         type=Path,
         default=DEFAULT_ENV_GRID,
         help="YAML file describing environment jobs (default: configs/gepa_envs.yaml)",
+    )
+    parser.add_argument(
+        "--gepa-auto",
+        choices=["light", "medium", "heavy"],
+        default="light",
+        help="DSPy GEPA auto budget (controls mutation/eval counts)",
     )
     return parser.parse_args()
 
@@ -107,21 +122,6 @@ def load_prompt_payload(state_root: Path) -> tuple[str, Optional[Dict[str, Any]]
     return CONSTRAINTS_TEXT, None, {"source": "default_constraints"}
 
 
-def build_reward_generator(constraints_text: str, synthesizer_state: Optional[Dict[str, Any]]) -> RewardGenerator:
-    synthesizer = RewardSynthesizer()
-    if synthesizer_state:
-        synthesizer.gen.load_state(synthesizer_state)
-    return RewardGenerator(constraints_text=constraints_text, synthesizer=synthesizer, verbose=False)
-
-
-def create_iteration_directory(state_root: Path) -> Path:
-    timestamp = dt.datetime.utcnow().strftime("iter-%Y%m%d-%H%M%S")
-    iteration_dir = state_root / timestamp
-    iteration_dir.mkdir(parents=True, exist_ok=False)
-    (iteration_dir / "runs").mkdir(exist_ok=True)
-    return iteration_dir
-
-
 def to_float_list(value: Any) -> List[float]:
     if value is None:
         return []
@@ -150,88 +150,125 @@ def build_dataset_row(job: EnvJob, result: TrainingResult) -> Dict[str, Any]:
     }
 
 
-def write_metadata(iteration_dir: Path, metadata: Mapping[str, Any]) -> None:
-    metadata_path = iteration_dir / "metadata.json"
-    with metadata_path.open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2, sort_keys=True)
+class RewardPromptProgram(dspy.Module):
+    """DSPy module that synthesizes reward code from env description + constraints."""
+
+    def __init__(self, constraints_text: str, synthesizer_state: Optional[Mapping[str, Any]] = None):
+        super().__init__()
+        self.constraints_text = constraints_text
+        self.synthesizer = RewardSynthesizer()
+        if synthesizer_state:
+            self.synthesizer.gen.load_state(synthesizer_state)
+
+    def forward(self, env_description: str, constraints: Optional[str] = None):
+        text = constraints or self.constraints_text
+        reward_code = self.synthesizer(env_description=env_description, constraints=text)
+        return dspy.Prediction(reward_code=reward_code)
+
+
+class StaticRewardGenerator:
+    """Reward generator that uses pre-baked reward code (no LLM calls)."""
+
+    def __init__(self, reward_code: str):
+        self.reward_code = reward_code
+
+    def generate(self, env, env_params):
+        dense_fn = sanitize_and_compile(self.reward_code)
+        return dense_fn, self.reward_code
+
+
+def build_examples(jobs: List[EnvJob], constraints_text: str) -> List[dspy.Example]:
+    examples: List[dspy.Example] = []
+    for job in jobs:
+        desc = f"{job.env_id} | benchmark={job.benchmark_id}"
+        ex = dspy.Example(env_description=desc, constraints=constraints_text).with_inputs(
+            "env_description", "constraints"
+        )
+        cfg = job.to_config()
+        cfg["name"] = job.name
+        ex.job_config = cfg
+        ex.job_name = job.name
+        examples.append(ex)
+    return examples
 
 
 def run_batch() -> None:
     args = parse_args()
     state_root = args.state_root.expanduser().resolve()
     state_root.mkdir(parents=True, exist_ok=True)
+    logs_root = state_root / "gepa_runs"
+    logs_root.mkdir(exist_ok=True)
+
     env_grid_path = args.env_grid.expanduser().resolve()
     jobs = load_env_jobs(env_grid_path)
+
     constraints_text, synthesizer_state, prompt_meta = load_prompt_payload(state_root)
-    iteration_dir = create_iteration_directory(state_root)
-    dataset_path = iteration_dir / "train_dense.jsonl"
-
-    metadata = {
-        "iteration_dir": str(iteration_dir),
-        "created_at_utc": dt.datetime.utcnow().isoformat(timespec="seconds"),
-        "env_grid_path": str(env_grid_path),
-        "prompt": prompt_meta,
-        "jobs": [job.__dict__ for job in jobs],
-    }
-
-    reward_generator = build_reward_generator(constraints_text, synthesizer_state)
-    failure_dir = iteration_dir / "failed_rewards"
-    failure_dir.mkdir(exist_ok=True)
-    reward_generator.failure_artifact_dir = failure_dir
     reflection_module = create_reward_reflection_module()
 
-    with dataset_path.open("w", encoding="utf-8") as dataset_file:
-        for job in jobs:
-            print(f"[run_reward_batch] Starting job {job.name} ({job.env_id})")
-            job_output_dir = iteration_dir / "runs" / job.name
-            job_output_dir.mkdir(parents=True, exist_ok=True)
+    # Configure LM once; reuse for program + reflection.
+    base_lm = configure_portkey_lm()
+    dspy.configure(lm=base_lm)
 
-            result = None
-            for attempt_idx in range(1, reward_generator.max_sanitize_attempts + 1):
-                try:
-                    result = run_training_with_reward(
-                        reward_generator,
-                        output_dir=str(job_output_dir),
-                        config_override=job.to_config(),
-                        reward_mode="dense",
-                    )
-                    break
-                except Exception:
-                    err_text = traceback.format_exc()
-                    timestamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-                    prefix = f"runtime-{job.name}-attempt{attempt_idx:02d}-{timestamp}"
+    program = RewardPromptProgram(constraints_text, synthesizer_state)
+    examples = build_examples(jobs, constraints_text)
+    trainset = valset = examples  # on-policy: no static holdout
 
-                    dense_path = job_output_dir / "dense_reward_synthesized.py"
-                    if dense_path.exists():
-                        try:
-                            (failure_dir / f"{prefix}.py").write_text(dense_path.read_text(), encoding="utf-8")
-                        except Exception:
-                            pass
-                    try:
-                        (failure_dir / f"{prefix}.err.txt").write_text(err_text, encoding="utf-8")
-                    except Exception:
-                        pass
+    run_counter = itertools.count(1)
 
-                    print(
-                        f"[run_reward_batch] Runtime failure on job {job.name} attempt {attempt_idx}: "
-                        f"see failed_rewards/{prefix}.*"
-                    )
-                    if attempt_idx >= reward_generator.max_sanitize_attempts:
-                        print(f"[run_reward_batch] Giving up on job {job.name} after {attempt_idx} attempts")
-                        break
+    def on_policy_metric(example: dspy.Example, prediction: dspy.Prediction, *_):
+        """Evaluate a GEPA candidate by running the full RL loop (existing budget)."""
+        reward_code = getattr(prediction, "reward_code", "")
+        failsafe_score = 0.0
+        if not reward_code.strip():
+            return dspy.Prediction(score=failsafe_score, feedback="Empty reward code")
 
-            if result is None:
-                continue
+        candidate_id = next(run_counter)
+        run_dir = logs_root / f"candidate-{candidate_id:04d}-{getattr(example, 'job_name', 'env')}"
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-            row = build_dataset_row(job, result)
-            row["reflection_text"] = build_reward_reflection(row, reflection_module=reflection_module)
-            dataset_file.write(json.dumps(row) + "\n")
-            dataset_file.flush()
-            print(f"[run_reward_batch] Finished job {job.name}")
+        try:
+            reward_generator = StaticRewardGenerator(reward_code)
+            job_cfg = getattr(example, "job_config", {}) or {}
+            train_cfg = {k: v for k, v in job_cfg.items() if k != "name"}
+            result = run_training_with_reward(
+                reward_generator,
+                output_dir=str(run_dir),
+                config_override=train_cfg,
+                reward_mode="dense",
+            )
+            row = build_dataset_row(
+                EnvJob.from_mapping(candidate_id, job_cfg),
+                result,
+            )
+            reflection = build_reward_reflection(row, reflection_module=reflection_module)
+            sparse_curve = row.get("sparse_return_curve") or []
+            final_return = float(sparse_curve[-1]) if sparse_curve else 0.0
+            return dspy.Prediction(score=final_return, feedback=reflection)
+        except Exception as exc:
+            return dspy.Prediction(score=failsafe_score, feedback=f"Training failed: {exc}")
 
-    write_metadata(iteration_dir, metadata)
-    (iteration_dir / "ready_for_gepa").touch()
-    print(f"[run_reward_batch] Wrote dataset to {dataset_path}")
+    compiler = dspy.GEPA(
+        metric=on_policy_metric,
+        auto=args.gepa_auto,
+        reflection_lm=base_lm,
+        track_stats=True,
+    )
+
+    optimized_program = compiler.compile(program, trainset=trainset, valset=valset)
+
+    prompt_payload = {
+        "constraints_text": constraints_text,
+        "synthesizer_state": optimized_program.synthesizer.gen.dump_state(),
+        "updated_at": dt.datetime.utcnow().isoformat(timespec="seconds"),
+        "source": prompt_meta,
+    }
+    write_active_prompt(state_root, prompt_payload)
+
+    stats_path = logs_root / "gepa_stats.json"
+    stats_path.write_text(json.dumps(getattr(compiler, "stats", {}), indent=2, sort_keys=True), encoding="utf-8")
+
+    print(f"[run_reward_batch] GEPA completed. Active prompt updated at {get_active_prompt_path(state_root)}")
+    print(f"[run_reward_batch] GEPA stats written to {stats_path}")
 
 
 if __name__ == "__main__":
