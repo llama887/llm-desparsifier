@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import itertools
 import json
+import random
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -21,6 +25,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import dspy
 import numpy as np
 import yaml
+from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 
 from llm_desparsifier.rewards import (
     RewardSynthesizer,
@@ -35,6 +40,21 @@ from llm_desparsifier.utils import get_active_prompt_path, write_active_prompt
 
 DEFAULT_ENV_GRID = Path("configs/gepa_envs.yaml")
 BASE_PROMPT_PATH = Path("llm_desparsifier/rewards/prompts/base_reward_prompt.txt")
+DEFAULT_MAX_METRIC_CALLS = 80
+DEFAULT_REFLECTION_MINIBATCH = 2
+MAX_TOTAL_TIMESTEPS = 20_000_000
+MAX_NUM_ENVS = 1_024
+MAX_EVAL_ENVS = 128
+MAX_EVAL_EPISODES = 20
+
+
+@dataclass
+class MetricCacheEntry:
+    score: float
+    feedback: str
+    run_dir: Path
+    created_at: float
+    sparse_curve: List[float]
 
 
 @dataclass
@@ -82,11 +102,41 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ENV_GRID,
         help="YAML file describing environment jobs (default: configs/gepa_envs.yaml)",
     )
-    parser.add_argument(
+    budget_group = parser.add_mutually_exclusive_group()
+    budget_group.add_argument(
         "--gepa-auto",
         choices=["light", "medium", "heavy"],
-        default="light",
-        help="DSPy GEPA auto budget (controls mutation/eval counts)",
+        default=None,
+        help="DSPy GEPA auto budget (controls mutation/eval counts).",
+    )
+    budget_group.add_argument(
+        "--max-full-evals",
+        type=int,
+        default=None,
+        help="Cap GEPA by the number of full train+val evals (each equals len(train)+len(val) metric calls).",
+    )
+    budget_group.add_argument(
+        "--max-metric-calls",
+        type=int,
+        default=None,
+        help="Hard cap on GEPA metric calls (overrides auto/full-evals).",
+    )
+    parser.add_argument(
+        "--reflection-minibatch-size",
+        type=int,
+        default=DEFAULT_REFLECTION_MINIBATCH,
+        help="Examples per reflective minibatch (smaller = cheaper feedback passes).",
+    )
+    parser.add_argument(
+        "--disable-merge",
+        action="store_true",
+        help="Disable GEPA merge proposer to save budget.",
+    )
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        default=None,
+        help="Thread pool size for GEPA metric evaluation (None = DSPy default).",
     )
     return parser.parse_args()
 
@@ -150,6 +200,48 @@ def build_dataset_row(job: EnvJob, result: TrainingResult) -> Dict[str, Any]:
     }
 
 
+def clamp_job_budget(job_cfg: Mapping[str, Any]) -> tuple[Dict[str, Any], List[str]]:
+    """Clamp expensive training knobs to keep per-candidate runtime bounded."""
+
+    cfg = dict(job_cfg)
+    notes: List[str] = []
+
+    def _clamp(key: str, cap: int) -> None:
+        if key in cfg:
+            original = int(cfg[key])
+            capped = min(original, cap)
+            if capped != original:
+                notes.append(f"{key} {original}→{capped}")
+            cfg[key] = capped
+        else:
+            cfg[key] = cap
+            notes.append(f"{key} default→{cap}")
+
+    _clamp("total_timesteps", MAX_TOTAL_TIMESTEPS)
+    _clamp("num_envs", MAX_NUM_ENVS)
+    _clamp("eval_num_envs", MAX_EVAL_ENVS)
+    _clamp("eval_num_episodes", MAX_EVAL_EPISODES)
+    return cfg, notes
+
+
+def make_candidate_fingerprint(reward_code: str, job_cfg: Mapping[str, Any]) -> str:
+    payload = {
+        "reward": reward_code,
+        "env_id": job_cfg.get("env_id"),
+        "benchmark_id": job_cfg.get("benchmark_id"),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def derive_seed(example_id: str, candidate_fp: str) -> int:
+    digest = hashlib.blake2b(f"{example_id}:{candidate_fp}".encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % 2_147_483_647
+
+
+def get_example_id(example: dspy.Example) -> str:
+    return str(getattr(example, "job_name", getattr(example, "env_description", "example")))
+
+
 class RewardPromptProgram(dspy.Module):
     """DSPy module that synthesizes reward code from env description + constraints."""
 
@@ -194,6 +286,11 @@ def build_examples(jobs: List[EnvJob], constraints_text: str) -> List[dspy.Examp
 
 def run_batch() -> None:
     args = parse_args()
+    if args.gepa_auto is None and args.max_full_evals is None and args.max_metric_calls is None:
+        args.max_metric_calls = DEFAULT_MAX_METRIC_CALLS
+    reflection_minibatch_size = max(1, args.reflection_minibatch_size)
+    use_merge = not args.disable_merge
+
     state_root = args.state_root.expanduser().resolve()
     state_root.mkdir(parents=True, exist_ok=True)
     logs_root = state_root / "gepa_runs"
@@ -214,22 +311,46 @@ def run_batch() -> None:
     trainset = valset = examples  # on-policy: no static holdout
 
     run_counter = itertools.count(1)
+    metric_cache: Dict[tuple[str, str], MetricCacheEntry] = {}
+    cache_lock = threading.Lock()
 
     def on_policy_metric(example: dspy.Example, prediction: dspy.Prediction, *_):
         """Evaluate a GEPA candidate by running the full RL loop (existing budget)."""
         reward_code = getattr(prediction, "reward_code", "")
         failsafe_score = 0.0
         if not reward_code.strip():
-            return dspy.Prediction(score=failsafe_score, feedback="Empty reward code")
+            return ScoreWithFeedback(score=failsafe_score, feedback="Empty reward code")
 
-        candidate_id = next(run_counter)
-        run_dir = logs_root / f"candidate-{candidate_id:04d}-{getattr(example, 'job_name', 'env')}"
+        example_id = get_example_id(example)
+        job_cfg_raw = getattr(example, "job_config", {}) or {}
+        budgeted_cfg, budget_notes = clamp_job_budget(job_cfg_raw)
+        candidate_fp = make_candidate_fingerprint(reward_code, budgeted_cfg)
+        cache_key = (example_id, candidate_fp)
+
+        with cache_lock:
+            cached = metric_cache.get(cache_key)
+        if cached is not None:
+            print(f"[on_policy_metric] cache hit {example_id}#{candidate_fp} score={cached.score:.4f}")
+            return ScoreWithFeedback(score=cached.score, feedback=cached.feedback)
+
+        seed = derive_seed(example_id, candidate_fp)
+        budgeted_cfg.setdefault("train_seed", seed)
+        budgeted_cfg.setdefault("eval_seed", seed + 1)
+        random.seed(seed)
+        np.random.seed(seed % (2**32 - 1))
+
+        train_cfg = {k: v for k, v in budgeted_cfg.items() if k != "name"}
+        run_id = next(run_counter)
+        run_dir = logs_root / f"candidate-{run_id:04d}-{example_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
 
+        if budget_notes:
+            print(f"[on_policy_metric] budget clamp {example_id}: " + "; ".join(budget_notes))
+        print(f"[on_policy_metric] cache miss {example_id}#{candidate_fp} seed={seed} dir={run_dir.name}")
+
+        start = time.time()
         try:
             reward_generator = StaticRewardGenerator(reward_code)
-            job_cfg = getattr(example, "job_config", {}) or {}
-            train_cfg = {k: v for k, v in job_cfg.items() if k != "name"}
             result = run_training_with_reward(
                 reward_generator,
                 output_dir=str(run_dir),
@@ -237,20 +358,53 @@ def run_batch() -> None:
                 reward_mode="dense",
             )
             row = build_dataset_row(
-                EnvJob.from_mapping(candidate_id, job_cfg),
+                EnvJob.from_mapping(run_id, {**train_cfg, "name": job_cfg_raw.get("name", example_id)}),
                 result,
             )
+            row["env_description"] = getattr(example, "env_description", None)
+            row["job_name"] = example_id
             reflection = build_reward_reflection(row, reflection_module=reflection_module)
             sparse_curve = row.get("sparse_return_curve") or []
             final_return = float(sparse_curve[-1]) if sparse_curve else 0.0
-            return dspy.Prediction(score=final_return, feedback=reflection)
+            elapsed = time.time() - start
+            cache_entry = MetricCacheEntry(
+                score=final_return,
+                feedback=reflection,
+                run_dir=run_dir,
+                created_at=time.time(),
+                sparse_curve=sparse_curve,
+            )
+            with cache_lock:
+                metric_cache[cache_key] = cache_entry
+            print(
+                f"[on_policy_metric] completed {example_id}#{candidate_fp} in {elapsed / 60:.2f}m "
+                f"score={final_return:.4f}"
+            )
+            return ScoreWithFeedback(score=final_return, feedback=reflection)
         except Exception as exc:
-            return dspy.Prediction(score=failsafe_score, feedback=f"Training failed: {exc}")
+            elapsed = time.time() - start
+            print(f"[on_policy_metric] failure {example_id}#{candidate_fp} after {elapsed / 60:.2f}m: {exc}")
+            failure_feedback = f"Training failed: {exc}"
+            cache_entry = MetricCacheEntry(
+                score=failsafe_score,
+                feedback=failure_feedback,
+                run_dir=run_dir,
+                created_at=time.time(),
+                sparse_curve=[],
+            )
+            with cache_lock:
+                metric_cache[cache_key] = cache_entry
+            return ScoreWithFeedback(score=failsafe_score, feedback=failure_feedback)
 
     compiler = dspy.GEPA(
         metric=on_policy_metric,
         auto=args.gepa_auto,
+        max_full_evals=args.max_full_evals,
+        max_metric_calls=args.max_metric_calls,
+        reflection_minibatch_size=reflection_minibatch_size,
         reflection_lm=base_lm,
+        use_merge=use_merge,
+        num_threads=args.num_threads,
         track_stats=True,
     )
 
