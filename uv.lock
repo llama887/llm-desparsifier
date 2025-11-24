@@ -1247,6 +1247,7 @@ dependencies = [
     { name = "dspy" },
     { name = "jax", extra = ["cuda12"] },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "xminigrid", extra = ["baselines"] },
 ]
 
@@ -1255,6 +1256,7 @@ requires-dist = [
     { name = "dspy", specifier = ">=3.0.3" },
     { name = "jax", extras = ["cuda12"], specifier = ">=0.7.2" },
     { name = "pytest", specifier = ">=8.4.2" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "xminigrid", extras = ["baselines"], specifier = ">=0.9.1" },
 ]
 

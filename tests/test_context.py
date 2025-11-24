@@ -12,6 +12,13 @@ from xminigrid.wrappers import GymAutoResetWrapper
 from llm_desparsifier.utils.context import extract_xland_ctx, _extract_state_snapshot
 
 
+def _freeze_to_dict(value):
+    try:
+        return dict(value)
+    except TypeError:
+        return value
+
+
 def _to_numpy(value):
     return np.asarray(jax.device_get(value))
 
@@ -51,6 +58,15 @@ def test_extract_xland_ctx_includes_previous_snapshot_after_initial_step():
     step_num = int(_to_numpy(ctx["step_num"]))
     step_num_prev = int(_to_numpy(ctx["step_num_prev"]))
     assert step_num == step_num_prev + 1, "step_num should increment between timesteps"
+
+    object_positions = _freeze_to_dict(ctx["object_positions"])
+    assert "yellow_square" in object_positions
+    assert "yellow square" in object_positions
+    assert "green_ball" in object_positions
+    npt.assert_array_equal(
+        _to_numpy(object_positions["yellow_square"]),
+        _to_numpy(next_snapshot["yellow_square_pos"]),
+    )
 
 
 def test_extract_xland_ctx_clones_snapshot_on_reset():

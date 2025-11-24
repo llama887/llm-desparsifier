@@ -217,7 +217,16 @@ artifacts/generated_rewards/
 !artifacts/generated_rewards/.gitkeep
 artifacts/baseline_run/
 !artifacts/baseline_run/.gitkeep
+artifacts/gepa_state/
+!artifacts/gepa_state/.gitkeep
+logs/
+metadata.json
+train_dense.jsonl
+optimized_prompt.json
+ready_for_gepa
+prompt_ready
 llm_plans
 plan.md
 artifacts
 external_docs
+prompt.md

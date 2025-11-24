@@ -6,6 +6,7 @@ import inspect
 from collections.abc import Mapping
 from dataclasses import replace as _py_replace
 
+import jax.numpy as jnp
 from flax import struct
 
 try:
@@ -53,11 +54,13 @@ class DesparsifyRewardWrapper:
         self.dense_fn = dense_fn
         self.ctx_fn = ctx_fn
         self._dense_nargs = len(inspect.signature(dense_fn).parameters)
+        self._component_keys = tuple(getattr(dense_fn, "__reward_component_keys__", ()))
+        self._component_template = self._build_component_template(self._component_keys)
 
     def _unwrap(self, ts):
         return ts.base if isinstance(ts, RewardTimeStep) else ts
 
-    def _augment_extras(self, ts, original_reward, dense_reward):
+    def _augment_extras(self, ts, original_reward, dense_reward, reward_components):
         source = ts.extras if isinstance(ts, RewardTimeStep) else getattr(ts, "extras", None)
         if source is not None:
             extras = source
@@ -80,10 +83,15 @@ class DesparsifyRewardWrapper:
             extras_out = {}
         extras_out["ground_truth_reward"] = original_reward
         extras_out["dense_reward"] = dense_reward
+        normalized = self._normalize_reward_components(reward_components)
+        if normalized is not None:
+            extras_out["reward_components"] = normalized
+        elif self._component_template is not None and "reward_components" not in extras_out:
+            extras_out["reward_components"] = self._component_template
         return freeze(extras_out)
 
-    def _wrap_timestep(self, ts, original_reward, dense_reward):
-        extras = self._augment_extras(ts, original_reward, dense_reward)
+    def _wrap_timestep(self, ts, original_reward, dense_reward, reward_components=None):
+        extras = self._augment_extras(ts, original_reward, dense_reward, reward_components)
         if hasattr(ts, "replace"):
             base = ts.replace(reward=dense_reward)
         else:
@@ -106,13 +114,50 @@ class DesparsifyRewardWrapper:
             ctx = extras if extras is not None else {}
 
         if self._dense_nargs == 3:
-            r_dense = self.dense_fn(ts, action, ts_next)
+            dense_output = self.dense_fn(ts, action, ts_next)
         elif self._dense_nargs == 5:
-            r_dense = self.dense_fn(env_params, ts, action, ts_next, ctx)
+            dense_output = self.dense_fn(env_params, ts, action, ts_next, ctx)
         else:  # fallback: keep sparse reward
-            r_dense = ts_next.reward
+            dense_output = ts_next.reward
 
-        return self._wrap_timestep(ts_next, original_reward, r_dense)
+        dense_reward, reward_components = self._extract_reward_output(dense_output)
+        return self._wrap_timestep(ts_next, original_reward, dense_reward, reward_components)
+
+    def _extract_reward_output(self, dense_output):
+        reward_components = None
+        if isinstance(dense_output, tuple) and len(dense_output) == 2:
+            dense_reward, reward_components = dense_output
+            if reward_components is not None and not isinstance(reward_components, Mapping):
+                raise TypeError("reward_components must be a mapping of component_name -> value")
+        else:
+            dense_reward = dense_output
+        return dense_reward, reward_components
+
+    def _build_component_template(self, keys):
+        if not keys:
+            return None
+        return freeze({name: jnp.float32(0.0) for name in keys})
+
+    def _normalize_reward_components(self, reward_components):
+        if reward_components is None:
+            return None
+        if isinstance(reward_components, FrozenDict):
+            frozen = reward_components
+        else:
+            frozen = freeze(reward_components)
+        if not self._component_keys:
+            return frozen
+        actual_keys = tuple(frozen.keys())
+        expected_set = set(self._component_keys)
+        if set(actual_keys) != expected_set:
+            missing = expected_set - set(actual_keys)
+            extra = set(actual_keys) - expected_set
+            raise ValueError(
+                "reward_components keys must remain constant. "
+                f"missing={sorted(missing)}, extra={sorted(extra)}"
+            )
+        ordered = {name: frozen[name] for name in self._component_keys}
+        return freeze(ordered)
 
     def num_actions(self, env_params):
         return self.env.num_actions(env_params)

@@ -105,6 +105,8 @@ class _Sanitizer(ast.NodeVisitor):
         self._scope_stack.pop()
 
     def visit_Attribute(self, node):  # type: ignore[override]
+        if getattr(node, "attr", None) == "get" and isinstance(node.value, (ast.Name, ast.Attribute)):
+            return self.generic_visit(node)
         root, chain = _decompose_attribute(node)
         if isinstance(root, ast.Name) and root.id in _ALLOWED_TOP:
             return self.generic_visit(node)
@@ -118,6 +120,8 @@ class _Sanitizer(ast.NodeVisitor):
 
     def visit_Call(self, node):  # type: ignore[override]
         if isinstance(node.func, ast.Attribute):
+            if node.func.attr == "get" and isinstance(node.func.value, (ast.Name, ast.Attribute)):
+                return self.generic_visit(node)
             root, chain = _decompose_attribute(node.func)
             if isinstance(root, ast.Name) and root.id in _ALLOWED_TOP:
                 return self.generic_visit(node)
@@ -134,6 +138,53 @@ class _Sanitizer(ast.NodeVisitor):
                 return self.generic_visit(node)
         raise ValueError("function calls must be to jnp/jax.* or basic casts")
 
+    def visit_Subscript(self, node):  # type: ignore[override]
+        # Allow subscripts on intermediate dicts that authors obtain via ctx.get,
+        # but block direct `ctx[...]` accesses so prompts enforcing `.get` remain effective.
+        if isinstance(node.value, ast.Name) and node.value.id == "ctx":
+            raise ValueError("use ctx.get(...) instead of ctx[...]")
+        return self.generic_visit(node)
+
+
+def _validate_reward_structure(func_node: ast.FunctionDef) -> list[str]:
+    class _RewardVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.has_components_dict = False
+            self.component_keys: list[str] = []
+
+        def visit_Assign(self, node: ast.Assign) -> None:  # type: ignore[override]
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "reward_components":
+                    if not isinstance(node.value, ast.Dict):
+                        raise ValueError("reward_components must be defined as a dict literal")
+                    if not node.value.keys:
+                        raise ValueError("reward_components dict must contain at least one entry")
+                    keys: list[str] = []
+                    for key in node.value.keys:
+                        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                            raise ValueError("reward_components keys must be string literals")
+                        keys.append(str(key.value))
+                    self.has_components_dict = True
+                    if not self.component_keys:
+                        self.component_keys = keys
+            self.generic_visit(node)
+
+        def visit_Return(self, node: ast.Return) -> None:  # type: ignore[override]
+            if node.value is None:
+                raise ValueError("dense_reward must return (total_reward, reward_components)")
+            if not isinstance(node.value, ast.Tuple) or len(node.value.elts) != 2:
+                raise ValueError("dense_reward must return (total_reward, reward_components)")
+            components_node = node.value.elts[1]
+            if not isinstance(components_node, ast.Name) or components_node.id != "reward_components":
+                raise ValueError("second element of return must be reward_components")
+            self.generic_visit(node)
+
+    visitor = _RewardVisitor()
+    visitor.visit(func_node)
+    if not visitor.has_components_dict:
+        raise ValueError("reward_components dict literal is required before returning")
+    return visitor.component_keys
+
 
 def sanitize_and_compile(code: str):
     """Validate the generated code and return the compiled dense reward function."""
@@ -141,6 +192,7 @@ def sanitize_and_compile(code: str):
     fdefs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
     if len(fdefs) != 1 or fdefs[0].name != "dense_reward":
         raise ValueError("output must define dense_reward(...) as the first top-level def")
+    component_keys = _validate_reward_structure(fdefs[0])
     _Sanitizer().visit(tree)
 
     bytecode = compile(tree, filename="<dense_reward>", mode="exec")
@@ -150,4 +202,6 @@ def sanitize_and_compile(code: str):
     dense_reward = safe_locals.get("dense_reward") or safe_globals.get("dense_reward")
     if not callable(dense_reward):
         raise ValueError("dense_reward not found after exec")
+    if component_keys:
+        setattr(dense_reward, "__reward_component_keys__", tuple(component_keys))
     return dense_reward

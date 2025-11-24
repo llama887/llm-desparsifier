@@ -20,6 +20,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from flax.core.frozen_dict import freeze
 from xminigrid.core.constants import Colors, Tiles
 
 __all__ = ["extract_xland_ctx"]
@@ -68,6 +69,52 @@ def _is_reset(ts) -> bool:
         return False
 
 
+def _build_lookup_tables():
+    tile_lookup = {}
+    for name, value in Tiles.__dict__.items():
+        if name.startswith("_"):
+            continue
+        if not isinstance(value, int):
+            continue
+        tile_lookup[value] = name.lower()
+    color_lookup = {}
+    for name, value in Colors.__dict__.items():
+        if name.startswith("_"):
+            continue
+        if not isinstance(value, int):
+            continue
+        color_lookup[value] = name.lower()
+    return tile_lookup, color_lookup
+
+
+_TILE_ID_TO_NAME, _COLOR_ID_TO_NAME = _build_lookup_tables()
+_OBJECT_TILE_IDS = {
+    Tiles.BALL,
+    Tiles.SQUARE,
+    Tiles.PYRAMID,
+    Tiles.GOAL,
+    Tiles.KEY,
+    Tiles.HEX,
+    Tiles.STAR,
+}
+
+
+def _extract_object_positions(tile_layer, color_layer):
+    positions = {}
+    for tile_id, tile_name in _TILE_ID_TO_NAME.items():
+        if tile_id not in _OBJECT_TILE_IDS:
+            continue
+        tile_mask = tile_layer == tile_id
+        for color_id, color_name in _COLOR_ID_TO_NAME.items():
+            mask = jnp.logical_and(tile_mask, color_layer == color_id)
+            snake_key = f"{color_name}_{tile_name}"
+            value = _find_first_match(mask)
+            positions[snake_key] = value
+            spaced_key = snake_key.replace("_", " ")
+            positions[spaced_key] = value
+    return positions
+
+
 def _extract_state_snapshot(ts):
     """Return a dictionary of spatial features for the given timestep."""
     grid = ts.state.grid
@@ -94,7 +141,7 @@ def _extract_state_snapshot(ts):
     empty_pocket = jnp.array([Tiles.EMPTY, Colors.EMPTY], dtype=jnp.int32)
     is_carrying = jnp.logical_not(jnp.all(pocket == empty_pocket))
 
-    return {
+    snapshot = {
         "yellow_square_pos": yellow_square_pos,
         "green_ball_pos": green_ball_pos,
         "agent_pos": agent_pos,
@@ -103,6 +150,8 @@ def _extract_state_snapshot(ts):
         "is_carrying": is_carrying,
         "carried_item": pocket,
     }
+    snapshot["object_positions"] = freeze(_extract_object_positions(tile_layer, color_layer))
+    return snapshot
 
 
 def extract_xland_ctx(env_params, ts_prev, ts_next):
