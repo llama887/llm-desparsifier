@@ -853,12 +853,16 @@ def run_training_with_reward(
         steps = loss_info["eval/returns_mean"].shape[0]
         for idx in range(steps):
             step_metrics: dict[str, float] = {}
+            global_step = int((idx + 1) * steps_per_meta)
+            wall_time_sec = float(train_elapsed * ((idx + 1) / total_meta_updates)) if total_meta_updates else 0.0
             for name, value in loss_info.items():
                 value_arr = jnp.asarray(value)
                 if value_arr.ndim == 0:
                     step_metrics[name] = float(value_arr)
                 else:
                     step_metrics[name] = float(value_arr[idx])
+            step_metrics["global_step"] = global_step
+            step_metrics["wall_time_sec"] = wall_time_sec
             progress_callback(idx, step_metrics)
 
     meta_updates = jnp.arange(config.num_meta_updates)
@@ -1056,12 +1060,19 @@ def run_dense_and_sparse(
     results: list[TrainingResult] = []
     for mode in reward_modes:
         mode_output_dir = os.path.join(output_dir, mode) if multi_run else output_dir
+        mode_progress_cb = progress_callback
+        if progress_callback is not None:
+            def mode_progress(idx: int, metrics: Mapping[str, float], *, _mode=mode):
+                enriched = dict(metrics)
+                enriched.setdefault("reward_mode", _mode)
+                progress_callback(idx, enriched)
+            mode_progress_cb = mode_progress
         result = run_training_with_reward(
             reward_generator,
             output_dir=mode_output_dir,
             ctx_fn=ctx_fn,
             config_override=config_override,
-            progress_callback=progress_callback,
+            progress_callback=mode_progress_cb,
             reward_mode=mode,
         )
         results.append(result)

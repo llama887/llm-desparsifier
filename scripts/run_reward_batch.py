@@ -15,6 +15,7 @@ import datetime as dt
 import hashlib
 import itertools
 import json
+import os
 import random
 import threading
 import time
@@ -26,12 +27,16 @@ import dspy
 import numpy as np
 import yaml
 from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
+try:
+    import wandb
+except ImportError:  # pragma: no cover - wandb optional
+    wandb = None
 
 from llm_desparsifier.rewards import (
     RewardSynthesizer,
+    RewardGenerator,
     build_reward_reflection,
     create_reward_reflection_module,
-    sanitize_and_compile,
     configure_portkey_lm,
 )
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT
@@ -155,21 +160,22 @@ def load_env_jobs(env_grid_path: Path) -> List[EnvJob]:
     return jobs
 
 
-def load_prompt_payload(state_root: Path) -> tuple[str, Optional[Dict[str, Any]], Dict[str, Any]]:
+def load_prompt_payload(state_root: Path) -> tuple[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
     prompt_path = get_active_prompt_path(state_root)
     if prompt_path.exists():
         payload = json.loads(prompt_path.read_text())
         text = payload.get("constraints_text")
         if isinstance(text, str) and text.strip():
             synth_state = payload.get("synthesizer_state")
+            prompt_state = payload.get("prompt_state")
             meta = {"source": "active_prompt", "path": str(prompt_path)}
-            return text, synth_state, meta
+            return text, synth_state, prompt_state, meta
     if BASE_PROMPT_PATH.exists():
-        return BASE_PROMPT_PATH.read_text(), None, {
+        return BASE_PROMPT_PATH.read_text(), None, None, {
             "source": "base_prompt_file",
             "path": str(BASE_PROMPT_PATH),
         }
-    return CONSTRAINTS_TEXT, None, {"source": "default_constraints"}
+    return CONSTRAINTS_TEXT, None, None, {"source": "default_constraints"}
 
 
 def to_float_list(value: Any) -> List[float]:
@@ -243,39 +249,55 @@ def get_example_id(example: dspy.Example) -> str:
 
 
 class RewardPromptProgram(dspy.Module):
-    """DSPy module that synthesizes reward code from env description + constraints."""
+    """DSPy module that synthesizes reward code, but treats the prompt as the optimizable object."""
 
-    def __init__(self, constraints_text: str, synthesizer_state: Optional[Mapping[str, Any]] = None):
+    def __init__(
+        self,
+        constraints_text: str,
+        synthesizer_state: Optional[Mapping[str, Any]] = None,
+        prompt_state: Optional[Mapping[str, Any]] = None,
+    ):
         super().__init__()
-        self.constraints_text = constraints_text
+        self.base_constraints = constraints_text
+
+        class PromptSearch(dspy.Signature):
+            env_description: str = dspy.InputField()
+            base_constraints: str = dspy.InputField()
+            prompt_text: str = dspy.OutputField(desc="Rewritten constraints for reward synthesis")
+
+        class PromptGenerator(dspy.Module):
+            def __init__(self, state: Optional[Mapping[str, Any]] = None):
+                super().__init__()
+                self.rewriter = dspy.Predict(PromptSearch)
+                if state:
+                    self.rewriter.load_state(state)
+
+            def dump_state(self) -> Mapping[str, Any]:
+                return self.rewriter.dump_state()
+
+            def forward(self, env_description: str, base_constraints: str) -> str:
+                out = self.rewriter(env_description=env_description, base_constraints=base_constraints)
+                return out.prompt_text
+
+        self.prompt_generator = PromptGenerator(prompt_state)
         self.synthesizer = RewardSynthesizer()
         if synthesizer_state:
             self.synthesizer.gen.load_state(synthesizer_state)
 
     def forward(self, env_description: str, constraints: Optional[str] = None):
-        text = constraints or self.constraints_text
-        reward_code = self.synthesizer(env_description=env_description, constraints=text)
-        return dspy.Prediction(reward_code=reward_code)
-
-
-class StaticRewardGenerator:
-    """Reward generator that uses pre-baked reward code (no LLM calls)."""
-
-    def __init__(self, reward_code: str):
-        self.reward_code = reward_code
-
-    def generate(self, env, env_params):
-        dense_fn = sanitize_and_compile(self.reward_code)
-        return dense_fn, self.reward_code
+        # GEPA now optimizes the rewrite of the base constraints; fallback to provided constraints.
+        prompt_text = constraints or self.prompt_generator(
+            env_description=env_description, base_constraints=self.base_constraints
+        )
+        reward_code = self.synthesizer(env_description=env_description, constraints=prompt_text)
+        return dspy.Prediction(reward_code=reward_code, prompt_text=prompt_text)
 
 
 def build_examples(jobs: List[EnvJob], constraints_text: str) -> List[dspy.Example]:
     examples: List[dspy.Example] = []
     for job in jobs:
         desc = f"{job.env_id} | benchmark={job.benchmark_id}"
-        ex = dspy.Example(env_description=desc, constraints=constraints_text).with_inputs(
-            "env_description", "constraints"
-        )
+        ex = dspy.Example(env_description=desc).with_inputs("env_description")
         cfg = job.to_config()
         cfg["name"] = job.name
         ex.job_config = cfg
@@ -299,14 +321,51 @@ def run_batch() -> None:
     env_grid_path = args.env_grid.expanduser().resolve()
     jobs = load_env_jobs(env_grid_path)
 
-    constraints_text, synthesizer_state, prompt_meta = load_prompt_payload(state_root)
+    constraints_text, synthesizer_state, prompt_state, prompt_meta = load_prompt_payload(state_root)
     reflection_module = create_reward_reflection_module()
 
     # Configure LM once; reuse for program + reflection.
     base_lm = configure_portkey_lm()
     dspy.configure(lm=base_lm)
 
-    program = RewardPromptProgram(constraints_text, synthesizer_state)
+    wandb_run = None
+    candidate_table = None
+    if wandb is not None and not os.environ.get("WANDB_DISABLED"):
+        try:
+            wandb_run = wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "llm-desparsifier"),
+                name=f"gepa-{state_root.name}",
+                config={
+                    "state_root": str(state_root),
+                    "env_grid": str(env_grid_path),
+                    "gepa_auto": args.gepa_auto,
+                    "max_full_evals": args.max_full_evals,
+                    "max_metric_calls": args.max_metric_calls,
+                    "reflection_minibatch_size": reflection_minibatch_size,
+                    "use_merge": use_merge,
+                    "num_threads": args.num_threads,
+                },
+            )
+            candidate_table = wandb.Table(
+                columns=[
+                    "candidate_idx",
+                    "example_id",
+                    "fingerprint",
+                    "candidate_prompt",
+                    "reward_code",
+                    "final_return",
+                    "sparse_curve",
+                    "feedback",
+                    "run_dir",
+                    "elapsed_sec",
+                    "budget_notes",
+                ]
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[wandb] init failed, continuing without logging: {exc}")
+            wandb_run = None
+
+    program = RewardPromptProgram(constraints_text, synthesizer_state=synthesizer_state, prompt_state=prompt_state)
     examples = build_examples(jobs, constraints_text)
     trainset = valset = examples  # on-policy: no static holdout
 
@@ -350,7 +409,15 @@ def run_batch() -> None:
 
         start = time.time()
         try:
-            reward_generator = StaticRewardGenerator(reward_code)
+            candidate_prompt = getattr(prediction, "prompt_text", None) or constraints_text
+            reward_generator = RewardGenerator(
+                constraints_text=candidate_prompt,
+                lm=base_lm,
+                max_sanitize_attempts=5,
+                failure_artifact_dir=run_dir / "sanitize_failures",
+                bootstrap_code=reward_code,
+                verbose=False,
+            )
             result = run_training_with_reward(
                 reward_generator,
                 output_dir=str(run_dir),
@@ -376,6 +443,29 @@ def run_batch() -> None:
             )
             with cache_lock:
                 metric_cache[cache_key] = cache_entry
+                if candidate_table is not None:
+                    candidate_table.add_data(
+                        run_id,
+                        example_id,
+                        candidate_fp,
+                        candidate_prompt,
+                        result.emitted_reward_code,
+                        final_return,
+                        sparse_curve,
+                        reflection,
+                        str(run_dir),
+                        elapsed,
+                        "; ".join(budget_notes),
+                    )
+            if wandb_run is not None:
+                enqueue_log(
+                    {
+                        "gepa/candidate_return": final_return,
+                        "gepa/candidate_idx": run_id,
+                        "gepa/example_id": example_id,
+                    },
+                    step=next(log_step_counter),
+                )
             print(
                 f"[on_policy_metric] completed {example_id}#{candidate_fp} in {elapsed / 60:.2f}m "
                 f"score={final_return:.4f}"
@@ -385,6 +475,16 @@ def run_batch() -> None:
             elapsed = time.time() - start
             print(f"[on_policy_metric] failure {example_id}#{candidate_fp} after {elapsed / 60:.2f}m: {exc}")
             failure_feedback = f"Training failed: {exc}"
+            # Surface sanitizer guidance (if available) so GEPA can mutate prompts effectively.
+            if "reward_generator" in locals():
+                attempts = getattr(reward_generator, "last_attempt_history", None)
+                if attempts:
+                    try:
+                        extra = reward_generator._build_feedback_block(attempts)  # type: ignore[attr-defined]
+                        failure_feedback = f"{failure_feedback}\n\nSanitizer feedback:\n{extra}"
+                    except Exception:
+                        # Do not let feedback formatting mask the original failure.
+                        pass
             cache_entry = MetricCacheEntry(
                 score=failsafe_score,
                 feedback=failure_feedback,
@@ -394,6 +494,30 @@ def run_batch() -> None:
             )
             with cache_lock:
                 metric_cache[cache_key] = cache_entry
+                if candidate_table is not None:
+                    candidate_table.add_data(
+                        run_id,
+                        example_id,
+                        candidate_fp,
+                        candidate_prompt,
+                        reward_code,
+                        failsafe_score,
+                        [],
+                        failure_feedback,
+                        str(run_dir),
+                        elapsed,
+                        "; ".join(budget_notes),
+                    )
+            if wandb_run is not None:
+                enqueue_log(
+                    {
+                        "gepa/candidate_return": failsafe_score,
+                        "gepa/candidate_idx": run_id,
+                        "gepa/example_id": example_id,
+                        "gepa/error": str(exc),
+                    },
+                    step=next(log_step_counter),
+                )
             return ScoreWithFeedback(score=failsafe_score, feedback=failure_feedback)
 
     compiler = dspy.GEPA(
@@ -413,6 +537,7 @@ def run_batch() -> None:
     prompt_payload = {
         "constraints_text": constraints_text,
         "synthesizer_state": optimized_program.synthesizer.gen.dump_state(),
+        "prompt_state": optimized_program.prompt_generator.dump_state(),
         "updated_at": dt.datetime.utcnow().isoformat(timespec="seconds"),
         "source": prompt_meta,
     }
@@ -423,6 +548,22 @@ def run_batch() -> None:
 
     print(f"[run_reward_batch] GEPA completed. Active prompt updated at {get_active_prompt_path(state_root)}")
     print(f"[run_reward_batch] GEPA stats written to {stats_path}")
+
+    if wandb_run is not None:
+        if candidate_table is not None:
+            enqueue_log({"gepa/candidates": candidate_table}, step=next(log_step_counter))
+        if log_queue is not None:
+            log_queue.put(None)
+        if log_thread is not None:
+            log_thread.join(timeout=5)
+        art = wandb.Artifact(f"{state_root.name}-gepa", type="gepa-state")
+        _active = get_active_prompt_path(state_root)
+        if _active.exists():
+            art.add_file(str(_active), name="active_prompt.json")
+        if stats_path.exists():
+            art.add_file(str(stats_path), name="gepa_stats.json")
+        wandb_run.log_artifact(art)
+        wandb_run.finish(quiet=True)
 
 
 if __name__ == "__main__":

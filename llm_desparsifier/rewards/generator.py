@@ -54,11 +54,14 @@ class RewardGenerator:
     verbose: bool = True
     max_sanitize_attempts: int = 10
     failure_artifact_dir: Optional[Path] = None
+    bootstrap_code: Optional[str] = None
+    last_attempt_history: List[_AttemptRecord] = field(default_factory=list, init=False)
 
     def __post_init__(self):
         if self.lm is None:
             self.lm = configure_portkey_lm()
-        else:
+            # Configure DSPy only when we own the LM; avoids thread ownership errors
+            # when a caller supplies an already-configured LM from another thread.
             dspy.configure(lm=self.lm)
         if self.max_sanitize_attempts < 1:
             raise ValueError("max_sanitize_attempts must be >= 1")
@@ -67,12 +70,20 @@ class RewardGenerator:
         """Return `(dense_fn, emitted_code)` for the given environment setup."""
         env_text = self.describe_fn(env, env_params)
         attempt_history: List[_AttemptRecord] = []
+        self.last_attempt_history = []
+        bootstrap_used = False
         for attempt_idx in range(1, self.max_sanitize_attempts + 1):
             feedback_block = ""
             if attempt_history:
                 feedback_block = self._build_feedback_block(attempt_history)
             constraints = f"{self.constraints_text}{feedback_block}"
-            code = self.synthesizer(env_text, constraints)
+            if not bootstrap_used and self.bootstrap_code is not None:
+                code = self.bootstrap_code
+                bootstrap_used = True
+            else:
+                # Use thread-local DSPy settings to avoid cross-thread configure errors.
+                with dspy.settings.context(lm=self.lm):
+                    code = self.synthesizer(env_text, constraints)
 
             if self.verbose:
                 print("\n==== Generated dense_reward candidate (pre-sanitize) ====\n")
@@ -91,6 +102,7 @@ class RewardGenerator:
                 feedback_snapshot = self._build_feedback_block(attempt_history)
                 self._persist_failed_attempt(record, attempt_idx, feedback_snapshot)
                 if attempt_idx >= self.max_sanitize_attempts:
+                    self.last_attempt_history = attempt_history
                     message = self._format_retry_failure(attempt_history)
                     raise RuntimeError(message) from exc
                 continue
@@ -100,6 +112,7 @@ class RewardGenerator:
                 print("Dense Function: \n", dense_fn)
                 print("\n----\n\n")
 
+            self.last_attempt_history = attempt_history
             return dense_fn, code
 
         # This line is unreachable, but satisfies type checkers.

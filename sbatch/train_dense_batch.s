@@ -19,6 +19,13 @@ mkdir -p "$XLAND_MINIGRID_DATA"
 export XDG_CACHE_HOME="$PWD/.cache"
 mkdir -p "$XDG_CACHE_HOME"
 
+export WANDB_API_KEY=4eebac5d4dc88793e64cfb18af3233657db3aeda
+export WANDB_DATA_DIR=$SCRATCH/wandb_cache
+mkdir -p "$WANDB_DATA_DIR"
+export WANDB_DIR="${WANDB_DATA_DIR}/runs"
+mkdir -p "$WANDB_DIR"
+
+
 STATE_ROOT="${STATE_ROOT:-$PWD/artifacts/gepa_state}"
 
 uv sync

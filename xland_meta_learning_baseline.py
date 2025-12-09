@@ -13,6 +13,11 @@ from typing import Callable, Optional
 from llm_desparsifier.rewards import RewardGenerator
 from llm_desparsifier.rl.pipeline import TrainingResult, run_dense_and_sparse
 
+try:
+    import wandb
+except ImportError:  # pragma: no cover - wandb is optional at runtime
+    wandb = None
+
 DEFAULT_OUTPUT_DIR = os.path.join(os.getcwd(), "artifacts", "baseline_run")
 
 
@@ -107,14 +112,47 @@ def main():
 
     ctx_fn_override = _maybe_resolve_ctx_fn(args.ctx_fn)
 
-    results = run_dense_and_sparse(
-        reward_generator,
-        output_dir=output_dir,
-        ctx_fn=ctx_fn_override,
-        config_override=config_override,
-        compare_dense_vs_sparse=args.compare_dense_vs_sparse,
-        default_reward_mode=args.reward_mode,
-    )
+    run_name = os.path.basename(output_dir.rstrip(os.sep)) or "baseline-run"
+    wandb_run = None
+    if wandb is not None and not os.environ.get("WANDB_DISABLED"):
+        try:
+            wandb_run = wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "llm-desparsifier"),
+                name=run_name,
+                config={
+                    "env_id": args.env_id,
+                    "benchmark_id": args.benchmark_id,
+                    "total_timesteps": args.total_timesteps,
+                    "train_seed": args.train_seed,
+                    "eval_seed": args.eval_seed,
+                    "compare_dense_vs_sparse": args.compare_dense_vs_sparse,
+                    "default_reward_mode": args.reward_mode,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[wandb] init failed, continuing without logging: {exc}")
+            wandb_run = None
+
+    def _progress(idx: int, metrics):
+        if wandb_run is None:
+            return
+        step = int(metrics.get("global_step", idx))
+        wandb_run.log(metrics, step=step)
+
+    try:
+        results = run_dense_and_sparse(
+            reward_generator,
+            output_dir=output_dir,
+            ctx_fn=ctx_fn_override,
+            config_override=config_override,
+            progress_callback=_progress if wandb_run is not None else None,
+            compare_dense_vs_sparse=args.compare_dense_vs_sparse,
+            default_reward_mode=args.reward_mode,
+        )
+    except Exception:
+        if wandb_run is not None:
+            wandb_run.finish(quiet=True)
+        raise
 
     if len(results) == 1:
         result = results[0]
@@ -126,6 +164,19 @@ def main():
                 f"Training complete (mode={result.reward_mode}). Key metrics: {result.final_metrics}"
             )
             print("Artifacts:", result.artifacts)
+
+    if wandb_run is not None:
+        def _add_file_if_exists(artifact, path: str):
+            if path and os.path.exists(path):
+                artifact.add_file(path, name=os.path.basename(path))
+
+        for result in results:
+            art_name = f"{run_name}-{result.reward_mode}"
+            art = wandb.Artifact(art_name, type="training-run")
+            for key, path in result.artifacts.items():
+                _add_file_if_exists(art, path)
+            wandb_run.log_artifact(art)
+        wandb_run.finish(quiet=True)
 
 
 if __name__ == "__main__":

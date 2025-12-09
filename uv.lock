@@ -1248,6 +1248,7 @@ dependencies = [
     { name = "jax", extra = ["cuda12"] },
     { name = "pytest" },
     { name = "pyyaml" },
+    { name = "wandb" },
     { name = "xminigrid", extra = ["baselines"] },
 ]
 
@@ -1257,6 +1258,7 @@ requires-dist = [
     { name = "jax", extras = ["cuda12"], specifier = ">=0.7.2" },
     { name = "pytest", specifier = ">=8.4.2" },
     { name = "pyyaml", specifier = ">=6.0.2" },
+    { name = "wandb", specifier = ">=0.22.1" },
     { name = "xminigrid", extras = ["baselines"], specifier = ">=0.9.1" },
 ]
 

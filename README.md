@@ -22,6 +22,8 @@ Prompt optimizing LLMs to desparsify RL environments.
 
 Both runs emit per-mode artifacts under `artifacts/...` including the ground-truth CSV/summary files and the combined `plots/dense_vs_sparse_gt.png` plot.
 
+W&B logging is enabled by default. Set `WANDB_DISABLED=true` to skip, or `WANDB_MODE=offline` to log locally and sync later.
+
 ## SLURM / Cluster Jobs
 Use the bundled sbatch script, which defaults to running the comparison workflow:
 ```bash
