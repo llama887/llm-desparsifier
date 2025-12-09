@@ -235,6 +235,8 @@ def make_candidate_fingerprint(reward_code: str, job_cfg: Mapping[str, Any]) -> 
         "reward": reward_code,
         "env_id": job_cfg.get("env_id"),
         "benchmark_id": job_cfg.get("benchmark_id"),
+        "eval_num_episodes": job_cfg.get("eval_num_episodes"),
+        "eval_seed": job_cfg.get("eval_seed"),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
@@ -353,7 +355,7 @@ def run_batch() -> None:
                     "fingerprint",
                     "candidate_prompt",
                     "reward_code",
-                    "final_return",
+                    "solve_rate",
                     "sparse_curve",
                     "feedback",
                     "run_dir",
@@ -432,10 +434,21 @@ def run_batch() -> None:
             row["job_name"] = example_id
             reflection = build_reward_reflection(row, reflection_module=reflection_module)
             sparse_curve = row.get("sparse_return_curve") or []
-            final_return = float(sparse_curve[-1]) if sparse_curve else 0.0
+
+            gt_eval = result.ground_truth_eval or {}
+            returns = gt_eval.get("returns") or []
+            successes = gt_eval.get("successes")
+            if successes is None:
+                successes = sum(1 for r in returns if r > 0.0)
+            total_eps = len(returns)
+            solve_rate = float(successes) / float(total_eps) if total_eps else float(gt_eval.get("success_rate", 0.0))
+            # Fallback to the previous metric if eval returns are missing.
+            if total_eps == 0 and not gt_eval:
+                solve_rate = float(sparse_curve[-1]) if sparse_curve else 0.0
+
             elapsed = time.time() - start
             cache_entry = MetricCacheEntry(
-                score=final_return,
+                score=solve_rate,
                 feedback=reflection,
                 run_dir=run_dir,
                 created_at=time.time(),
@@ -450,7 +463,7 @@ def run_batch() -> None:
                         candidate_fp,
                         candidate_prompt,
                         result.emitted_reward_code,
-                        final_return,
+                        solve_rate,
                         sparse_curve,
                         reflection,
                         str(run_dir),
@@ -460,7 +473,8 @@ def run_batch() -> None:
             if wandb_run is not None:
                 enqueue_log(
                     {
-                        "gepa/candidate_return": final_return,
+                        "gepa/candidate_return": solve_rate,
+                        "gepa/solve_rate": solve_rate,
                         "gepa/candidate_idx": run_id,
                         "gepa/example_id": example_id,
                     },
@@ -468,9 +482,9 @@ def run_batch() -> None:
                 )
             print(
                 f"[on_policy_metric] completed {example_id}#{candidate_fp} in {elapsed / 60:.2f}m "
-                f"score={final_return:.4f}"
+                f"score={solve_rate:.4f}"
             )
-            return ScoreWithFeedback(score=final_return, feedback=reflection)
+            return ScoreWithFeedback(score=solve_rate, feedback=reflection)
         except Exception as exc:
             elapsed = time.time() - start
             print(f"[on_policy_metric] failure {example_id}#{candidate_fp} after {elapsed / 60:.2f}m: {exc}")

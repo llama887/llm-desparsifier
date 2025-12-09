@@ -988,12 +988,18 @@ def run_training_with_reward(
         % (gt_eval_result.mean_return, gt_eval_result.std_return, len(gt_eval_result.returns))
     )
 
+    successes = sum(1 for r in gt_eval_result.returns if r > 0.0)
+    total_eps = len(gt_eval_result.returns)
+    success_rate = float(successes) / float(total_eps) if total_eps else 0.0
+
     ground_truth_eval = {
         "returns": gt_eval_result.returns,
         "lengths": gt_eval_result.lengths,
         "mean": gt_eval_result.mean_return,
         "std": gt_eval_result.std_return,
         "total_steps": gt_eval_result.total_steps,
+        "successes": successes,
+        "success_rate": success_rate,
     }
 
     final_metrics = {
@@ -1002,6 +1008,8 @@ def run_training_with_reward(
         "dense_ground_abs_gap": final_abs_gap,
         "total_eval_reward": gt_eval_result.mean_return,
         "num_eval_episodes": len(gt_eval_result.returns),
+        "solve_rate": success_rate,
+        "eval_successes": successes,
     }
 
     artifacts = {
