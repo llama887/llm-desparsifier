@@ -56,6 +56,9 @@ class RewardGenerator:
     failure_artifact_dir: Optional[Path] = None
     bootstrap_code: Optional[str] = None
     last_attempt_history: List[_AttemptRecord] = field(default_factory=list, init=False)
+    # Sticky cache of the most recent environment description sent to the LLM.
+    # Used downstream for reflections so the feedback LM knows the goal/ruleset.
+    last_env_description: Optional[str] = field(default=None, init=False)
 
     def __post_init__(self):
         if self.lm is None:
@@ -69,6 +72,7 @@ class RewardGenerator:
     def generate(self, env, env_params) -> Tuple[Callable, str]:
         """Return `(dense_fn, emitted_code)` for the given environment setup."""
         env_text = self.describe_fn(env, env_params)
+        self.last_env_description = env_text
         attempt_history: List[_AttemptRecord] = []
         self.last_attempt_history = []
         bootstrap_used = False

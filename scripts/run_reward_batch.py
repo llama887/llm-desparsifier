@@ -32,6 +32,13 @@ try:
 except ImportError:  # pragma: no cover - wandb optional
     wandb = None
 
+import weave
+
+# Weave 0.52+ expects `project_name` instead of the older `project` kwarg.
+weave.init(project_name=os.environ.get("WEAVE_PROJECT", "llm-desparsifier"))
+from llm_desparsifier.utils.weave_patches import apply_safe_log_score_patch
+apply_safe_log_score_patch()
+
 from llm_desparsifier.rewards import (
     RewardSynthesizer,
     RewardGenerator,
@@ -184,7 +191,15 @@ def to_float_list(value: Any) -> List[float]:
     return np.asarray(value, dtype=float).tolist()
 
 
-def build_dataset_row(job: EnvJob, result: TrainingResult) -> Dict[str, Any]:
+def build_dataset_row(
+    job: EnvJob,
+    result: TrainingResult,
+    *,
+    env_description: Optional[str] = None,
+    candidate_prompt: Optional[str] = None,
+    sanitizer_feedback: Optional[str] = None,
+    budget_cfg: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     loss_info = result.train_info.get("loss_info", {}) if isinstance(result.train_info, Mapping) else {}
     sparse_curve = to_float_list(loss_info.get("eval/ground_truth_returns_mean"))
     component_logs = result.train_info.get("component_logs", {}) if isinstance(result.train_info, Mapping) else {}
@@ -203,6 +218,10 @@ def build_dataset_row(job: EnvJob, result: TrainingResult) -> Dict[str, Any]:
         "component_curves": component_curves,
         "final_metrics": result.final_metrics,
         "artifacts": result.artifacts,
+        "env_description": env_description,
+        "candidate_prompt": candidate_prompt,
+        "sanitizer_feedback": sanitizer_feedback,
+        "budget_cfg": dict(budget_cfg) if budget_cfg else None,
     }
 
 
@@ -332,6 +351,29 @@ def run_batch() -> None:
 
     wandb_run = None
     candidate_table = None
+    log_queue: Optional["queue.Queue[tuple[Mapping[str, Any], Optional[int]]]"] = None
+    log_thread: Optional[threading.Thread] = None
+    log_step_counter = itertools.count(1)
+
+    def _log_worker(q: "queue.Queue[tuple[Mapping[str, Any], Optional[int]]]", run) -> None:
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            payload, step = item
+            try:
+                run.log(payload, step=step)
+            except Exception as exc:  # pragma: no cover - best-effort logging
+                print(f"[wandb] log failed: {exc}")
+            finally:
+                q.task_done()
+
+    def enqueue_log(payload: Mapping[str, Any], *, step: Optional[int] = None) -> None:
+        """Enqueue W&B logging to preserve order under parallel metric calls."""
+        if wandb_run is None or log_queue is None:
+            return
+        log_queue.put((payload, step))
+
     if wandb is not None and not os.environ.get("WANDB_DISABLED"):
         try:
             wandb_run = wandb.init(
@@ -363,6 +405,11 @@ def run_batch() -> None:
                     "budget_notes",
                 ]
             )
+            import queue
+
+            log_queue = queue.Queue()
+            log_thread = threading.Thread(target=_log_worker, args=(log_queue, wandb_run), daemon=True)
+            log_thread.start()
         except Exception as exc:  # pragma: no cover - defensive
             print(f"[wandb] init failed, continuing without logging: {exc}")
             wandb_run = None
@@ -426,13 +473,38 @@ def run_batch() -> None:
                 config_override=train_cfg,
                 reward_mode="dense",
             )
+
+            env_description = getattr(reward_generator, "last_env_description", None) or getattr(
+                example, "env_description", None
+            )
+            sanitizer_feedback = None
+            if getattr(reward_generator, "last_attempt_history", None):
+                try:
+                    sanitizer_feedback = reward_generator._build_feedback_block(  # type: ignore[attr-defined]
+                        reward_generator.last_attempt_history
+                    )
+                except Exception:
+                    sanitizer_feedback = None
+
             row = build_dataset_row(
                 EnvJob.from_mapping(run_id, {**train_cfg, "name": job_cfg_raw.get("name", example_id)}),
                 result,
+                env_description=env_description,
+                candidate_prompt=candidate_prompt,
+                sanitizer_feedback=sanitizer_feedback,
+                budget_cfg=train_cfg,
             )
-            row["env_description"] = getattr(example, "env_description", None)
             row["job_name"] = example_id
-            reflection = build_reward_reflection(row, reflection_module=reflection_module)
+
+            guidance_note = (
+                "Context inputs describe this run (environment goal/rules, budgets, sanitizer notes). "
+                "They vary across jobs—provide general, environment-aware fixes, not hard-coded solutions."
+            )
+            reflection = build_reward_reflection(
+                row,
+                reflection_module=reflection_module,
+                guidance_text=f"{EUREKA_GUIDANCE}\n\n{guidance_note}",
+            )
             sparse_curve = row.get("sparse_return_curve") or []
 
             gt_eval = result.ground_truth_eval or {}
@@ -568,6 +640,9 @@ def run_batch() -> None:
             enqueue_log({"gepa/candidates": candidate_table}, step=next(log_step_counter))
         if log_queue is not None:
             log_queue.put(None)
+            # Queue.join() in Python's stdlib does not accept a timeout; block until the
+            # logging worker drains pending items, then proceed with teardown.
+            log_queue.join()
         if log_thread is not None:
             log_thread.join(timeout=5)
         art = wandb.Artifact(f"{state_root.name}-gepa", type="gepa-state")

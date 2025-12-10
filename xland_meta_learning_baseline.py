@@ -14,9 +14,16 @@ from llm_desparsifier.rewards import RewardGenerator
 from llm_desparsifier.rl.pipeline import TrainingResult, run_dense_and_sparse
 
 try:
-    import wandb
+import wandb
 except ImportError:  # pragma: no cover - wandb is optional at runtime
     wandb = None
+
+import weave
+from llm_desparsifier.utils.weave_patches import apply_safe_log_score_patch
+
+# Weave 0.52+ expects `project_name` instead of the older `project` kwarg.
+weave.init(project_name=os.environ.get("WEAVE_PROJECT", "llm-desparsifier"))
+apply_safe_log_score_patch()
 
 DEFAULT_OUTPUT_DIR = os.path.join(os.getcwd(), "artifacts", "baseline_run")
 

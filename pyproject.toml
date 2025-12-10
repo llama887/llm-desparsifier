@@ -11,6 +11,7 @@ dependencies = [
     "xminigrid[baselines]>=0.9.1",
     "pyyaml>=6.0.2",
     "wandb>=0.22.1",
+    "weave>=0.52.22",
 ]
 
 [build-system]
