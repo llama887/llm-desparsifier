@@ -152,6 +152,22 @@ You must output exactly ONE function:
   def dense_reward(env_params, ts_prev, action, ts_next, ctx):
     # returns (total_reward: jnp.float32, reward_components: dict[str, jnp.float32])
 
+Hard requirements the sanitizer enforces:
+- The return statement must be exactly `return total_reward, reward_components` where `reward_components` is a Python dict with string keys and scalar jnp arrays as values.
+- Access every ctx field with `.get(key, fallback)`; using `ctx[...]` is invalid.
+- Guard nested maps like `object_positions` with `.get` at each level.
+
+Minimal valid pattern:
+```python
+def dense_reward(env_params, ts_prev, action, ts_next, ctx):
+    agent_pos = ctx.get("agent_pos", jnp.array([-1, -1], dtype=jnp.int32))
+    step_num = ctx.get("step_num", jnp.array(0, dtype=jnp.int32))
+    progress = jnp.where(agent_pos[0] >= 0, 0.01 * step_num.astype(jnp.float32), jnp.array(0.0))
+    reward_components = {"progress": progress, "penalty": jnp.array(0.0)}
+    total_reward = reward_components["progress"] + reward_components["penalty"]
+    return total_reward, reward_components
+```
+
 Context:
 - The function will be installed as `dense_fn` inside `DesparsifyRewardWrapper` (see snippet below) and invoked either with three args `(ts_prev, action, ts_next)` or the five-arg signature shown above. Always implement the five-arg form; the wrapper detects it via `inspect.signature`.
 - `ctx` is produced (when configured) by a pure `ctx_fn(env_params, ts_prev, ts_next)` that runs right after `env.step`. It returns a dictionary mapping strings to JAX arrays (you may only access fields of ctx by using ctx.get(...) instead of ctx[...]). Each entry is derived from the `xminigrid.types.TimeStep` objects:

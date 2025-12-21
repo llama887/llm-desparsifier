@@ -29,4 +29,4 @@ mkdir -p "$WANDB_DIR"
 STATE_ROOT="${STATE_ROOT:-$PWD/artifacts/gepa_state}"
 
 uv sync
-uv run scripts/run_reward_batch.py --state-root "$STATE_ROOT"
+uv run python scripts/run_reward_batch.py --state-root /tmp/gepa-test --env-grid configs/gepa_envs.yaml --max-metric-calls 1 --num-threads 1

@@ -61,7 +61,6 @@ def build_reward_reflection(
     component_summary = _format_component_curves(run_record.get("component_curves"))
     component_stats_summary = _format_component_stats(run_record.get("component_curves"))
     metrics_summary = _format_metrics(run_record.get("final_metrics"))
-    context_summary = _format_context(run_record)
 
     module = reflection_module or create_reward_reflection_module()
 
@@ -71,7 +70,7 @@ def build_reward_reflection(
             reward_code=reward_code,
             sparse_curve_summary=sparse_summary,
             component_curve_summary="\n".join(
-                [text for text in [component_summary, component_stats_summary, context_summary] if text]
+                [text for text in [component_summary, component_stats_summary] if text]
             ),
             metrics_summary=metrics_summary,
             guidance=guidance_text,
@@ -148,41 +147,6 @@ def _format_metrics(metrics: Any) -> str:
         else:
             parts.append(f"{key}={value}")
     return "Metrics: " + ", ".join(parts)
-
-
-def _format_context(run_record: Mapping[str, Any]) -> str:
-    notes: list[str] = []
-    candidate_prompt = run_record.get("candidate_prompt")
-    if candidate_prompt:
-        snippet = candidate_prompt[:400].replace("\n", " ")
-        notes.append(f"Candidate prompt (truncated): {snippet}")
-
-    budget_cfg = run_record.get("budget_cfg") or {}
-    if isinstance(budget_cfg, Mapping):
-        keys = [
-            "total_timesteps",
-            "num_envs",
-            "eval_num_envs",
-            "eval_num_episodes",
-            "max_steps",
-            "gt_success_threshold",
-        ]
-        present = [f"{k}={budget_cfg[k]}" for k in keys if k in budget_cfg]
-        if present:
-            notes.append("Budgets: " + ", ".join(present))
-
-    metrics = run_record.get("final_metrics") or {}
-    if isinstance(metrics, Mapping):
-        if "eval_successes" in metrics and "num_eval_episodes" in metrics:
-            notes.append(
-                f"Eval successes: {metrics.get('eval_successes', '?')} / {metrics.get('num_eval_episodes', '?')}"
-            )
-
-    sanitizer_feedback = run_record.get("sanitizer_feedback")
-    if sanitizer_feedback:
-        notes.append("Sanitizer feedback from earlier attempts is included below if relevant.")
-
-    return "\n".join(notes)
 
 
 def _sample_series(values: Any, num_points: int = 6) -> list[float]:

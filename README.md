@@ -36,7 +36,7 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 - **Success criterion**: an eval episode is “solved” iff the ground-truth sparse return `> 0` (goal satisfied before timeout). Returns are computed by the environment’s built-in sparse reward.
 - **Score fed to GEPA**: `solve_rate = successes / eval_num_episodes` (clamped episodes). If eval returns are missing, the metric falls back to the last sparse curve point from training; if everything fails, score defaults to `0.0`.
 - **Seeds & randomness**: `train_seed`/`eval_seed` are either loaded from the grid or deterministically derived; Python `random` and NumPy are also seeded for reproducibility in reward gen/training wrappers.
-- **Storage**: `MetricCacheEntry.score` plus `feedback` and `sparse_curve` are cached and reused; W&B logs `gepa/solve_rate` and the candidate table row. The score is always in `[0,1]`, making it scale-free with respect to dense reward magnitude.
+- **Storage**: each GEPA candidate run logs per-env artifacts under `STATE_ROOT/gepa_runs/`; W&B logs `gepa/solve_rate` and the candidate table row. The score is always in `[0,1]`, making it scale-free with respect to dense reward magnitude.
 
 ## Feedback channel to GEPA
 - The metric returns `ScoreWithFeedback(score=solve_rate, feedback=<reflection text>)` so GEPA can optimize with both numbers and natural-language guidance. citeturn0search0
@@ -98,6 +98,10 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 - **Per-env budgets**: `configs/gepa_envs.yaml` (`total_timesteps`, `train_seed`, `eval_seed`, etc.). Any value above the caps will be clamped in `clamp_job_budget`; lower values are respected.
 - **Global caps**: edit `MAX_TOTAL_TIMESTEPS`, `MAX_NUM_ENVS`, `MAX_EVAL_ENVS`, `MAX_EVAL_EPISODES` near the top of `scripts/run_reward_batch.py`.
 - **RL training defaults**: `llm_desparsifier/rl/pipeline.py:TrainConfig` (policy sizes, PPO knobs, eval counts, seeds). Override by adding keys to a job entry in the env grid; GEPA passes them through to `TrainConfig(**config_override)`.
-- **GEPA search budget**: choose exactly one of `--gepa-auto {light,medium,heavy}`, `--max-full-evals`, or `--max-metric-calls` when running `scripts/run_reward_batch.py`. `--reflection-minibatch-size` controls how many envs are batched per feedback call; `--disable-merge` turns off GEPA’s candidate merging.
+- **GEPA search budget**: primary knobs are `--max-metric-calls` (default 80) and `--reflection-minibatch-size` when running `scripts/run_reward_batch.py`. Edit `configs/gepa_envs.yaml` to change which envs are evaluated.
 - **State location**: set `STATE_ROOT=/your/path` (env var for sbatch or flag locally) to isolate prompt/checkpoint state.
-- **Logging**: `WANDB_DISABLED=1` skips W&B; otherwise project/name are set in `run_reward_batch.py`. Candidate artifacts live under `STATE_ROOT/gepa_runs/`.
+- **Logging (minimal, high-signal)**: `WANDB_DISABLED=1` skips W&B; otherwise project/name are set in `scripts/run_reward_batch.py`. Each run logs:
+  - `gepa/solve_rate` (scalar) – solve rate per GEPA candidate over the current env batch (main time series).
+  - `gepa/sparse_baseline_solve_rate` (scalar) – ground-truth sparse baseline logged once at step 0 for comparison.
+  - GEPA candidate table (one row per proposal): `step`, `env_id`, `solve_rate`, `sparse_baseline`, `reward_code_sha16`, `prompt_text` (truncated), `feedback` (EUREKA reflection), `run_dir` (artifact path).
+  - Artifacts remain under `STATE_ROOT/gepa_runs/` (per-candidate logs and emitted reward code).

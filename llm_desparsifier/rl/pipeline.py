@@ -4,20 +4,16 @@ from __future__ import annotations
 import math
 import os
 import time
-import csv
-import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, TypedDict
 from typing import Literal
 
 import flax
 import flax.linen as nn
-import imageio
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
-import matplotlib.pyplot as plt
 import numpy as np
 import optax
 import distrax
@@ -330,130 +326,6 @@ def rollout(
     final_carry = jax.lax.while_loop(_cond_fn, _body_fn, init_val=init_carry)
     return final_carry[1]
 
-
-def _load_ground_truth_series(csv_path: str):
-    steps, returns, stds = [], [], []
-    with open(csv_path, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            steps.append(float(row["global_step"]))
-            returns.append(float(row["gt_return"]))
-            stds.append(float(row.get("gt_return_std", 0.0)))
-    if not steps:
-        return None
-    return {
-        "steps": np.asarray(steps),
-        "returns": np.asarray(returns),
-        "std": np.asarray(stds),
-    }
-
-
-def _load_summary(summary_path: str):
-    if not summary_path:
-        return None
-    with open(summary_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def plot_gt_comparison(csv_paths: Mapping[str, str], summary_paths: Mapping[str, str], out_path: str) -> Optional[str]:
-    run_series: dict[str, dict[str, np.ndarray]] = {}
-    run_summaries: dict[str, Mapping[str, Any]] = {}
-    for mode, csv_path in csv_paths.items():
-        if not csv_path or not os.path.exists(csv_path):
-            continue
-        series = _load_ground_truth_series(csv_path)
-        if series is None:
-            continue
-        run_series[mode] = series
-        summary_path = summary_paths.get(mode)
-        if summary_path and os.path.exists(summary_path):
-            run_summaries[mode] = _load_summary(summary_path)
-
-    if not run_series:
-        return None
-
-    modes = sorted(run_series.keys())
-    colors = {
-        "dense": "tab:blue",
-        "sparse": "tab:orange",
-    }
-
-    fig = plt.figure(figsize=(10, 8))
-    grid = fig.add_gridspec(2, 1, height_ratios=[3, 1])
-    ax_main = fig.add_subplot(grid[0])
-    ax_diff = fig.add_subplot(grid[1], sharex=ax_main)
-
-    for mode in modes:
-        series = run_series[mode]
-        steps = series["steps"]
-        returns = series["returns"]
-        std = series["std"]
-        color = colors.get(mode, None)
-        label = f"{mode.capitalize()} GT"
-        ax_main.plot(steps, returns, label=label, color=color)
-        if np.any(std):
-            ax_main.fill_between(steps, returns - std, returns + std, color=color, alpha=0.2)
-
-        summary = run_summaries.get(mode)
-        if summary and summary.get("max_return") is not None and summary.get("argmax_step") is not None:
-            ax_main.scatter(summary["argmax_step"], summary["max_return"], color=color, marker="o")
-            ax_main.annotate(
-                f"max {summary['max_return']:.1f}",
-                xy=(summary["argmax_step"], summary["max_return"]),
-                xytext=(5, 5),
-                textcoords="offset points",
-                color=color,
-                fontsize=8,
-            )
-
-    ax_main.set_title("Ground-truth Returns vs Environment Steps")
-    ax_main.set_ylabel("Return")
-    ax_main.legend()
-    ax_main.grid(True, alpha=0.3)
-
-    if "dense" in run_series and "sparse" in run_series:
-        dense_steps = run_series["dense"]["steps"]
-        dense_returns = run_series["dense"]["returns"]
-        sparse_steps = run_series["sparse"]["steps"]
-        sparse_returns = run_series["sparse"]["returns"]
-        shared_steps = np.intersect1d(dense_steps, sparse_steps)
-        if shared_steps.size:
-            dense_interp = np.interp(shared_steps, dense_steps, dense_returns)
-            sparse_interp = np.interp(shared_steps, sparse_steps, sparse_returns)
-            diff = dense_interp - sparse_interp
-            ax_diff.plot(shared_steps, diff, color="tab:purple", label="Dense - Sparse")
-            ax_diff.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
-            ax_diff.set_ylabel("Δ Return")
-            ax_diff.set_xlabel("Environment Steps")
-            ax_diff.grid(True, alpha=0.3)
-            ax_diff.legend()
-        else:
-            ax_diff.set_visible(False)
-    else:
-        ax_diff.set_visible(False)
-
-    if run_summaries:
-        table_lines = ["Run | Final | Max | Argmax | AUC | T_thresh"]
-        for mode in modes:
-            summary = run_summaries.get(mode)
-            if summary:
-                table_lines.append(
-                    (
-                        f"{mode:<5}| "
-                        f"{summary.get('final_return', '-')!s:<6} | "
-                        f"{summary.get('max_return', '-')!s:<6} | "
-                        f"{summary.get('argmax_step', '-')!s:<7} | "
-                        f"{summary.get('auc_ground_truth', '-')!s:<6} | "
-                        f"{summary.get('time_to_threshold', '-')!s:<8}"
-                    )
-                )
-        fig.text(0.02, 0.01, "\n".join(table_lines), fontsize=8, family="monospace")
-
-    fig.tight_layout(rect=(0, 0.03, 1, 1))
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    return out_path
 
 # ======================
 # Training
@@ -893,67 +765,12 @@ def run_training_with_reward(
                 )
             )
 
-    gt_curve_path = os.path.join(output_dir, "training_curve_ground_truth.png")
-    dense_curve_path = os.path.join(output_dir, "training_curve_dense.png")
-    combined_curve_path = os.path.join(output_dir, "training_curve.png")
-
-    plt.figure()
-    plt.plot(meta_updates, gt_series, label="Ground-truth reward")
-    plt.title("Ground-truth Eval Returns over Meta Updates")
-    plt.xlabel("Meta Update")
-    plt.ylabel("Return")
-    plt.legend()
-    plt.savefig(gt_curve_path, dpi=150)
-    plt.close()
-
-    plt.figure()
-    dense_label = "Dense reward" if reward_mode == "dense" else "Training reward"
-    plt.plot(meta_updates, dense_series, label=dense_label, color="tab:orange")
-    plt.title(f"{dense_label} Eval Returns over Meta Updates")
-    plt.xlabel("Meta Update")
-    plt.ylabel("Return")
-    plt.legend()
-    plt.savefig(dense_curve_path, dpi=150)
-    plt.close()
-
-    def _normalize_to_unit_interval(series):
-        min_val = jnp.min(series)
-        max_val = jnp.max(series)
-        range_val = max_val - min_val
-        inv_range = jnp.where(range_val > 0, 1.0 / range_val, 0.0)
-        return jnp.where(range_val > 0, (series - min_val) * inv_range, jnp.zeros_like(series))
-
-    dense_series_norm = _normalize_to_unit_interval(dense_series)
-    gt_series_norm = _normalize_to_unit_interval(gt_series)
-
-    plt.figure()
-    plt.plot(meta_updates, gt_series_norm, label="Ground-truth reward (normalized)")
-    plt.plot(
-        meta_updates,
-        dense_series_norm,
-        label=("Dense reward (normalized)" if reward_mode == "dense" else "Training reward (normalized)"),
-        linestyle="--",
-    )
-    plt.title("Normalized Eval Returns over Meta Updates")
-    plt.xlabel("Meta Update")
-    plt.ylabel("Normalized Return [0, 1]")
-    plt.legend()
-    plt.savefig(combined_curve_path, dpi=150)
-    plt.close()
-
+    # Simplified: skip plotting and CSV dumps to reduce overhead.
+    gt_curve_path = ""
+    dense_curve_path = ""
+    combined_curve_path = ""
     metrics_csv_path = None
     metrics_summary_path = None
-    if ground_truth_rows:
-        metrics_csv_path = dump_ground_truth_logs(output_dir, ground_truth_rows)
-        summary_payload = compute_ground_truth_summary(
-            ground_truth_rows, threshold=config.gt_success_threshold
-        )
-        summary_payload.update({
-            "run_id": run_id,
-            "reward_mode": reward_mode,
-            "threshold": config.gt_success_threshold,
-        })
-        metrics_summary_path = dump_ground_truth_summary(output_dir, summary_payload)
 
     # ========== Evaluation via ground-truth harness ==========
     eval_model = ActorCriticRNN(
@@ -970,7 +787,7 @@ def run_training_with_reward(
         num_episodes=config.eval_num_episodes,
         seed=config.eval_seed,
         img_obs=config.img_obs,
-        capture_video=True,
+        capture_video=False,
     )
     gt_eval_result = run_ground_truth_eval(
         train_state=train_info["state"],
@@ -978,11 +795,7 @@ def run_training_with_reward(
         cfg=eval_cfg,
     )
 
-    rollout_path = os.path.join(output_dir, "eval_rollout.mp4")
-    if gt_eval_result.frames:
-        imageio.mimsave(rollout_path, gt_eval_result.frames, fps=16, format="mp4")
-    else:
-        rollout_path = ""
+    rollout_path = ""
     print(
         "Ground-truth eval: mean=%.4f ± %.4f over %d episodes"
         % (gt_eval_result.mean_return, gt_eval_result.std_return, len(gt_eval_result.returns))
@@ -1084,19 +897,5 @@ def run_dense_and_sparse(
             reward_mode=mode,
         )
         results.append(result)
-
-    if multi_run:
-        csv_paths = {}
-        summary_paths = {}
-        for result in results:
-            csv_path = result.artifacts.get("ground_truth_metrics_csv")
-            summary_path = result.artifacts.get("ground_truth_summary")
-            csv_paths[result.reward_mode] = csv_path
-            summary_paths[result.reward_mode] = summary_path
-        comparison_plot_path = os.path.join(output_dir, "plots", "dense_vs_sparse_gt.png")
-        plotted = plot_gt_comparison(csv_paths, summary_paths, comparison_plot_path)
-        if plotted:
-            for result in results:
-                result.artifacts["dense_vs_sparse_gt_plot"] = plotted
 
     return results

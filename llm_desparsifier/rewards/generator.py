@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import dspy
-import jax.numpy as jnp
 
 from llm_desparsifier.rewards.llm_client import configure_portkey_lm
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT, describe_ruleset
@@ -51,10 +49,7 @@ class RewardGenerator:
     describe_fn: Callable[[object, object], str] = describe_ruleset
     sanitize_fn: Callable[[str], Callable] = sanitize_and_compile
     lm: Optional[dspy.LM] = None
-    verbose: bool = True
     max_sanitize_attempts: int = 10
-    failure_artifact_dir: Optional[Path] = None
-    bootstrap_code: Optional[str] = None
     last_attempt_history: List[_AttemptRecord] = field(default_factory=list, init=False)
     # Sticky cache of the most recent environment description sent to the LLM.
     # Used downstream for reflections so the feedback LM knows the goal/ruleset.
@@ -75,98 +70,34 @@ class RewardGenerator:
         self.last_env_description = env_text
         attempt_history: List[_AttemptRecord] = []
         self.last_attempt_history = []
-        bootstrap_used = False
         for attempt_idx in range(1, self.max_sanitize_attempts + 1):
             feedback_block = ""
             if attempt_history:
                 feedback_block = self._build_feedback_block(attempt_history)
             constraints = f"{self.constraints_text}{feedback_block}"
-            if not bootstrap_used and self.bootstrap_code is not None:
-                code = self.bootstrap_code
-                bootstrap_used = True
-            else:
-                # Use thread-local DSPy settings to avoid cross-thread configure errors.
-                with dspy.settings.context(lm=self.lm):
-                    code = self.synthesizer(env_text, constraints)
-
-            if self.verbose:
-                print("\n==== Generated dense_reward candidate (pre-sanitize) ====\n")
-                print(code)
-                print("\nEnvironment Description: \n", env_text)
-                print("\n=========================================================\n")
+            # Use thread-local DSPy settings to avoid cross-thread configure errors.
+            with dspy.settings.context(lm=self.lm):
+                code = self.synthesizer(env_text, constraints)
 
             try:
                 dense_fn = self.sanitize_fn(code)
-                self._run_smoke_test(dense_fn)
             except ValueError as exc:
                 error_text = f"{exc.__class__.__name__}: {exc}"
                 timestamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
                 record = _AttemptRecord(code=code, error_text=error_text, timestamp=timestamp)
                 attempt_history.append(record)
                 feedback_snapshot = self._build_feedback_block(attempt_history)
-                self._persist_failed_attempt(record, attempt_idx, feedback_snapshot)
                 if attempt_idx >= self.max_sanitize_attempts:
                     self.last_attempt_history = attempt_history
                     message = self._format_retry_failure(attempt_history)
                     raise RuntimeError(message) from exc
                 continue
 
-            if self.verbose:
-                print("\n\n----\n")
-                print("Dense Function: \n", dense_fn)
-                print("\n----\n\n")
-
             self.last_attempt_history = attempt_history
             return dense_fn, code
 
         # This line is unreachable, but satisfies type checkers.
         raise RuntimeError("Reward generation loop exited unexpectedly")
-
-    def _run_smoke_test(self, dense_fn: Callable) -> None:
-        """Execute a minimal, eager reward call to catch obvious runtime errors.
-
-        The test is intentionally lightweight (single call, small tensors) to avoid
-        noticeable overhead. Any exception is converted to ValueError so it enters
-        the existing retry path.
-        """
-
-        class _SmokeTimeStep:
-            def __init__(self):
-                self.reward = jnp.asarray(0.0)
-                self.observation = jnp.zeros((1, 1, 1))
-
-            def last(self):
-                return False
-
-        dummy_env_params = type("DummyEnvParams", (), {
-            "height": 1,
-            "width": 1,
-            "view_size": 1,
-            "max_steps": 1,
-            "ruleset": None,
-        })()
-
-        ts_prev = _SmokeTimeStep()
-        ts_next = _SmokeTimeStep()
-        action = jnp.asarray(0, dtype=jnp.int32)
-        ctx = {
-            "agent_pos": jnp.asarray([0, 0]),
-            "agent_direction": jnp.asarray(0),
-            "step_num": jnp.asarray(0),
-            "is_carrying": jnp.asarray(0),
-            "carried_item": jnp.asarray(-1),
-            "yellow_square_pos": jnp.asarray([0, 0]),
-            "green_ball_pos": jnp.asarray([1, 0]),
-            "object_positions": {
-                "yellow_square": jnp.asarray([0, 0]),
-                "green_ball": jnp.asarray([1, 0]),
-            },
-        }
-
-        try:
-            dense_fn(dummy_env_params, ts_prev, action, ts_next, ctx)
-        except Exception as exc:
-            raise ValueError(f"Smoke test failed: {exc}") from exc
 
     def _build_feedback_block(self, attempts: List[_AttemptRecord]) -> str:
         if not attempts:
@@ -197,21 +128,6 @@ class RewardGenerator:
         )
         lines.append("Rewrite dense_reward so it satisfies all original constraints and fixes every issue above.")
         return "\n".join(lines)
-
-    def _persist_failed_attempt(self, record: _AttemptRecord, attempt_idx: int, feedback_block: str) -> None:
-        if not self.failure_artifact_dir:
-            return
-        try:
-            failure_dir = Path(self.failure_artifact_dir)
-            failure_dir.mkdir(parents=True, exist_ok=True)
-            prefix = f"attempt-{attempt_idx:02d}-{record.timestamp}"
-            (failure_dir / f"{prefix}.py").write_text(record.code, encoding="utf-8")
-            (failure_dir / f"{prefix}.err.txt").write_text(record.error_text, encoding="utf-8")
-            if feedback_block:
-                (failure_dir / f"{prefix}.feedback.md").write_text(feedback_block, encoding="utf-8")
-        except Exception:
-            # Failing to write diagnostics should not abort reward generation.
-            pass
 
     @staticmethod
     def _format_retry_failure(attempt_history: List[_AttemptRecord]) -> str:

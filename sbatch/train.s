@@ -48,7 +48,7 @@ nvidia-smi || true
 
 echo "=== JAX info ==="
 uv run -- python - <<'PY'
-import os, inspect, jax, jaxlib, subprocess
+import os, inspect, jax, jaxlib
 print("JAX:", jax.__version__, "jaxlib:", jaxlib.__version__)
 print("Devices:", jax.devices())
 # Show linkage for the core extension to verify libcuda resolution
@@ -56,6 +56,15 @@ import jaxlib as jl, os, inspect
 ext = os.path.join(os.path.dirname(inspect.getfile(jl)), "xla_extension.so")
 print("xla_extension.so:", ext)
 try:
+    # Avoid os.fork() from subprocess in a multi-threaded JAX process:
+    # use posix_spawn so the child is created without inheriting problematic thread state.
+    pid = os.posix_spawn("ldd", ["ldd", ext], os.environ)
+    _, status = os.waitpid(pid, 0)
+    if status != 0:
+        print(f"ldd exited with status {status}")
+except AttributeError:
+    # Fallback for platforms lacking posix_spawn; keep old behavior as last resort.
+    import subprocess
     subprocess.run(["ldd", ext], check=False)
 except Exception as e:
     print("ldd failed:", e)

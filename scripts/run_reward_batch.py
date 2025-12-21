@@ -13,11 +13,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
-import itertools
 import json
 import os
 import random
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,13 +29,6 @@ try:
     import wandb
 except ImportError:  # pragma: no cover - wandb optional
     wandb = None
-
-import weave
-
-# Weave 0.52+ expects `project_name` instead of the older `project` kwarg.
-weave.init(project_name=os.environ.get("WEAVE_PROJECT", "llm-desparsifier"))
-from llm_desparsifier.utils.weave_patches import apply_safe_log_score_patch
-apply_safe_log_score_patch()
 
 from llm_desparsifier.rewards import (
     RewardSynthesizer,
@@ -60,13 +51,43 @@ MAX_EVAL_ENVS = 128
 MAX_EVAL_EPISODES = 20
 
 
-@dataclass
-class MetricCacheEntry:
-    score: float
-    feedback: str
-    run_dir: Path
-    created_at: float
-    sparse_curve: List[float]
+def safe_wandb_log(wandb_run: Any, payload: Mapping[str, Any], **kwargs: Any) -> None:
+    if wandb_run is None:
+        return
+    if getattr(wandb_run, "_is_finished", False) or getattr(wandb_run, "finished", False):
+        return
+    try:
+        wandb_run.log(payload, **kwargs)
+    except Exception as exc:  # pragma: no cover - defensive for late-finish errors
+        if wandb is not None and isinstance(exc, wandb.errors.UsageError) and "finished" in str(exc):
+            return
+        raise
+
+
+def safe_wandb_log_artifact(wandb_run: Any, artifact: Any) -> None:
+    if wandb_run is None:
+        return
+    if getattr(wandb_run, "_is_finished", False) or getattr(wandb_run, "finished", False):
+        return
+    try:
+        wandb_run.log_artifact(artifact)
+    except Exception as exc:  # pragma: no cover - defensive for late-finish errors
+        if wandb is not None and isinstance(exc, wandb.errors.UsageError) and "finished" in str(exc):
+            return
+        raise
+
+
+def safe_wandb_finish(wandb_run: Any) -> None:
+    if wandb_run is None:
+        return
+    if getattr(wandb_run, "_is_finished", False) or getattr(wandb_run, "finished", False):
+        return
+    try:
+        wandb_run.finish(quiet=True)
+    except Exception as exc:  # pragma: no cover - defensive for late-finish errors
+        if wandb is not None and isinstance(exc, wandb.errors.UsageError) and "finished" in str(exc):
+            return
+        raise
 
 
 @dataclass
@@ -114,24 +135,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ENV_GRID,
         help="YAML file describing environment jobs (default: configs/gepa_envs.yaml)",
     )
-    budget_group = parser.add_mutually_exclusive_group()
-    budget_group.add_argument(
-        "--gepa-auto",
-        choices=["light", "medium", "heavy"],
-        default=None,
-        help="DSPy GEPA auto budget (controls mutation/eval counts).",
-    )
-    budget_group.add_argument(
-        "--max-full-evals",
-        type=int,
-        default=None,
-        help="Cap GEPA by the number of full train+val evals (each equals len(train)+len(val) metric calls).",
-    )
-    budget_group.add_argument(
+    parser.add_argument(
         "--max-metric-calls",
         type=int,
         default=None,
-        help="Hard cap on GEPA metric calls (overrides auto/full-evals).",
+        help="Hard cap on GEPA metric calls (defaults to 80).",
     )
     parser.add_argument(
         "--reflection-minibatch-size",
@@ -140,15 +148,9 @@ def parse_args() -> argparse.Namespace:
         help="Examples per reflective minibatch (smaller = cheaper feedback passes).",
     )
     parser.add_argument(
-        "--disable-merge",
+        "--skip-sparse-baseline",
         action="store_true",
-        help="Disable GEPA merge proposer to save budget.",
-    )
-    parser.add_argument(
-        "--num-threads",
-        type=int,
-        default=None,
-        help="Thread pool size for GEPA metric evaluation (None = DSPy default).",
+        help="Skip the pre-GEPA sparse reward baseline run (no horizontal solve-rate line).",
     )
     return parser.parse_args()
 
@@ -329,10 +331,9 @@ def build_examples(jobs: List[EnvJob], constraints_text: str) -> List[dspy.Examp
 
 def run_batch() -> None:
     args = parse_args()
-    if args.gepa_auto is None and args.max_full_evals is None and args.max_metric_calls is None:
+    if args.max_metric_calls is None:
         args.max_metric_calls = DEFAULT_MAX_METRIC_CALLS
     reflection_minibatch_size = max(1, args.reflection_minibatch_size)
-    use_merge = not args.disable_merge
 
     state_root = args.state_root.expanduser().resolve()
     state_root.mkdir(parents=True, exist_ok=True)
@@ -341,6 +342,7 @@ def run_batch() -> None:
 
     env_grid_path = args.env_grid.expanduser().resolve()
     jobs = load_env_jobs(env_grid_path)
+    # Use all jobs from the grid; users can edit the YAML to reduce set.
 
     constraints_text, synthesizer_state, prompt_state, prompt_meta = load_prompt_payload(state_root)
     reflection_module = create_reward_reflection_module()
@@ -351,28 +353,9 @@ def run_batch() -> None:
 
     wandb_run = None
     candidate_table = None
-    log_queue: Optional["queue.Queue[tuple[Mapping[str, Any], Optional[int]]]"] = None
-    log_thread: Optional[threading.Thread] = None
-    log_step_counter = itertools.count(1)
-
-    def _log_worker(q: "queue.Queue[tuple[Mapping[str, Any], Optional[int]]]", run) -> None:
-        while True:
-            item = q.get()
-            if item is None:
-                break
-            payload, step = item
-            try:
-                run.log(payload, step=step)
-            except Exception as exc:  # pragma: no cover - best-effort logging
-                print(f"[wandb] log failed: {exc}")
-            finally:
-                q.task_done()
-
-    def enqueue_log(payload: Mapping[str, Any], *, step: Optional[int] = None) -> None:
-        """Enqueue W&B logging to preserve order under parallel metric calls."""
-        if wandb_run is None or log_queue is None:
-            return
-        log_queue.put((payload, step))
+    io_table = None
+    sparse_baselines: Dict[str, Dict[str, Any]] = {}
+    sparse_baseline_mean: float = 0.0
 
     if wandb is not None and not os.environ.get("WANDB_DISABLED"):
         try:
@@ -382,239 +365,255 @@ def run_batch() -> None:
                 config={
                     "state_root": str(state_root),
                     "env_grid": str(env_grid_path),
-                    "gepa_auto": args.gepa_auto,
-                    "max_full_evals": args.max_full_evals,
                     "max_metric_calls": args.max_metric_calls,
                     "reflection_minibatch_size": reflection_minibatch_size,
-                    "use_merge": use_merge,
-                    "num_threads": args.num_threads,
                 },
             )
             candidate_table = wandb.Table(
                 columns=[
-                    "candidate_idx",
-                    "example_id",
-                    "fingerprint",
-                    "candidate_prompt",
-                    "reward_code",
+                    "step",
+                    "env_id",
                     "solve_rate",
-                    "sparse_curve",
+                    "sparse_baseline",
+                    "reward_code_sha16",
+                    "prompt_text",
                     "feedback",
                     "run_dir",
-                    "elapsed_sec",
-                    "budget_notes",
                 ]
             )
-            import queue
-
-            log_queue = queue.Queue()
-            log_thread = threading.Thread(target=_log_worker, args=(log_queue, wandb_run), daemon=True)
-            log_thread.start()
+            io_table = wandb.Table(
+                columns=[
+                    "metric_call",
+                    "score",
+                    "feedback",
+                    "prompt_text",
+                ]
+            )
         except Exception as exc:  # pragma: no cover - defensive
             print(f"[wandb] init failed, continuing without logging: {exc}")
             wandb_run = None
+            io_table = None
+
+    # ========== Sparse baseline (generic sparse reward) ==========
+    if not args.skip_sparse_baseline:
+        class _NullRewardGenerator:
+            def generate(self, *_, **__):
+                raise RuntimeError("Sparse baseline should not call reward generator")
+
+        baseline_root = logs_root / "sparse_baseline"
+        baseline_root.mkdir(exist_ok=True)
+        per_env_baselines = []
+        for job in jobs:
+            baseline_dir = baseline_root / job.name
+            baseline_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[sparse-baseline] running {job.name} into {baseline_dir}")
+            try:
+                baseline_result = run_training_with_reward(
+                    _NullRewardGenerator(),
+                    output_dir=str(baseline_dir),
+                    config_override=job.to_config(),
+                    reward_mode="sparse",
+                )
+                solve_rate = float(baseline_result.final_metrics.get("solve_rate", 0.0))
+                sparse_curve = to_float_list(
+                    baseline_result.train_info.get("loss_info", {}).get("eval/ground_truth_returns_mean")
+                )
+                sparse_baselines[job.name] = {
+                    "solve_rate": solve_rate,
+                    "sparse_curve": sparse_curve,
+                    "artifacts": dict(baseline_result.artifacts),
+                }
+                per_env_baselines.append(solve_rate)
+                if wandb_run is not None:
+                    safe_wandb_log(
+                        wandb_run,
+                        {
+                            "gepa/example_id": job.name,
+                            "gepa/env_id": job.env_id,
+                            "gepa/sparse_baseline_solve_rate": solve_rate,
+                        },
+                        step=0,
+                    )
+                print(f"[sparse-baseline] {job.name} solve_rate={solve_rate:.4f}")
+            except Exception as exc:  # pragma: no cover - baseline is best-effort
+                print(f"[sparse-baseline] FAILED {job.name}: {exc}")
+        if per_env_baselines:
+            sparse_baseline_mean = float(np.mean(per_env_baselines))
+            if wandb_run is not None:
+                safe_wandb_log(
+                    wandb_run,
+                    {"gepa/sparse_baseline_solve_rate_mean": sparse_baseline_mean},
+                    step=0,
+                )
 
     program = RewardPromptProgram(constraints_text, synthesizer_state=synthesizer_state, prompt_state=prompt_state)
     examples = build_examples(jobs, constraints_text)
     trainset = valset = examples  # on-policy: no static holdout
 
-    run_counter = itertools.count(1)
-    metric_cache: Dict[tuple[str, str], MetricCacheEntry] = {}
-    cache_lock = threading.Lock()
+    run_counter = 1
+    metric_call_idx = 0
 
     def on_policy_metric(example: dspy.Example, prediction: dspy.Prediction, *_):
         """Evaluate a GEPA candidate by running the full RL loop (existing budget)."""
+        nonlocal run_counter, metric_call_idx
+        metric_call_idx += 1
         reward_code = getattr(prediction, "reward_code", "")
         failsafe_score = 0.0
         if not reward_code.strip():
             return ScoreWithFeedback(score=failsafe_score, feedback="Empty reward code")
 
-        example_id = get_example_id(example)
-        job_cfg_raw = getattr(example, "job_config", {}) or {}
-        budgeted_cfg, budget_notes = clamp_job_budget(job_cfg_raw)
-        candidate_fp = make_candidate_fingerprint(reward_code, budgeted_cfg)
-        cache_key = (example_id, candidate_fp)
+        baseline_solve_rate_mean = sparse_baseline_mean if sparse_baseline_mean else None
+        per_env_results = []
+        total_elapsed = 0.0
+        # Evaluate across env jobs serially.
+        for job in jobs:
+            example_id = job.name
+            baseline_solve_rate = sparse_baselines.get(example_id, {}).get("solve_rate")
+            job_cfg_raw = job.to_config()
+            budgeted_cfg, budget_notes = clamp_job_budget(job_cfg_raw)
+            seed = derive_seed(example_id, reward_code)
+            budgeted_cfg.setdefault("train_seed", seed)
+            budgeted_cfg.setdefault("eval_seed", seed + 1)
+            random.seed(seed)
+            np.random.seed(seed % (2**32 - 1))
 
-        with cache_lock:
-            cached = metric_cache.get(cache_key)
-        if cached is not None:
-            print(f"[on_policy_metric] cache hit {example_id}#{candidate_fp} score={cached.score:.4f}")
-            return ScoreWithFeedback(score=cached.score, feedback=cached.feedback)
+            train_cfg = {k: v for k, v in budgeted_cfg.items() if k != "name"}
+            run_dir = logs_root / f"candidate-{run_counter:04d}-{example_id}"
+            run_counter += 1
+            run_dir.mkdir(parents=True, exist_ok=True)
 
-        seed = derive_seed(example_id, candidate_fp)
-        budgeted_cfg.setdefault("train_seed", seed)
-        budgeted_cfg.setdefault("eval_seed", seed + 1)
-        random.seed(seed)
-        np.random.seed(seed % (2**32 - 1))
+            if budget_notes:
+                print(f"[on_policy_metric] budget clamp {example_id}: " + "; ".join(budget_notes))
+            print(f"[on_policy_metric] evaluating {example_id} seed={seed} dir={run_dir.name}")
 
-        train_cfg = {k: v for k, v in budgeted_cfg.items() if k != "name"}
-        run_id = next(run_counter)
-        run_dir = logs_root / f"candidate-{run_id:04d}-{example_id}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        if budget_notes:
-            print(f"[on_policy_metric] budget clamp {example_id}: " + "; ".join(budget_notes))
-        print(f"[on_policy_metric] cache miss {example_id}#{candidate_fp} seed={seed} dir={run_dir.name}")
-
-        start = time.time()
-        try:
-            candidate_prompt = getattr(prediction, "prompt_text", None) or constraints_text
-            reward_generator = RewardGenerator(
-                constraints_text=candidate_prompt,
-                lm=base_lm,
-                max_sanitize_attempts=5,
-                failure_artifact_dir=run_dir / "sanitize_failures",
-                bootstrap_code=reward_code,
-                verbose=False,
-            )
-            result = run_training_with_reward(
-                reward_generator,
-                output_dir=str(run_dir),
-                config_override=train_cfg,
-                reward_mode="dense",
-            )
-
-            env_description = getattr(reward_generator, "last_env_description", None) or getattr(
-                example, "env_description", None
-            )
-            sanitizer_feedback = None
-            if getattr(reward_generator, "last_attempt_history", None):
-                try:
-                    sanitizer_feedback = reward_generator._build_feedback_block(  # type: ignore[attr-defined]
-                        reward_generator.last_attempt_history
-                    )
-                except Exception:
-                    sanitizer_feedback = None
-
-            row = build_dataset_row(
-                EnvJob.from_mapping(run_id, {**train_cfg, "name": job_cfg_raw.get("name", example_id)}),
-                result,
-                env_description=env_description,
-                candidate_prompt=candidate_prompt,
-                sanitizer_feedback=sanitizer_feedback,
-                budget_cfg=train_cfg,
-            )
-            row["job_name"] = example_id
-
-            guidance_note = (
-                "Context inputs describe this run (environment goal/rules, budgets, sanitizer notes). "
-                "They vary across jobs—provide general, environment-aware fixes, not hard-coded solutions."
-            )
-            reflection = build_reward_reflection(
-                row,
-                reflection_module=reflection_module,
-                guidance_text=f"{EUREKA_GUIDANCE}\n\n{guidance_note}",
-            )
-            sparse_curve = row.get("sparse_return_curve") or []
-
-            gt_eval = result.ground_truth_eval or {}
-            returns = gt_eval.get("returns") or []
-            successes = gt_eval.get("successes")
-            if successes is None:
-                successes = sum(1 for r in returns if r > 0.0)
-            total_eps = len(returns)
-            solve_rate = float(successes) / float(total_eps) if total_eps else float(gt_eval.get("success_rate", 0.0))
-            # Fallback to the previous metric if eval returns are missing.
-            if total_eps == 0 and not gt_eval:
-                solve_rate = float(sparse_curve[-1]) if sparse_curve else 0.0
-
-            elapsed = time.time() - start
-            cache_entry = MetricCacheEntry(
-                score=solve_rate,
-                feedback=reflection,
-                run_dir=run_dir,
-                created_at=time.time(),
-                sparse_curve=sparse_curve,
-            )
-            with cache_lock:
-                metric_cache[cache_key] = cache_entry
-                if candidate_table is not None:
-                    candidate_table.add_data(
-                        run_id,
-                        example_id,
-                        candidate_fp,
-                        candidate_prompt,
-                        result.emitted_reward_code,
-                        solve_rate,
-                        sparse_curve,
-                        reflection,
-                        str(run_dir),
-                        elapsed,
-                        "; ".join(budget_notes),
-                    )
-            if wandb_run is not None:
-                enqueue_log(
-                    {
-                        "gepa/candidate_return": solve_rate,
-                        "gepa/solve_rate": solve_rate,
-                        "gepa/candidate_idx": run_id,
-                        "gepa/example_id": example_id,
-                    },
-                    step=next(log_step_counter),
+            start = time.time()
+            try:
+                candidate_prompt = getattr(prediction, "prompt_text", None) or constraints_text
+                reward_generator = RewardGenerator(
+                    constraints_text=candidate_prompt,
+                    lm=base_lm,
+                    max_sanitize_attempts=5,
                 )
-            print(
-                f"[on_policy_metric] completed {example_id}#{candidate_fp} in {elapsed / 60:.2f}m "
-                f"score={solve_rate:.4f}"
-            )
-            return ScoreWithFeedback(score=solve_rate, feedback=reflection)
-        except Exception as exc:
-            elapsed = time.time() - start
-            print(f"[on_policy_metric] failure {example_id}#{candidate_fp} after {elapsed / 60:.2f}m: {exc}")
-            failure_feedback = f"Training failed: {exc}"
-            # Surface sanitizer guidance (if available) so GEPA can mutate prompts effectively.
-            if "reward_generator" in locals():
-                attempts = getattr(reward_generator, "last_attempt_history", None)
-                if attempts:
+                result = run_training_with_reward(
+                    reward_generator,
+                    output_dir=str(run_dir),
+                    config_override=train_cfg,
+                    reward_mode="dense",
+                )
+
+                env_description = getattr(reward_generator, "last_env_description", None) or getattr(
+                    example, "env_description", None
+                )
+                sanitizer_feedback = None
+                if getattr(reward_generator, "last_attempt_history", None):
                     try:
-                        extra = reward_generator._build_feedback_block(attempts)  # type: ignore[attr-defined]
-                        failure_feedback = f"{failure_feedback}\n\nSanitizer feedback:\n{extra}"
+                        sanitizer_feedback = reward_generator._build_feedback_block(  # type: ignore[attr-defined]
+                            reward_generator.last_attempt_history
+                        )
                     except Exception:
-                        # Do not let feedback formatting mask the original failure.
-                        pass
-            cache_entry = MetricCacheEntry(
-                score=failsafe_score,
-                feedback=failure_feedback,
-                run_dir=run_dir,
-                created_at=time.time(),
-                sparse_curve=[],
-            )
-            with cache_lock:
-                metric_cache[cache_key] = cache_entry
-                if candidate_table is not None:
-                    candidate_table.add_data(
-                        run_id,
-                        example_id,
-                        candidate_fp,
-                        candidate_prompt,
-                        reward_code,
-                        failsafe_score,
-                        [],
-                        failure_feedback,
-                        str(run_dir),
-                        elapsed,
-                        "; ".join(budget_notes),
-                    )
-            if wandb_run is not None:
-                enqueue_log(
-                    {
-                        "gepa/candidate_return": failsafe_score,
-                        "gepa/candidate_idx": run_id,
-                        "gepa/example_id": example_id,
-                        "gepa/error": str(exc),
-                    },
-                    step=next(log_step_counter),
+                        sanitizer_feedback = None
+
+                row = build_dataset_row(
+                    EnvJob.from_mapping(run_counter, {**train_cfg, "name": job_cfg_raw.get("name", example_id)}),
+                    result,
+                    env_description=env_description,
+                    candidate_prompt=candidate_prompt,
+                    sanitizer_feedback=sanitizer_feedback,
+                    budget_cfg=train_cfg,
                 )
-            return ScoreWithFeedback(score=failsafe_score, feedback=failure_feedback)
+                row["job_name"] = example_id
+
+                reflection = build_reward_reflection(
+                    row,
+                    reflection_module=reflection_module,
+                    guidance_text=EUREKA_GUIDANCE,
+                )
+                sparse_curve = row.get("sparse_return_curve") or []
+
+                gt_eval = result.ground_truth_eval or {}
+                returns = gt_eval.get("returns") or []
+                successes = gt_eval.get("successes")
+                if successes is None:
+                    successes = sum(1 for r in returns if r > 0.0)
+                total_eps = len(returns)
+                solve_rate = float(successes) / float(total_eps) if total_eps else float(gt_eval.get("success_rate", 0.0))
+                # Fallback to the previous metric if eval returns are missing.
+                if total_eps == 0 and not gt_eval:
+                    solve_rate = float(sparse_curve[-1]) if sparse_curve else 0.0
+
+                elapsed = time.time() - start
+                per_env_results.append(
+                    (example_id, solve_rate, sparse_curve, reflection, str(run_dir), baseline_solve_rate, run_counter)
+                )
+                total_elapsed += elapsed
+            except Exception as exc:
+                elapsed = time.time() - start
+                print(f"[on_policy_metric] failure {example_id} after {elapsed / 60:.2f}m: {exc}")
+                failure_feedback = f"Training failed: {exc}"
+                if "reward_generator" in locals():
+                    attempts = getattr(reward_generator, "last_attempt_history", None)
+                    if attempts:
+                        try:
+                            extra = reward_generator._build_feedback_block(attempts)  # type: ignore[attr-defined]
+                            failure_feedback = f"{failure_feedback}\n\nSanitizer feedback:\n{extra}"
+                        except Exception:
+                            pass
+                per_env_results.append(
+                    (example_id, failsafe_score, [], failure_feedback, str(run_dir), baseline_solve_rate, run_counter)
+                )
+                total_elapsed += elapsed
+                continue
+
+        # After looping envs, aggregate solve rates for GEPA
+        if not per_env_results:
+            return ScoreWithFeedback(score=failsafe_score, feedback="No envs evaluated")
+        solve_rates = [item[1] for item in per_env_results]
+        solve_rate_mean = float(np.mean(solve_rates))
+        solve_rate_median = float(np.median(solve_rates))
+        # Log candidate table aggregate (single row)
+        if candidate_table is not None:
+            run_id_primary = per_env_results[0][6] if per_env_results[0][6] is not None else 0
+            env_label = per_env_results[0][0] if len(per_env_results) == 1 else "multi-env"
+            prompt_text = getattr(prediction, "prompt_text", None) or constraints_text
+            reward_hash = hashlib.sha256(reward_code.encode("utf-8")).hexdigest()[:16]
+            feedback_text = per_env_results[0][3]
+            run_dir_primary = str(per_env_results[0][4])
+            candidate_table.add_data(
+                run_id_primary,
+                env_label,
+                solve_rate_mean,
+                baseline_solve_rate_mean,
+                reward_hash,
+                prompt_text,
+                feedback_text,
+                run_dir_primary,
+            )
+        # Log aggregate and per-env metrics
+        if wandb_run is not None:
+            payload = {
+                "gepa/solve_rate": solve_rate_mean,
+                "gepa/solve_rate_mean": solve_rate_mean,
+            }
+            if baseline_solve_rate_mean is not None:
+                payload["gepa/sparse_baseline_solve_rate"] = baseline_solve_rate_mean
+            safe_wandb_log(wandb_run, payload)
+
+        print(
+            f"[on_policy_metric] aggregate solve_rate mean={solve_rate_mean:.4f} "
+            f"median={solve_rate_median:.4f} over {len(per_env_results)} envs; elapsed={total_elapsed/60:.2f}m"
+        )
+        # Provide feedback from first env (arbitrary) to keep GEPA interface happy
+        feedback_text = per_env_results[0][3]
+        if io_table is not None:
+            prompt_text = getattr(prediction, "prompt_text", None) or constraints_text
+            io_table.add_data(metric_call_idx, solve_rate_mean, feedback_text, prompt_text)
+        return ScoreWithFeedback(score=solve_rate_mean, feedback=feedback_text)
 
     compiler = dspy.GEPA(
         metric=on_policy_metric,
-        auto=args.gepa_auto,
-        max_full_evals=args.max_full_evals,
         max_metric_calls=args.max_metric_calls,
         reflection_minibatch_size=reflection_minibatch_size,
         reflection_lm=base_lm,
-        use_merge=use_merge,
-        num_threads=args.num_threads,
         track_stats=True,
     )
 
@@ -630,29 +629,26 @@ def run_batch() -> None:
     write_active_prompt(state_root, prompt_payload)
 
     stats_path = logs_root / "gepa_stats.json"
-    stats_path.write_text(json.dumps(getattr(compiler, "stats", {}), indent=2, sort_keys=True), encoding="utf-8")
+    stats_payload = getattr(compiler, "stats", {}) or {}
+    stats_payload["sparse_baselines"] = sparse_baselines
+    stats_path.write_text(json.dumps(stats_payload, indent=2, sort_keys=True), encoding="utf-8")
 
     print(f"[run_reward_batch] GEPA completed. Active prompt updated at {get_active_prompt_path(state_root)}")
     print(f"[run_reward_batch] GEPA stats written to {stats_path}")
 
     if wandb_run is not None:
         if candidate_table is not None:
-            enqueue_log({"gepa/candidates": candidate_table}, step=next(log_step_counter))
-        if log_queue is not None:
-            log_queue.put(None)
-            # Queue.join() in Python's stdlib does not accept a timeout; block until the
-            # logging worker drains pending items, then proceed with teardown.
-            log_queue.join()
-        if log_thread is not None:
-            log_thread.join(timeout=5)
+            safe_wandb_log(wandb_run, {"gepa/candidates": candidate_table})
+        if io_table is not None:
+            safe_wandb_log(wandb_run, {"gepa/io_table": io_table})
         art = wandb.Artifact(f"{state_root.name}-gepa", type="gepa-state")
         _active = get_active_prompt_path(state_root)
         if _active.exists():
             art.add_file(str(_active), name="active_prompt.json")
         if stats_path.exists():
             art.add_file(str(stats_path), name="gepa_stats.json")
-        wandb_run.log_artifact(art)
-        wandb_run.finish(quiet=True)
+        safe_wandb_log_artifact(wandb_run, art)
+        safe_wandb_finish(wandb_run)
 
 
 if __name__ == "__main__":
