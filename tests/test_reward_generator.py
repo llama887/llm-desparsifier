@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
 from typing import Any
 
 import jax.numpy as jnp
@@ -63,7 +61,6 @@ def test_reward_generator_invokes_components():
         describe_fn=fake_describe,
         sanitize_fn=fake_sanitize,
         lm=object(),
-        verbose=False,
     )
 
     dense_fn, emitted = generator.generate(env=object(), env_params=object())
@@ -89,33 +86,23 @@ def test_reward_generator_retries_until_success():
 
         return dense_reward
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        failure_dir = Path(tmpdir)
-        generator = _TestableRewardGenerator(
-            synthesizer=synth,
-            describe_fn=lambda *_: "env",
-            sanitize_fn=fake_sanitize,
-            lm=object(),
-            verbose=False,
-            max_sanitize_attempts=3,
-            failure_artifact_dir=failure_dir,
-        )
+    generator = _TestableRewardGenerator(
+        synthesizer=synth,
+        describe_fn=lambda *_: "env",
+        sanitize_fn=fake_sanitize,
+        lm=object(),
+        max_sanitize_attempts=3,
+    )
 
-        dense_fn, _ = generator.generate(env=object(), env_params=object())
+    dense_fn, _ = generator.generate(env=object(), env_params=object())
 
-        assert attempt_counter["count"] == 2
-        assert len(synth.calls) == 2
-        retry_prompt = synth.calls[1]
-        assert "### Sanitizer retry guidance" in retry_prompt
-        assert "Attempt 1" in retry_prompt
-        assert "use ctx.get" in retry_prompt
-        assert dense_fn(None, None, None, None, {})[0] == 7.0
-
-        code_files = list(failure_dir.glob("attempt-01-*.py"))
-        err_files = list(failure_dir.glob("attempt-01-*.err.txt"))
-        feedback_files = list(failure_dir.glob("attempt-01-*.feedback.md"))
-        assert code_files and err_files and feedback_files
-
+    assert attempt_counter["count"] == 2
+    assert len(synth.calls) == 2
+    retry_prompt = synth.calls[1]
+    assert "### Sanitizer retry guidance" in retry_prompt
+    assert "Attempt 1" in retry_prompt
+    assert "use ctx.get" in retry_prompt
+    assert dense_fn(None, None, None, None, {})[0] == 7.0
 
 def test_reward_generator_raises_after_max_attempts():
     synth = _RetrySynth()
@@ -123,22 +110,17 @@ def test_reward_generator_raises_after_max_attempts():
     def always_fail(_code: str):
         raise ValueError("still invalid")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        failure_dir = Path(tmpdir)
-        generator = _TestableRewardGenerator(
-            synthesizer=synth,
-            describe_fn=lambda *_: "env",
-            sanitize_fn=always_fail,
-            lm=object(),
-            verbose=False,
-            max_sanitize_attempts=2,
-            failure_artifact_dir=failure_dir,
-        )
+    generator = _TestableRewardGenerator(
+        synthesizer=synth,
+        describe_fn=lambda *_: "env",
+        sanitize_fn=always_fail,
+        lm=object(),
+        max_sanitize_attempts=2,
+    )
 
-        with pytest.raises(RuntimeError) as excinfo:
-            generator.generate(env=object(), env_params=object())
+    with pytest.raises(RuntimeError) as excinfo:
+        generator.generate(env=object(), env_params=object())
 
-        message = str(excinfo.value)
-        assert "Failed to sanitize" in message
-        assert "Attempt 1" in message and "Attempt 2" in message
-        assert len(list(failure_dir.glob("attempt-*.py"))) == 2
+    message = str(excinfo.value)
+    assert "Failed to sanitize" in message
+    assert "Attempt 1" in message and "Attempt 2" in message

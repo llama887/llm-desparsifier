@@ -153,7 +153,7 @@ You must output exactly ONE function:
     # returns (total_reward: jnp.float32, reward_components: dict[str, jnp.float32])
 
 Hard requirements the sanitizer enforces:
-- The return statement must be exactly `return total_reward, reward_components` where `reward_components` is a Python dict with string keys and scalar jnp arrays as values.
+- The return statement must be `return total_reward, reward_components` where `reward_components` is a Python dict with string keys and scalar jnp arrays as values, **or** `return total_reward, { ... }` using a dict literal with string keys.
 - Access every ctx field with `.get(key, fallback)`; using `ctx[...]` is invalid.
 - Guard nested maps like `object_positions` with `.get` at each level.
 
@@ -197,13 +197,13 @@ def dummy_dense_reward(env_params, ts_prev, action, ts_next, ctx):
   yellow_square = obj_pos.get("yellow_square", jnp.array([-1, -1], dtype=jnp.int32))
   green_ball = obj_pos.get("green_ball", jnp.array([-1, -1], dtype=jnp.int32))
   ```
-- Call **only** JAX primitives (`jnp.*`, `jax.lax.*`) or helper functions you define inside `dense_reward`. Do **not** invoke Python `math.*`, `numpy.*`, or arbitrary library functions; the sanitizer will reject them.
+- Call **only** JAX primitives (`jnp.*`, `jax.lax.*`) or helper functions you define inside `dense_reward`. Method calls are restricted to `.astype(...)`. Do **not** invoke Python `math.*`, `numpy.*`, or arbitrary library functions; the sanitizer will reject them.
 - If you define helper functions inside dense_reward, ensure they are pure, side-effect free, and only call jnp/jax operations.
 - Do NOT access Python globals, files, network, randomness, or environment internals.
 - The function must be pure and JIT-friendly: no Python branching on array values; use jnp.where / lax.cond.
 - Reward should be shaped dense potential: make partial progress yield **positive** rewards (e.g., `potential - potential_prev`), and penalize regress/idle steps; small per-step penalty ok.
 - Must gracefully handle episode termination: set to 0 after terminal or add a success bonus that is consistent with sparse=1.
-- Build `reward_components = {"name": component_value, ...}` (string keys only) and return `(total_reward, reward_components)`.
+- Build `reward_components = {"name": component_value, ...}` (string keys only) and return `(total_reward, reward_components)`, or return a dict literal directly as the second tuple element.
 
 YOU MUST WRITE VALID JITTABLE JAX CODE
 """

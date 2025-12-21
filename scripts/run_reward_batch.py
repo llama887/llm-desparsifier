@@ -284,9 +284,8 @@ class RewardPromptProgram(dspy.Module):
         self.base_constraints = constraints_text
 
         class PromptSearch(dspy.Signature):
-            env_description: str = dspy.InputField()
             base_constraints: str = dspy.InputField()
-            prompt_text: str = dspy.OutputField(desc="Rewritten constraints for reward synthesis")
+            prompt_text: str = dspy.OutputField(desc="Evolved constraints for reward synthesis")
 
         class PromptGenerator(dspy.Module):
             def __init__(self, state: Optional[Mapping[str, Any]] = None):
@@ -298,8 +297,8 @@ class RewardPromptProgram(dspy.Module):
             def dump_state(self) -> Mapping[str, Any]:
                 return self.rewriter.dump_state()
 
-            def forward(self, env_description: str, base_constraints: str) -> str:
-                out = self.rewriter(env_description=env_description, base_constraints=base_constraints)
+            def forward(self, base_constraints: str) -> str:
+                out = self.rewriter(base_constraints=base_constraints)
                 return out.prompt_text
 
         self.prompt_generator = PromptGenerator(prompt_state)
@@ -309,9 +308,7 @@ class RewardPromptProgram(dspy.Module):
 
     def forward(self, env_description: str, constraints: Optional[str] = None):
         # GEPA now optimizes the rewrite of the base constraints; fallback to provided constraints.
-        prompt_text = constraints or self.prompt_generator(
-            env_description=env_description, base_constraints=self.base_constraints
-        )
+        prompt_text = constraints or self.prompt_generator(base_constraints=self.base_constraints)
         reward_code = self.synthesizer(env_description=env_description, constraints=prompt_text)
         return dspy.Prediction(reward_code=reward_code, prompt_text=prompt_text)
 

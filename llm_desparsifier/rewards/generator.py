@@ -123,7 +123,7 @@ class RewardGenerator:
             "Checklist:\n"
             "- Use ctx.get(...) with explicit fallbacks for every optional key.\n"
             "- Only call jnp.* or jax.* primitives; dict.get is the only permitted Python method for ctx-derived maps.\n"
-            "- Return (total_reward, reward_components) with scalar JAX arrays for every component.\n"
+            "- Return (total_reward, reward_components) or (total_reward, { ... }) with scalar JAX arrays for every component.\n"
             "- Avoid extra imports, global state, or non-JAX math operations.\n"
         )
         lines.append("Rewrite dense_reward so it satisfies all original constraints and fixes every issue above.")

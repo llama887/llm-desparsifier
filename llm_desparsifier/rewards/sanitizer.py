@@ -105,6 +105,8 @@ class _Sanitizer(ast.NodeVisitor):
         self._scope_stack.pop()
 
     def visit_Attribute(self, node):  # type: ignore[override]
+        if getattr(node, "attr", None) == "astype":
+            return self.generic_visit(node)
         if getattr(node, "attr", None) == "get" and isinstance(node.value, (ast.Name, ast.Attribute)):
             return self.generic_visit(node)
         root, chain = _decompose_attribute(node)
@@ -120,6 +122,8 @@ class _Sanitizer(ast.NodeVisitor):
 
     def visit_Call(self, node):  # type: ignore[override]
         if isinstance(node.func, ast.Attribute):
+            if node.func.attr == "astype":
+                return self.generic_visit(node)
             if node.func.attr == "get" and isinstance(node.func.value, (ast.Name, ast.Attribute)):
                 return self.generic_visit(node)
             root, chain = _decompose_attribute(node.func)
@@ -149,24 +153,33 @@ class _Sanitizer(ast.NodeVisitor):
 def _validate_reward_structure(func_node: ast.FunctionDef) -> list[str]:
     class _RewardVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
-            self.has_components_dict = False
             self.component_keys: list[str] = []
+
+        @staticmethod
+        def _extract_keys(node: ast.Dict) -> list[str]:
+            if not node.keys:
+                raise ValueError("reward_components dict must contain at least one entry")
+            keys: list[str] = []
+            for key in node.keys:
+                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                    raise ValueError("reward_components keys must be string literals")
+                keys.append(str(key.value))
+            return keys
+
+        def _register_keys(self, keys: list[str]) -> None:
+            if not self.component_keys:
+                self.component_keys = keys
+                return
+            if set(keys) != set(self.component_keys):
+                raise ValueError("reward_components keys must remain constant")
 
         def visit_Assign(self, node: ast.Assign) -> None:  # type: ignore[override]
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == "reward_components":
                     if not isinstance(node.value, ast.Dict):
                         raise ValueError("reward_components must be defined as a dict literal")
-                    if not node.value.keys:
-                        raise ValueError("reward_components dict must contain at least one entry")
-                    keys: list[str] = []
-                    for key in node.value.keys:
-                        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
-                            raise ValueError("reward_components keys must be string literals")
-                        keys.append(str(key.value))
-                    self.has_components_dict = True
-                    if not self.component_keys:
-                        self.component_keys = keys
+                    keys = self._extract_keys(node.value)
+                    self._register_keys(keys)
             self.generic_visit(node)
 
         def visit_Return(self, node: ast.Return) -> None:  # type: ignore[override]
@@ -175,13 +188,19 @@ def _validate_reward_structure(func_node: ast.FunctionDef) -> list[str]:
             if not isinstance(node.value, ast.Tuple) or len(node.value.elts) != 2:
                 raise ValueError("dense_reward must return (total_reward, reward_components)")
             components_node = node.value.elts[1]
-            if not isinstance(components_node, ast.Name) or components_node.id != "reward_components":
+            if isinstance(components_node, ast.Name):
+                if components_node.id != "reward_components":
+                    raise ValueError("second element of return must be reward_components")
+            elif isinstance(components_node, ast.Dict):
+                keys = self._extract_keys(components_node)
+                self._register_keys(keys)
+            else:
                 raise ValueError("second element of return must be reward_components")
             self.generic_visit(node)
 
     visitor = _RewardVisitor()
     visitor.visit(func_node)
-    if not visitor.has_components_dict:
+    if not visitor.component_keys:
         raise ValueError("reward_components dict literal is required before returning")
     return visitor.component_keys
 
