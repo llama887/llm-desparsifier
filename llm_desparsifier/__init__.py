@@ -5,7 +5,6 @@ from .rewards import RewardGenerator, create_reward_generator
 from .rl.pipeline import (
     RewardGeneratorProtocol,
     TrainingResult,
-    run_dense_and_sparse,
     run_training_with_reward,
 )
 
@@ -18,5 +17,4 @@ __all__ = [
     "TrainingResult",
     "RewardGenerator",
     "create_reward_generator",
-    "run_dense_and_sparse",
 ]

@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, TypedDict
+from typing import Any, Callable, Mapping, Optional, Protocol, TypedDict
 from typing import Literal
 
 import flax
@@ -27,12 +27,6 @@ from xminigrid.environment import EnvParams, Environment
 from xminigrid.wrappers import GymAutoResetWrapper
 
 from llm_desparsifier.rl.eval import GroundTruthEvalConfig, run_ground_truth_eval
-from llm_desparsifier.rl.metrics import (
-    GroundTruthLogRow,
-    compute_ground_truth_summary,
-    dump_ground_truth_logs,
-    dump_ground_truth_summary,
-)
 from llm_desparsifier.rl.structures import RolloutStats, Transition
 from llm_desparsifier.rl.wrappers import DesparsifyRewardWrapper
 from llm_desparsifier.utils import extract_xland_ctx
@@ -745,32 +739,10 @@ def run_training_with_reward(
     steps_per_meta = config.num_envs * config.num_steps_per_env
     total_meta_updates = int(meta_updates.shape[0]) if meta_updates.size else 0
     run_id = os.path.basename(os.path.normpath(output_dir)) or "run"
-    ground_truth_rows: list[GroundTruthLogRow] = []
-    if total_meta_updates > 0:
-        for idx in range(total_meta_updates):
-            global_step = int((idx + 1) * steps_per_meta)
-            wall_time = float(train_elapsed * ((idx + 1) / total_meta_updates)) if total_meta_updates else 0.0
-            gt_return = float(gt_series[idx])
-            gt_std = float(gt_std_series[idx]) if gt_std_series is not None else 0.0
-            ground_truth_rows.append(
-                GroundTruthLogRow(
-                    run_id=run_id,
-                    reward_mode=reward_mode,
-                    global_step=global_step,
-                    episode=idx,
-                    gt_return=gt_return,
-                    gt_return_std=gt_std,
-                    wall_time=wall_time,
-                    checkpoint_path="",
-                )
-            )
-
     # Simplified: skip plotting and CSV dumps to reduce overhead.
     gt_curve_path = ""
     dense_curve_path = ""
     combined_curve_path = ""
-    metrics_csv_path = None
-    metrics_summary_path = None
 
     # ========== Evaluation via ground-truth harness ==========
     eval_model = ActorCriticRNN(
@@ -833,8 +805,8 @@ def run_training_with_reward(
         "eval_rollout": rollout_path,
         "ctx_fn": "None" if ctx_fn_used is None else f"{ctx_fn_used.__module__}.{ctx_fn_used.__name__}",
         "reward_mode": reward_mode,
-        "ground_truth_metrics_csv": "" if metrics_csv_path is None else str(metrics_csv_path),
-        "ground_truth_summary": "" if metrics_summary_path is None else str(metrics_summary_path),
+        "ground_truth_metrics_csv": "",
+        "ground_truth_summary": "",
     }
 
     return TrainingResult(
@@ -846,56 +818,3 @@ def run_training_with_reward(
         reward_mode=reward_mode,
         ground_truth_eval=ground_truth_eval,
     )
-
-
-def run_dense_and_sparse(
-    reward_generator: RewardGeneratorProtocol,
-    output_dir: str,
-    *,
-    ctx_fn: Optional[Callable[..., Mapping[str, Any]]] = None,
-    config_override: Optional[Mapping[str, Any]] = None,
-    progress_callback: Optional[Callable[[int, Mapping[str, float]], None]] = None,
-    compare_dense_vs_sparse: bool = False,
-    default_reward_mode: RewardMode = "dense",
-) -> list[TrainingResult]:
-    """Run one or two training jobs sequentially depending on the compare flag.
-
-    When ``compare_dense_vs_sparse`` is True, runs the dense configuration first and
-    the sparse baseline second, writing each run into ``output_dir/<mode>``.
-    Otherwise runs a single job using ``default_reward_mode`` and writes to
-    ``output_dir`` directly (preserving legacy behavior).
-    """
-
-    if default_reward_mode not in ("dense", "sparse"):
-        raise ValueError(
-            f"Unsupported default_reward_mode '{default_reward_mode}'. Expected 'dense' or 'sparse'."
-        )
-
-    reward_modes: Sequence[RewardMode]
-    if compare_dense_vs_sparse:
-        reward_modes = ("dense", "sparse")
-    else:
-        reward_modes = (default_reward_mode,)
-
-    multi_run = len(reward_modes) > 1
-    results: list[TrainingResult] = []
-    for mode in reward_modes:
-        mode_output_dir = os.path.join(output_dir, mode) if multi_run else output_dir
-        mode_progress_cb = progress_callback
-        if progress_callback is not None:
-            def mode_progress(idx: int, metrics: Mapping[str, float], *, _mode=mode):
-                enriched = dict(metrics)
-                enriched.setdefault("reward_mode", _mode)
-                progress_callback(idx, enriched)
-            mode_progress_cb = mode_progress
-        result = run_training_with_reward(
-            reward_generator,
-            output_dir=mode_output_dir,
-            ctx_fn=ctx_fn,
-            config_override=config_override,
-            progress_callback=mode_progress_cb,
-            reward_mode=mode,
-        )
-        results.append(result)
-
-    return results
