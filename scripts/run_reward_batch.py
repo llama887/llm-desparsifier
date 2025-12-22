@@ -585,6 +585,8 @@ def run_batch() -> None:
                 feedback_text,
                 run_dir_primary,
             )
+            if wandb_run is not None:
+                safe_wandb_log(wandb_run, {"gepa/candidates": candidate_table}, step=metric_call_idx)
         # Log aggregate and per-env metrics
         if wandb_run is not None:
             payload = {
@@ -604,6 +606,8 @@ def run_batch() -> None:
         if io_table is not None:
             prompt_text = getattr(prediction, "prompt_text", None) or constraints_text
             io_table.add_data(metric_call_idx, solve_rate_mean, feedback_text, prompt_text)
+            if wandb_run is not None:
+                safe_wandb_log(wandb_run, {"gepa/io_table": io_table}, step=metric_call_idx)
         return ScoreWithFeedback(score=solve_rate_mean, feedback=feedback_text)
 
     compiler = dspy.GEPA(
