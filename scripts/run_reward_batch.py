@@ -354,6 +354,7 @@ def run_batch() -> None:
     io_table = None
     sparse_baselines: Dict[str, Dict[str, Any]] = {}
     sparse_baseline_mean: float = 0.0
+    last_wandb_step = -1
 
     if wandb is not None and not os.environ.get("WANDB_DISABLED"):
         try:
@@ -392,6 +393,17 @@ def run_batch() -> None:
             wandb_run = None
             io_table = None
 
+    def log_wandb(payload: Mapping[str, Any], *, step: Optional[int] = None) -> None:
+        nonlocal last_wandb_step
+        if wandb_run is None:
+            return
+        if step is None:
+            step = last_wandb_step + 1
+        else:
+            step = max(step, last_wandb_step + 1)
+        last_wandb_step = step
+        safe_wandb_log(wandb_run, payload, step=step)
+
     # ========== Sparse baseline (generic sparse reward) ==========
     if not args.skip_sparse_baseline:
         class _NullRewardGenerator:
@@ -422,27 +434,23 @@ def run_batch() -> None:
                     "artifacts": dict(baseline_result.artifacts),
                 }
                 per_env_baselines.append(solve_rate)
-                if wandb_run is not None:
-                    safe_wandb_log(
-                        wandb_run,
-                        {
-                            "gepa/example_id": job.name,
-                            "gepa/env_id": job.env_id,
-                            "gepa/sparse_baseline_solve_rate": solve_rate,
-                        },
-                        step=0,
-                    )
+                log_wandb(
+                    {
+                        "gepa/example_id": job.name,
+                        "gepa/env_id": job.env_id,
+                        "gepa/sparse_baseline_solve_rate": solve_rate,
+                    },
+                    step=0,
+                )
                 print(f"[sparse-baseline] {job.name} solve_rate={solve_rate:.4f}")
             except Exception as exc:  # pragma: no cover - baseline is best-effort
                 print(f"[sparse-baseline] FAILED {job.name}: {exc}")
         if per_env_baselines:
             sparse_baseline_mean = float(np.mean(per_env_baselines))
-            if wandb_run is not None:
-                safe_wandb_log(
-                    wandb_run,
-                    {"gepa/sparse_baseline_solve_rate_mean": sparse_baseline_mean},
-                    step=0,
-                )
+            log_wandb(
+                {"gepa/sparse_baseline_solve_rate_mean": sparse_baseline_mean},
+                step=0,
+            )
 
     program = RewardPromptProgram(constraints_text, synthesizer_state=synthesizer_state, prompt_state=prompt_state)
     examples = build_examples(jobs, constraints_text)
@@ -586,17 +594,15 @@ def run_batch() -> None:
                 feedback_text,
                 run_dir_primary,
             )
-            if wandb_run is not None:
-                safe_wandb_log(wandb_run, {"gepa/candidates": candidate_table}, step=metric_call_idx)
+            log_wandb({"gepa/candidates": candidate_table}, step=metric_call_idx)
         # Log aggregate and per-env metrics
-        if wandb_run is not None:
-            payload = {
-                "gepa/solve_rate": solve_rate_mean,
-                "gepa/solve_rate_mean": solve_rate_mean,
-            }
-            if baseline_solve_rate_mean is not None:
-                payload["gepa/sparse_baseline_solve_rate"] = baseline_solve_rate_mean
-            safe_wandb_log(wandb_run, payload, step=metric_call_idx)
+        payload = {
+            "gepa/solve_rate": solve_rate_mean,
+            "gepa/solve_rate_mean": solve_rate_mean,
+        }
+        if baseline_solve_rate_mean is not None:
+            payload["gepa/sparse_baseline_solve_rate"] = baseline_solve_rate_mean
+        log_wandb(payload, step=metric_call_idx)
 
         print(
             f"[on_policy_metric] aggregate solve_rate mean={solve_rate_mean:.4f} "
@@ -607,8 +613,7 @@ def run_batch() -> None:
         if io_table is not None:
             prompt_text = getattr(prediction, "prompt_text", None) or constraints_text
             io_table.add_data(metric_call_idx, solve_rate_mean, feedback_text, prompt_text)
-            if wandb_run is not None:
-                safe_wandb_log(wandb_run, {"gepa/io_table": io_table}, step=metric_call_idx)
+            log_wandb({"gepa/io_table": io_table}, step=metric_call_idx)
         return ScoreWithFeedback(score=solve_rate_mean, feedback=feedback_text)
 
     compiler = dspy.GEPA(
@@ -640,9 +645,9 @@ def run_batch() -> None:
 
     if wandb_run is not None:
         if candidate_table is not None:
-            safe_wandb_log(wandb_run, {"gepa/candidates": candidate_table})
+            log_wandb({"gepa/candidates": candidate_table})
         if io_table is not None:
-            safe_wandb_log(wandb_run, {"gepa/io_table": io_table})
+            log_wandb({"gepa/io_table": io_table})
         art = wandb.Artifact(f"{state_root.name}-gepa", type="gepa-state")
         _active = get_active_prompt_path(state_root)
         if _active.exists():
