@@ -10,15 +10,10 @@ import jax.numpy as jnp
 from flax import struct
 
 try:
-    from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
+    from flax.core.frozen_dict import freeze
 except ImportError:  # pragma: no cover - flax always available during training
-    FrozenDict = dict  # type: ignore[misc,assignment]
-
     def freeze(value):
         return value
-
-    def unfreeze(value):
-        return dict(value)
 
 
 @struct.dataclass
@@ -27,11 +22,6 @@ class RewardTimeStep(struct.PyTreeNode):
 
     base: object
     extras: Mapping = struct.field(default_factory=dict)
-
-    def replace(self, **kwargs):
-        extras = kwargs.pop("extras", self.extras)
-        new_base = self.base.replace(**kwargs)
-        return RewardTimeStep(new_base, extras)
 
     def __getattr__(self, name):
         return getattr(self.base, name)
@@ -55,30 +45,21 @@ class DesparsifyRewardWrapper:
         self.ctx_fn = ctx_fn
         self._dense_nargs = len(inspect.signature(dense_fn).parameters)
         self._component_keys = tuple(getattr(dense_fn, "__reward_component_keys__", ()))
-        self._component_template = self._build_component_template(self._component_keys)
-
-    def _unwrap(self, ts):
-        return ts.base if isinstance(ts, RewardTimeStep) else ts
+        self._component_template = freeze({name: jnp.float32(0.0) for name in self._component_keys}) if self._component_keys else None
 
     def _augment_extras(self, ts, original_reward, dense_reward, reward_components):
         source = ts.extras if isinstance(ts, RewardTimeStep) else getattr(ts, "extras", None)
-        if source is not None:
-            extras = source
-            if extras is None:
-                extras_out = {}
-            elif isinstance(extras, FrozenDict):
-                extras_out = unfreeze(extras)
-            elif isinstance(extras, Mapping):
-                extras_out = dict(extras)
+        if isinstance(source, Mapping):
+            extras_out = dict(source)
+        elif source is not None:
+            copy_fn = getattr(source, "copy", None)
+            if callable(copy_fn):
+                extras_out = copy_fn()
             else:
-                copy_fn = getattr(extras, "copy", None)
-                if callable(copy_fn):
-                    extras_out = copy_fn()
-                else:
-                    try:
-                        extras_out = dict(extras)
-                    except TypeError:
-                        extras_out = {"_wrapped_extras": extras}
+                try:
+                    extras_out = dict(source)
+                except TypeError:
+                    extras_out = {"_wrapped_extras": source}
         else:
             extras_out = {}
         extras_out["ground_truth_reward"] = original_reward
@@ -104,7 +85,7 @@ class DesparsifyRewardWrapper:
         return self._wrap_timestep(ts, reward, reward)
 
     def step(self, env_params, ts, action):
-        ts_base = self._unwrap(ts)
+        ts_base = ts.base if isinstance(ts, RewardTimeStep) else ts
         ts_next = self.env.step(env_params, ts_base, action)
         original_reward = ts_next.reward
         if self.ctx_fn is not None:
@@ -120,10 +101,6 @@ class DesparsifyRewardWrapper:
         else:  # fallback: keep sparse reward
             dense_output = ts_next.reward
 
-        dense_reward, reward_components = self._extract_reward_output(dense_output)
-        return self._wrap_timestep(ts_next, original_reward, dense_reward, reward_components)
-
-    def _extract_reward_output(self, dense_output):
         reward_components = None
         if isinstance(dense_output, tuple) and len(dense_output) == 2:
             dense_reward, reward_components = dense_output
@@ -131,20 +108,12 @@ class DesparsifyRewardWrapper:
                 raise TypeError("reward_components must be a mapping of component_name -> value")
         else:
             dense_reward = dense_output
-        return dense_reward, reward_components
-
-    def _build_component_template(self, keys):
-        if not keys:
-            return None
-        return freeze({name: jnp.float32(0.0) for name in keys})
+        return self._wrap_timestep(ts_next, original_reward, dense_reward, reward_components)
 
     def _normalize_reward_components(self, reward_components):
         if reward_components is None:
             return None
-        if isinstance(reward_components, FrozenDict):
-            frozen = reward_components
-        else:
-            frozen = freeze(reward_components)
+        frozen = freeze(reward_components)
         if not self._component_keys:
             return frozen
         actual_keys = tuple(frozen.keys())
@@ -166,7 +135,8 @@ class DesparsifyRewardWrapper:
         return self.env.observation_shape(env_params)
 
     def render(self, env_params, ts):
-        return self.env.render(env_params, self._unwrap(ts))
+        ts_base = ts.base if isinstance(ts, RewardTimeStep) else ts
+        return self.env.render(env_params, ts_base)
 
     def __getattr__(self, name):
         return getattr(self.env, name)
