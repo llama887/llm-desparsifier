@@ -15,9 +15,9 @@ def configure_portkey_lm(
     *,
     api_key: Optional[str] = None,
     base_url: str = "https://ai-gateway.apps.cloud.rt.nyu.edu/v1",
-    model_alias: str = "@o3-mini-5791cb/o3-mini",
+    model_alias: str = "@vertex-ai-3e806d/gemini-2.5-pro",
     temperature: float = 1.0,
-    max_completion_tokens: int = 160_000,
+    max_completion_tokens: int = 32_000,
 ) -> dspy.LM:
     """Configure DSPy to route requests through a Portkey gateway."""
     api_key = api_key or os.environ.get("PORTKEY_API_KEY")
