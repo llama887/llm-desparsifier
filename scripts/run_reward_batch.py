@@ -596,7 +596,7 @@ def run_batch() -> None:
             }
             if baseline_solve_rate_mean is not None:
                 payload["gepa/sparse_baseline_solve_rate"] = baseline_solve_rate_mean
-            safe_wandb_log(wandb_run, payload)
+            safe_wandb_log(wandb_run, payload, step=metric_call_idx)
 
         print(
             f"[on_policy_metric] aggregate solve_rate mean={solve_rate_mean:.4f} "
