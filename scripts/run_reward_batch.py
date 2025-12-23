@@ -37,6 +37,7 @@ from llm_desparsifier.rewards import (
     create_reward_reflection_module,
     configure_portkey_lm,
 )
+from llm_desparsifier.rewards.reflection import EUREKA_GUIDANCE
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT
 from llm_desparsifier.rl.pipeline import TrainingResult, run_training_with_reward
 from llm_desparsifier.utils import get_active_prompt_path, write_active_prompt
