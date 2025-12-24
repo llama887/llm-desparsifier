@@ -45,6 +45,20 @@ _ALLOWED_CALL_ATTRS = {
 }
 
 
+def _strip_markdown_fences(code: str) -> str:
+    stripped = code.strip()
+    if not stripped.startswith("```"):
+        return code
+    lines = stripped.splitlines()
+    if not lines:
+        return code
+    if not lines[0].strip().startswith("```"):
+        return code
+    if len(lines) >= 2 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return code
+
+
 def _decompose_attribute(node: ast.AST) -> tuple[ast.AST, list[str]]:
     chain: list[str] = []
     cur = node
@@ -154,6 +168,14 @@ def _validate_reward_structure(func_node: ast.FunctionDef) -> list[str]:
     class _RewardVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.component_keys: list[str] = []
+            self._func_depth = 0
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # type: ignore[override]
+            # Only validate returns/assignments in the top-level dense_reward body.
+            self._func_depth += 1
+            if self._func_depth == 1:
+                self.generic_visit(node)
+            self._func_depth -= 1
 
         @staticmethod
         def _extract_keys(node: ast.Dict) -> list[str]:
@@ -183,6 +205,8 @@ def _validate_reward_structure(func_node: ast.FunctionDef) -> list[str]:
             self.generic_visit(node)
 
         def visit_Return(self, node: ast.Return) -> None:  # type: ignore[override]
+            if self._func_depth != 1:
+                return
             if node.value is None:
                 raise ValueError("dense_reward must return (total_reward, reward_components)")
             if not isinstance(node.value, ast.Tuple) or len(node.value.elts) != 2:
@@ -207,6 +231,7 @@ def _validate_reward_structure(func_node: ast.FunctionDef) -> list[str]:
 
 def sanitize_and_compile(code: str):
     """Validate the generated code and return the compiled dense reward function."""
+    code = _strip_markdown_fences(code)
     tree = ast.parse(code)
     fdefs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
     if len(fdefs) != 1 or fdefs[0].name != "dense_reward":

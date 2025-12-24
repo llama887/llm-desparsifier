@@ -82,3 +82,35 @@ def test_sanitizer_blocks_disallowed_methods():
     )
     with pytest.raises(ValueError):
         sanitize_and_compile(bad_code)
+
+
+def test_sanitizer_strips_fenced_code_with_language_tag():
+    code = textwrap.dedent(
+        """
+        ```python   
+        def dense_reward(env_params, ts_prev, action, ts_next, ctx):
+            zeros = jnp.asarray(0.0, dtype=jnp.float32)
+            reward_components = {"progress": zeros}
+            return zeros, reward_components
+        ```   
+        """
+    )
+    fn = sanitize_and_compile(code)
+    result = fn(None, None, None, None, {})
+    assert result[0].shape == ()
+
+
+def test_sanitizer_strips_fenced_code_with_leading_whitespace():
+    code = textwrap.dedent(
+        """
+            ```python
+            def dense_reward(env_params, ts_prev, action, ts_next, ctx):
+                zeros = jnp.asarray(0.0, dtype=jnp.float32)
+                reward_components = {"progress": zeros}
+                return zeros, reward_components
+            ```
+        """
+    )
+    fn = sanitize_and_compile(code)
+    result = fn(None, None, None, None, {})
+    assert result[0].shape == ()

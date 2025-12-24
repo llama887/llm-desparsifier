@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
@@ -50,6 +51,8 @@ class RewardGenerator:
     sanitize_fn: Callable[[str], Callable] = sanitize_and_compile
     lm: Optional[dspy.LM] = None
     max_sanitize_attempts: int = 10
+    include_sanitizer_code_on_retry: bool = True
+    sanitizer_code_context: Optional[str] = field(default=None, init=False)
     last_attempt_history: List[_AttemptRecord] = field(default_factory=list, init=False)
     # Sticky cache of the most recent environment description sent to the LLM.
     # Used downstream for reflections so the feedback LM knows the goal/ruleset.
@@ -63,6 +66,8 @@ class RewardGenerator:
             dspy.configure(lm=self.lm)
         if self.max_sanitize_attempts < 1:
             raise ValueError("max_sanitize_attempts must be >= 1")
+        if self.include_sanitizer_code_on_retry:
+            self.sanitizer_code_context = self._load_sanitizer_context()
 
     def generate(self, env, env_params) -> Tuple[Callable, str]:
         """Return `(dense_fn, emitted_code)` for the given environment setup."""
@@ -74,14 +79,21 @@ class RewardGenerator:
             feedback_block = ""
             if attempt_history:
                 feedback_block = self._build_feedback_block(attempt_history)
-            constraints = f"{self.constraints_text}{feedback_block}"
+            sanitizer_block = ""
+            if attempt_history and self.include_sanitizer_code_on_retry and self.sanitizer_code_context:
+                sanitizer_block = (
+                    "\n\n### Sanitizer source (latest attempt only)\n"
+                    "Use this code to understand the exact constraints enforced during sanitization.\n"
+                    f"```python\n{self.sanitizer_code_context}\n```"
+                )
+            constraints = f"{self.constraints_text}{feedback_block}{sanitizer_block}"
             # Use thread-local DSPy settings to avoid cross-thread configure errors.
             with dspy.settings.context(lm=self.lm):
                 code = self.synthesizer(env_text, constraints)
 
             try:
                 dense_fn = self.sanitize_fn(code)
-            except ValueError as exc:
+            except (ValueError, SyntaxError) as exc:
                 error_text = f"{exc.__class__.__name__}: {exc}"
                 timestamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
                 record = _AttemptRecord(code=code, error_text=error_text, timestamp=timestamp)
@@ -105,6 +117,7 @@ class RewardGenerator:
         lines: List[str] = [
             "\n\n### Sanitizer retry guidance",
             f"You have already failed {len(attempts)} time(s). Review each failure carefully before emitting new code.",
+            "During the generation of the dense reward functions, we encountered these errors during sanitation:",
             "",
             "| Attempt | Timestamp (UTC) | Error |",
             "| --- | --- | --- |",
@@ -128,6 +141,11 @@ class RewardGenerator:
         )
         lines.append("Rewrite dense_reward so it satisfies all original constraints and fixes every issue above.")
         return "\n".join(lines)
+
+    @staticmethod
+    def _load_sanitizer_context() -> str:
+        sanitizer_path = Path(__file__).with_name("sanitizer.py")
+        return sanitizer_path.read_text(encoding="utf-8").strip()
 
     @staticmethod
     def _format_retry_failure(attempt_history: List[_AttemptRecord]) -> str:
