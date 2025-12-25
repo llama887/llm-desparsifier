@@ -3,19 +3,17 @@
 This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for XLand-MiniGrid. The main loop proposes reward prompts, runs the RL pipeline for each proposal, and feeds solve-rate scores plus EUREKA-style reflection text back into GEPA. LLM calls are routed through a Portkey gateway and require `PORTKEY_API_KEY`.
 
 ## DSPy GEPA contract (top level)
-- **Program under optimization**: `RewardPromptProgram` in `scripts/run_reward_batch.py`. Its `forward(env_description, constraints=None)`:
+- **Program under optimization**: `PromptOnlyProgram` in `scripts/run_reward_batch.py`. Its `forward(env_description, constraints=None)`:
   - Uses `PromptGenerator` (`dspy.Predict(PromptSearch)`) to rewrite the current `constraints_text` unless GEPA passes `constraints` explicitly.
-  - Calls `RewardSynthesizer` (`dspy.Predict(RewardSynthesis)`) to emit `reward_code` from the rewritten constraints + env description.
-  - Returns `dspy.Prediction(reward_code=..., prompt_text=...)`.
-- **Optimizer**: `dspy.GEPA(metric=on_policy_metric, max_metric_calls, reflection_minibatch_size, reflection_lm, track_stats=True)` created in `run_batch()`.
+  - Returns `dspy.Prediction(prompt_text=...)` only (no reward-code predictor in the program graph).
+- **Optimizer**: `dspy.GEPA(metric=on_policy_metric, max_metric_calls, reflection_lm, track_stats=True, num_threads=1)` created in `run_batch()`.
 - **Metric contract**: `metric(gold: Example, pred: Prediction, trace=None, pred_name=None, pred_trace=None) -> float | ScoreWithFeedback`. `ScoreWithFeedback` contains a numeric `score` and free-form `feedback` text. Higher scores are better and are expected to be in `[0, 1]`.
-- **How GEPA uses it here**: `on_policy_metric` runs a full RL training + evaluation loop per candidate and returns `ScoreWithFeedback(score=mean_solve_rate, feedback=reflection_text)`. The score is averaged across all env jobs in the current grid; feedback text is taken from the first env (to satisfy GEPA's interface).
+- **How GEPA uses it here**: `on_policy_metric` runs a full RL training + evaluation loop per *example* and returns `ScoreWithFeedback(score=solve_rate, feedback=reflection_text)`. Feedback requests for predictors reuse the cached `solve_rate` for that example+prompt so the feedback score matches the module score, per the DSPy GEPA contract.
 
 ## Inputs and state
 - **Env grid -> DSPy examples**: `configs/gepa_envs.yaml` is parsed into `EnvJob` objects (`env_id`, `benchmark_id`, `total_timesteps`, `train_seed`, `eval_seed`). `build_examples()` converts each job into a `dspy.Example(env_description="<env_id> | benchmark=<id>")`, attaches `example.job_config`, and sets `example.job_name`. Edit the YAML to change which environments GEPA optimizes over.
 - **Prompt state**: `STATE_ROOT/active_prompt.json` (default `artifacts/gepa_state/`) stores:
   - `constraints_text` (the current prompt block),
-  - `synthesizer_state` (DSPy weights for `RewardSynthesizer`),
   - `prompt_state` (DSPy weights for `PromptGenerator`),
   - `updated_at`, `source` metadata.
   The runner loads `active_prompt.json` if present; otherwise it falls back to `llm_desparsifier/rewards/prompts/base_reward_prompt.txt`, else the hard-coded `CONSTRAINTS_TEXT`. After GEPA completes it overwrites `active_prompt.json` atomically via `write_active_prompt`.
@@ -26,8 +24,8 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 
 ## Candidate evaluation flow (per GEPA proposal)
 - **Budget clamp**: `clamp_job_budget()` caps per-candidate cost (`total_timesteps <= 20M`, `num_envs <= 1024`, `eval_num_envs <= 128`, `eval_num_episodes <= 20`) and records any reductions in `budget_notes`. Missing keys are defaulted to the caps.
-- **Seeds**: if the env grid does not specify `train_seed`/`eval_seed`, they are derived deterministically from `example_id` + `reward_code` (train seed) and `train_seed + 1` (eval seed). If the grid provides seeds, they are respected.
-- **Reward synthesis**: `RewardGenerator.generate()` builds the env description via `describe_ruleset`, calls the DSPy reward LLM, sanitizes/compiles with `sanitize_and_compile`, and retries with detailed sanitizer feedback on failure. In `run_reward_batch.py` the max sanitize attempts is set to 5.
+- **Seeds**: if the env grid does not specify `train_seed`/`eval_seed`, they are derived deterministically from `example_id` + `prompt_text` (train seed) and `train_seed + 1` (eval seed). If the grid provides seeds, they are respected. Reward-code hashes/logs are derived from the emitted code used in training.
+- **Reward synthesis**: `RewardGenerator.generate()` builds the env description via `describe_ruleset`, calls the DSPy reward LLM using the GEPA-optimized `prompt_text`, sanitizes/compiles with `sanitize_and_compile`, and retries with detailed sanitizer feedback on failure. In `run_reward_batch.py` the max sanitize attempts is set to 5.
 - **Training**: `run_training_with_reward()` launches PPO with an RNN policy (`TrainConfig` defaults) and installs the dense reward via `DesparsifyRewardWrapper`. Dense rewards are used only for training; evaluation uses sparse rewards.
 - **Ground-truth evaluation**: `run_ground_truth_eval()` executes `eval_num_episodes` sparse episodes with the trained policy and returns per-episode returns/lengths plus success counts. These feed the GEPA score and reflection text.
 
@@ -39,6 +37,7 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 
 ## Feedback channel to GEPA
 - The metric returns `ScoreWithFeedback(score=solve_rate, feedback=<reflection text>)` so GEPA can optimize with both numbers and natural-language guidance.
+- If GEPA requests predictor-specific feedback (`pred_name`/`pred_trace`), the feedback text is prefixed with a short predictor header and the score is reused from the cached per-example evaluation.
 - `build_reward_reflection()` composes the reflection input from:
   - **Env summary**: full `describe_ruleset` text when available, else `env_id | benchmark=<id>`.
   - **Reward code**: sanitized `dense_reward` source string.
@@ -68,7 +67,7 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 ## Artifacts and layout
 - `STATE_ROOT/gepa_runs/candidate-####-<job>`: per-candidate outputs, emitted reward code, metrics, W&B run dir.
 - `STATE_ROOT/gepa_runs/sparse_baseline/<job>`: sparse baseline outputs.
-- `STATE_ROOT/active_prompt.json`: latest prompt/synthesizer state after GEPA completes.
+- `STATE_ROOT/active_prompt.json`: latest prompt state after GEPA completes.
 - `STATE_ROOT/gepa_runs/gepa_stats.json`: GEPA stats plus sparse baseline summary.
 
 ## Running the loop
@@ -92,15 +91,16 @@ Optional env vars:
 - **Per-env budgets**: `configs/gepa_envs.yaml` (`total_timesteps`, `train_seed`, `eval_seed`, etc.). Any value above the caps will be clamped in `clamp_job_budget`; lower values are respected.
 - **Global caps**: `MAX_TOTAL_TIMESTEPS`, `MAX_NUM_ENVS`, `MAX_EVAL_ENVS`, `MAX_EVAL_EPISODES` near the top of `scripts/run_reward_batch.py`.
 - **RL training defaults**: `llm_desparsifier/rl/pipeline.py:TrainConfig` (policy sizes, PPO knobs, eval counts, seeds). Override by adding keys to a job entry in the env grid; GEPA passes them through to `TrainConfig(**config_override)`.
-- **GEPA search budget**: `--max-metric-calls` (default 80) and `--reflection-minibatch-size` when running `scripts/run_reward_batch.py`.
+- **GEPA search budget**: `--max-metric-calls` (default 80) when running `scripts/run_reward_batch.py`.
 - **LLM routing**: `llm_desparsifier/rewards/llm_client.py` (`base_url`, `model_alias`, `temperature`, `max_completion_tokens`).
 - **Reward sanitizer**: `llm_desparsifier/rewards/sanitizer.py` (allowed ops and structure checks).
 
 ## Logging (minimal, high-signal)
 - `WANDB_DISABLED=1` skips W&B; otherwise project/name are set in `scripts/run_reward_batch.py`.
 - Each run logs:
-  - `gepa/solve_rate` and `gepa/solve_rate_mean` (solve rate per GEPA candidate over the env batch).
-  - `gepa/sparse_baseline_solve_rate` and `gepa/sparse_baseline_solve_rate_mean` (sparse baseline metrics when enabled).
-  - `gepa/candidates` table: `step`, `env_id`, `solve_rate`, `sparse_baseline`, `reward_code_sha16`, `prompt_text`, `feedback`, `run_dir`.
+  - `gepa/solve_rate` and `gepa/solve_rate_mean`: per-example solve rate for the current metric call (both set to the same value).
+  - `gepa/sparse_baseline_solve_rate_mean`: global mean sparse baseline solve rate across the env grid (logged once at step 0).
+  - `gepa/sparse_baseline_solve_rate`: per-env sparse baseline solve rate (logged once at step 0 alongside `gepa/example_id` and `gepa/env_id`).
+  - `gepa/candidates` table: `step`, `env_id`, `solve_rate`, `sparse_baseline` (per-env baseline for that example), `reward_code_sha16`, `prompt_text`, `feedback`, `run_dir`.
   - `gepa/io_table` (per metric call): `metric_call`, `score`, `feedback`, `prompt_text`.
   - Artifacts under `STATE_ROOT/gepa_runs/` plus `active_prompt.json` and `gepa_stats.json`.

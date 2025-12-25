@@ -95,7 +95,7 @@ class RewardGenerator:
                 dense_fn = self.sanitize_fn(code)
             except (ValueError, SyntaxError) as exc:
                 error_text = f"{exc.__class__.__name__}: {exc}"
-                timestamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
                 record = _AttemptRecord(code=code, error_text=error_text, timestamp=timestamp)
                 attempt_history.append(record)
                 feedback_snapshot = self._build_feedback_block(attempt_history)
