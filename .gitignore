@@ -223,6 +223,7 @@ logs/
 metadata.json
 train_dense.jsonl
 optimized_prompt.json
+sparse_baseline.json
 ready_for_gepa
 prompt_ready
 llm_plans

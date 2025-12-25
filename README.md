@@ -19,7 +19,8 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
   The runner loads `active_prompt.json` if present; otherwise it falls back to `llm_desparsifier/rewards/prompts/base_reward_prompt.txt`, else the hard-coded `CONSTRAINTS_TEXT`. After GEPA completes it overwrites `active_prompt.json` atomically via `write_active_prompt`.
 - **Run artifacts**:
   - `STATE_ROOT/gepa_runs/candidate-####-<job>`: per-candidate training outputs, reward code, metrics, W&B run dir.
-  - `STATE_ROOT/gepa_runs/sparse_baseline/<job>`: sparse baseline runs (if enabled).
+  - `STATE_ROOT/gepa_runs/sparse_baseline/<job>`: sparse baseline runs (cached).
+  - `sparse_baseline.json`: cached sparse baseline summary (repo root).
   - `STATE_ROOT/gepa_runs/gepa_stats.json`: GEPA optimizer stats plus sparse baselines.
 
 ## Candidate evaluation flow (per GEPA proposal)
@@ -67,6 +68,7 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 ## Artifacts and layout
 - `STATE_ROOT/gepa_runs/candidate-####-<job>`: per-candidate outputs, emitted reward code, metrics, W&B run dir.
 - `STATE_ROOT/gepa_runs/sparse_baseline/<job>`: sparse baseline outputs.
+- `sparse_baseline.json`: cached sparse baseline summary (repo root).
 - `STATE_ROOT/active_prompt.json`: latest prompt state after GEPA completes.
 - `STATE_ROOT/gepa_runs/gepa_stats.json`: GEPA stats plus sparse baseline summary.
 

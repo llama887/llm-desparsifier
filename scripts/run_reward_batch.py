@@ -39,6 +39,7 @@ from llm_desparsifier.rewards import (
 from llm_desparsifier.rewards.reflection import EUREKA_GUIDANCE
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT
 from llm_desparsifier.rl.pipeline import TrainingResult, run_training_with_reward
+from llm_desparsifier.rl.sparse_baseline import DEFAULT_BASELINE_JSON, ensure_sparse_baseline
 from llm_desparsifier.utils import get_active_prompt_path, write_active_prompt
 
 DEFAULT_ENV_GRID = Path("configs/gepa_envs.yaml")
@@ -139,11 +140,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Hard cap on GEPA metric calls (defaults to 80).",
-    )
-    parser.add_argument(
-        "--skip-sparse-baseline",
-        action="store_true",
-        help="Skip the pre-GEPA sparse reward baseline run (no horizontal solve-rate line).",
     )
     return parser.parse_args()
 
@@ -410,53 +406,14 @@ def run_batch() -> None:
         last_wandb_step = step
         safe_wandb_log(wandb_run, payload, step=step)
 
-    # ========== Sparse baseline (generic sparse reward) ==========
-    if not args.skip_sparse_baseline:
-        class _NullRewardGenerator:
-            def generate(self, *_, **__):
-                raise RuntimeError("Sparse baseline should not call reward generator")
-
-        baseline_root = logs_root / "sparse_baseline"
-        baseline_root.mkdir(exist_ok=True)
-        per_env_baselines = []
-        for job in jobs:
-            baseline_dir = baseline_root / job.name
-            baseline_dir.mkdir(parents=True, exist_ok=True)
-            print(f"[sparse-baseline] running {job.name} into {baseline_dir}")
-            try:
-                baseline_result = run_training_with_reward(
-                    _NullRewardGenerator(),
-                    output_dir=str(baseline_dir),
-                    config_override=job.to_config(),
-                    reward_mode="sparse",
-                )
-                solve_rate = float(baseline_result.final_metrics.get("solve_rate", 0.0))
-                sparse_curve = to_float_list(
-                    baseline_result.train_info.get("loss_info", {}).get("eval/ground_truth_returns_mean")
-                )
-                sparse_baselines[job.name] = {
-                    "solve_rate": solve_rate,
-                    "sparse_curve": sparse_curve,
-                    "artifacts": dict(baseline_result.artifacts),
-                }
-                per_env_baselines.append(solve_rate)
-                log_wandb(
-                    {
-                        "gepa/example_id": job.name,
-                        "gepa/env_id": job.env_id,
-                        "gepa/sparse_baseline_solve_rate": solve_rate,
-                    },
-                    step=0,
-                )
-                print(f"[sparse-baseline] {job.name} solve_rate={solve_rate:.4f}")
-            except Exception as exc:  # pragma: no cover - baseline is best-effort
-                print(f"[sparse-baseline] FAILED {job.name}: {exc}")
-        if per_env_baselines:
-            sparse_baseline_mean = float(np.mean(per_env_baselines))
-            log_wandb(
-                {"gepa/sparse_baseline_solve_rate_mean": sparse_baseline_mean},
-                step=0,
-            )
+    sparse_baselines, sparse_baseline_mean = ensure_sparse_baseline(
+        jobs,
+        logs_root=logs_root,
+        baseline_json_path=DEFAULT_BASELINE_JSON,
+        log_wandb=log_wandb,
+        env_grid_path=env_grid_path,
+        state_root=state_root,
+    )
 
     program = PromptOnlyProgram(constraints_text, prompt_state=prompt_state)
     trainset = build_examples(jobs, constraints_text)  # on-policy: no static holdout
@@ -483,11 +440,38 @@ def run_batch() -> None:
         example_id = job.name
         cache_key = (example_id, candidate_prompt)
         if pred_name is not None:
+            try:
+                from dspy.teleprompt.bootstrap_trace import FailedPrediction  # type: ignore
+            except Exception:  # pragma: no cover - defensive
+                FailedPrediction = None  # type: ignore
+
+            def _has_failed_prediction(trace_obj: Any) -> bool:
+                if FailedPrediction is None or not trace_obj:
+                    return False
+                for item in trace_obj:
+                    if isinstance(item, (list, tuple)) and len(item) >= 3:
+                        if isinstance(item[2], FailedPrediction):
+                            return True
+                return False
+
+            if _has_failed_prediction(pred_trace) or _has_failed_prediction(trace):
+                feedback_text = format_feedback(
+                    "Trace contains FailedPrediction; returning failure score.",
+                    pred_name,
+                    pred_trace,
+                )
+                return ScoreWithFeedback(score=failsafe_score, feedback=feedback_text)
             cached = metric_cache.get(cache_key)
             if cached is not None:
                 feedback_text = format_feedback(cached["reflection"], pred_name, pred_trace)
                 return ScoreWithFeedback(score=cached["solve_rate"], feedback=feedback_text)
             print(f"[on_policy_metric] warning: missing cache for feedback ({example_id})")
+            feedback_text = format_feedback(
+                "Missing cached score for predictor feedback; returning failure score.",
+                pred_name,
+                pred_trace,
+            )
+            return ScoreWithFeedback(score=failsafe_score, feedback=feedback_text)
         metric_call_idx += 1
         baseline_solve_rate = sparse_baselines.get(example_id, {}).get("solve_rate")
         baseline_solve_rate_mean = sparse_baseline_mean if sparse_baseline_mean else None
@@ -578,6 +562,10 @@ def run_batch() -> None:
                         failure_feedback = f"{failure_feedback}\n\nSanitizer feedback:\n{extra}"
                     except Exception:
                         pass
+            metric_cache[cache_key] = {
+                "solve_rate": failsafe_score,
+                "reflection": failure_feedback,
+            }
             feedback_text = format_feedback(failure_feedback, pred_name, pred_trace)
             return ScoreWithFeedback(score=failsafe_score, feedback=feedback_text)
 
