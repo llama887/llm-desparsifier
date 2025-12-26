@@ -329,6 +329,16 @@ class PromptOnlyProgram(dspy.Module):
     ):
         super().__init__()
         self.base_constraints = constraints_text
+        # Static meta-instructions that tell the LM to rewrite constraints only.
+        # We keep them outside the constraint block so the rewrite focuses on the
+        # content users care about, and we can later strip/verify if needed.
+        self.rewrite_preamble = (
+            "You are refining reward-spec constraints for a dense reward generator.\n"
+            "- Task: rewrite the constraints text to be clearer/safer.\n"
+            "- Output: ONLY the rewritten constraints text (no Python code, no code fences).\n"
+            "- Preserve all mandatory rules and headings; you may tighten/clarify them.\n"
+            "- Do NOT add or output any Python function bodies or examples.\n"
+        )
 
         class PromptSearch(dspy.Signature):
             base_constraints: str = dspy.InputField()
@@ -350,9 +360,20 @@ class PromptOnlyProgram(dspy.Module):
 
         self.prompt_generator = PromptGenerator(prompt_state)
 
+    def _build_rewrite_prompt(self) -> str:
+        """Wrap the base constraints so the LM is steered to rewrite text, not emit code."""
+        return (
+            f"{self.rewrite_preamble}"
+            "=== CONSTRAINTS TO REWRITE START ===\n"
+            f"{self.base_constraints.strip()}\n"
+            "=== CONSTRAINTS TO REWRITE END ===\n"
+            "Return only the rewritten constraints text."
+        )
+
     def forward(self, env_description: str, constraints: Optional[str] = None):
         # GEPA optimizes the rewrite of the base constraints; fallback to provided constraints.
-        prompt_text = constraints or self.prompt_generator(base_constraints=self.base_constraints)
+        rewrite_prompt = self._build_rewrite_prompt()
+        prompt_text = constraints or self.prompt_generator(base_constraints=rewrite_prompt)
         return dspy.Prediction(prompt_text=prompt_text)
 
 
