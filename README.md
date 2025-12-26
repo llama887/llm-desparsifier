@@ -89,7 +89,6 @@ Optional env vars:
 - `GEPA_OCCUPY_GPU_DUTY_MS` optional sleep between matmuls in milliseconds (default: 0).
 
 ## GPU occupier helper
-- During LLM-only phases (reward synthesis + reflection), the runner spawns `scripts/occupy_gpu.py` to keep the RTX8000 busy.
 - The occupier stops before PPO training starts, so it does not compete with RL training.
 
 ## Behavioral notes

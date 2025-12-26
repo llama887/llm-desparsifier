@@ -29,7 +29,7 @@ from xminigrid.wrappers import GymAutoResetWrapper
 from llm_desparsifier.rl.eval import GroundTruthEvalConfig, run_ground_truth_eval
 from llm_desparsifier.rl.structures import RolloutStats, Transition
 from llm_desparsifier.rl.wrappers import DesparsifyRewardWrapper
-from llm_desparsifier.utils import extract_xland_ctx, start_gpu_occupier, stop_gpu_occupier
+from llm_desparsifier.utils import extract_xland_ctx
 
 
 class RewardGeneratorProtocol(Protocol):
@@ -407,11 +407,7 @@ def make_states(
     if reward_mode == "dense":
         if reward_generator is None:
             raise ValueError("reward_generator must be provided for dense training runs")
-        start_gpu_occupier()
-        try:
-            dense_reward, emitted_code = reward_generator.generate(env, env_params)
-        finally:
-            stop_gpu_occupier()
+        dense_reward, emitted_code = reward_generator.generate(env, env_params)
         os.makedirs(output_dir, exist_ok=True)
         dense_path = os.path.join(output_dir, "dense_reward_synthesized.py")
         with open(dense_path, "w", encoding="utf-8") as f:
