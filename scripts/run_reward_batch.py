@@ -270,6 +270,40 @@ def format_feedback(feedback_text: str, pred_name: Optional[str], pred_trace: An
     return feedback_text
 
 
+def write_training_curve_png(
+    path: Path,
+    gepa_solve_rates: List[float],
+    sparse_baseline_mean: Optional[float],
+) -> None:
+    if not gepa_solve_rates:
+        print("[training-curve] no GEPA solve rates to plot; skipping training_curve.png")
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[training-curve] matplotlib unavailable; skipping plot ({exc})")
+        return
+
+    xs = list(range(1, len(gepa_solve_rates) + 1))
+    plt.figure(figsize=(8, 4))
+    plt.plot(xs, gepa_solve_rates, marker="o", linewidth=2.0, label="GEPA solve rate")
+    if sparse_baseline_mean is not None:
+        baseline_series = [float(sparse_baseline_mean)] * len(xs)
+        plt.plot(xs, baseline_series, linestyle="--", linewidth=2.0, label="Sparse baseline")
+    plt.xlabel("GEPA metric call")
+    plt.ylabel("Solve rate")
+    plt.title("Training Curve")
+    plt.legend(loc="best")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"[training-curve] wrote {path}")
+
+
 def job_from_example(example: dspy.Example) -> EnvJob:
     job_cfg_raw = getattr(example, "job_config", None)
     if not isinstance(job_cfg_raw, Mapping):
@@ -349,12 +383,15 @@ def run_batch() -> None:
     # Configure LM once; reuse for program + reflection.
     base_lm = configure_portkey_lm()
     dspy.configure(lm=base_lm)
+    dspy.settings.configure(provide_traceback=True)
+    print(f"[run_reward_batch] provide_traceback={dspy.settings.provide_traceback}")
 
     wandb_run = None
     candidate_table = None
     io_table = None
     sparse_baselines: Dict[str, Dict[str, Any]] = {}
     sparse_baseline_mean: float = 0.0
+    gepa_solve_rates: List[float] = []
     last_wandb_step = -1
 
     if wandb is not None and not os.environ.get("WANDB_DISABLED"):
@@ -406,6 +443,12 @@ def run_batch() -> None:
         last_wandb_step = step
         safe_wandb_log(wandb_run, payload, step=step)
 
+    baseline_budget_signature = {
+        "total_timesteps": MAX_TOTAL_TIMESTEPS,
+        "num_envs": MAX_NUM_ENVS,
+        "eval_num_envs": MAX_EVAL_ENVS,
+        "eval_num_episodes": MAX_EVAL_EPISODES,
+    }
     sparse_baselines, sparse_baseline_mean = ensure_sparse_baseline(
         jobs,
         logs_root=logs_root,
@@ -413,6 +456,8 @@ def run_batch() -> None:
         log_wandb=log_wandb,
         env_grid_path=env_grid_path,
         state_root=state_root,
+        config_clamper=clamp_job_budget,
+        budget_signature=baseline_budget_signature,
     )
 
     program = PromptOnlyProgram(constraints_text, prompt_state=prompt_state)
@@ -421,6 +466,8 @@ def run_batch() -> None:
     run_counter = 1
     metric_call_idx = 0
     metric_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+    score_by_prediction_id: Dict[int, float] = {}
+    feedback_by_prediction_id: Dict[int, str] = {}
 
     def on_policy_metric(
         example: dspy.Example,
@@ -431,10 +478,12 @@ def run_batch() -> None:
     ):
         """Evaluate a GEPA candidate by running the full RL loop (existing budget)."""
         nonlocal run_counter, metric_call_idx
+        training_curve_path = logs_root / "training_curve.png"
         failsafe_score = 0.0
         candidate_prompt = getattr(prediction, "prompt_text", None)
         if not isinstance(candidate_prompt, str) or not candidate_prompt.strip():
             candidate_prompt = constraints_text
+        prediction_key = id(prediction)
 
         job = job_from_example(example)
         example_id = job.name
@@ -461,17 +510,25 @@ def run_batch() -> None:
                     pred_trace,
                 )
                 return ScoreWithFeedback(score=failsafe_score, feedback=feedback_text)
-            cached = metric_cache.get(cache_key)
-            if cached is not None:
-                feedback_text = format_feedback(cached["reflection"], pred_name, pred_trace)
-                return ScoreWithFeedback(score=cached["solve_rate"], feedback=feedback_text)
-            print(f"[on_policy_metric] warning: missing cache for feedback ({example_id})")
+
+            cached_score = score_by_prediction_id.get(prediction_key)
+            cached_feedback = feedback_by_prediction_id.get(prediction_key)
+            if cached_score is None:
+                print(
+                    "[on_policy_metric] missing cached score for predictor feedback "
+                    f"example={example_id} pred_name={pred_name} "
+                    f"cache_key={cache_key}"
+                )
+                raise RuntimeError(
+                    "Missing cached score for predictor feedback; "
+                    "ensure scores are captured during primary metric evaluation."
+                )
             feedback_text = format_feedback(
-                "Missing cached score for predictor feedback; returning failure score.",
+                cached_feedback or "Missing cached feedback for predictor; returning score only.",
                 pred_name,
                 pred_trace,
             )
-            return ScoreWithFeedback(score=failsafe_score, feedback=feedback_text)
+            return ScoreWithFeedback(score=cached_score, feedback=feedback_text)
         metric_call_idx += 1
         baseline_solve_rate = sparse_baselines.get(example_id, {}).get("solve_rate")
         baseline_solve_rate_mean = sparse_baseline_mean if sparse_baseline_mean else None
@@ -566,7 +623,12 @@ def run_batch() -> None:
                 "solve_rate": failsafe_score,
                 "reflection": failure_feedback,
             }
+            score_by_prediction_id[prediction_key] = failsafe_score
+            feedback_by_prediction_id[prediction_key] = failure_feedback
             feedback_text = format_feedback(failure_feedback, pred_name, pred_trace)
+            gepa_solve_rates.append(failsafe_score)
+            baseline_line = sparse_baseline_mean if sparse_baselines else None
+            write_training_curve_png(training_curve_path, gepa_solve_rates, baseline_line)
             return ScoreWithFeedback(score=failsafe_score, feedback=feedback_text)
 
         reward_hash = hashlib.sha256(emitted_code.encode("utf-8")).hexdigest()[:16]
@@ -575,6 +637,11 @@ def run_batch() -> None:
             "solve_rate": solve_rate,
             "reflection": reflection,
         }
+        score_by_prediction_id[prediction_key] = solve_rate
+        feedback_by_prediction_id[prediction_key] = reflection
+        gepa_solve_rates.append(solve_rate)
+        baseline_line = sparse_baseline_mean if sparse_baselines else None
+        write_training_curve_png(training_curve_path, gepa_solve_rates, baseline_line)
 
         if candidate_table is not None:
             candidate_table.add_data(
@@ -618,7 +685,7 @@ def run_batch() -> None:
     prompt_payload = {
         "constraints_text": constraints_text,
         "prompt_state": optimized_program.prompt_generator.dump_state(),
-        "updated_at": dt.datetime.utcnow().isoformat(timespec="seconds"),
+        "updated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "source": prompt_meta,
     }
     write_active_prompt(state_root, prompt_payload)
@@ -626,10 +693,17 @@ def run_batch() -> None:
     stats_path = logs_root / "gepa_stats.json"
     stats_payload = getattr(compiler, "stats", {}) or {}
     stats_payload["sparse_baselines"] = sparse_baselines
+    stats_payload["sparse_baseline_mean"] = sparse_baseline_mean
+    stats_payload["gepa_solve_rate_series"] = gepa_solve_rates
+    stats_payload["baseline_budget_signature"] = baseline_budget_signature
     stats_path.write_text(json.dumps(stats_payload, indent=2, sort_keys=True), encoding="utf-8")
 
     print(f"[run_reward_batch] GEPA completed. Active prompt updated at {get_active_prompt_path(state_root)}")
     print(f"[run_reward_batch] GEPA stats written to {stats_path}")
+
+    training_curve_path = logs_root / "training_curve.png"
+    baseline_line = sparse_baseline_mean if sparse_baselines else None
+    write_training_curve_png(training_curve_path, gepa_solve_rates, baseline_line)
 
     if wandb_run is not None:
         if candidate_table is not None:
@@ -642,6 +716,8 @@ def run_batch() -> None:
             art.add_file(str(_active), name="active_prompt.json")
         if stats_path.exists():
             art.add_file(str(stats_path), name="gepa_stats.json")
+        if training_curve_path.exists():
+            art.add_file(str(training_curve_path), name="training_curve.png")
         safe_wandb_log_artifact(wandb_run, art)
         safe_wandb_finish(wandb_run)
 

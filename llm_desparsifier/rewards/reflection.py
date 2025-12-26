@@ -10,16 +10,20 @@ import numpy as np
 from llm_desparsifier.rewards.llm_client import configure_portkey_lm
 
 EUREKA_GUIDANCE = (
-    "You are the Reward Reflection module. We trained a dense-reward RL policy, "
+    "You are the Reward Reflection module, your job is to reflect on the current generated reward function."
+    "Your job is NOT to fix the reward function. We trained a dense-reward RL policy, "
     "logged sparse success curves plus per-component checkpoints, and now need actionable "
     "feedback. Carefully study the policy feedback and propose a revised reward strategy. "
+    "IMPORTANT: Do NOT output code, pseudo-code, diffs, or function definitions. "
+    "Do NOT include any fenced code blocks. Use concise natural-language guidance only. "
+    "Describe changes at a conceptual level (what to change and why), not how to implement them. "
     "Follow these tips: (1) If success/sparse returns stay "
-    "near zero, rewrite the entire reward structure. (2) When a component stays nearly "
+    "near zero, propose a new reward structure in words. (2) When a component stays nearly "
     "constant, RL could not optimize it—suggest scaling its magnitude, changing its "
     "temperature/shape, rewriting it, or discarding it. (3) If a component's magnitude "
     "dominates the rest, rescale it into a reasonable range. Reference specific component "
-    "names and explain how to adjust each one before describing how to rewrite the overall "
-    "reward function."
+    "names and explain how to adjust each one before describing how to revise the overall "
+    "reward function, without writing any code."
 )
 
 
@@ -32,7 +36,9 @@ class RewardReflectionSignature(dspy.Signature):
     component_curve_summary: str = dspy.InputField(desc="Per-component reward snapshots.")
     metrics_summary: str = dspy.InputField(desc="Aggregate evaluation metrics and gaps.")
     guidance: str = dspy.InputField(desc="Instructions describing the desired reflection style.")
-    reflection: str = dspy.OutputField(desc="Actionable EUREKA-style reward reflection.")
+    reflection: str = dspy.OutputField(
+        desc="Actionable EUREKA-style reward reflection (natural language only, no code blocks)."
+    )
 
 
 def create_reward_reflection_module(lm: Optional[dspy.LM] = None) -> dspy.Module:
@@ -77,7 +83,15 @@ def build_reward_reflection(
         )
         reflection_text = str(getattr(prediction, "reflection", "")).strip()
         if reflection_text:
-            return reflection_text
+            return _compose_feedback_with_raw_inputs(
+                reflection_text,
+                env_summary=env_summary,
+                reward_code=reward_code,
+                sparse_summary=sparse_summary,
+                component_summary=component_summary,
+                component_stats_summary=component_stats_summary,
+                metrics_summary=metrics_summary,
+            )
         raise ValueError("Empty reflection output from LM")
     except Exception as exc:  # pragma: no cover - exercised via fallback test
         return _compose_fallback_text(
@@ -159,6 +173,46 @@ def _sample_series(values: Any, num_points: int = 6) -> list[float]:
         return array.tolist()
     indices = np.linspace(0, array.size - 1, num_points, dtype=int)
     return [float(array[index]) for index in indices]
+
+
+def _compose_feedback_with_raw_inputs(
+    reflection_text: str,
+    *,
+    env_summary: str,
+    reward_code: str,
+    sparse_summary: str,
+    component_summary: str,
+    component_stats_summary: str,
+    metrics_summary: str,
+) -> str:
+    raw_sections = [
+        "Env summary:",
+        env_summary or "(empty)",
+        "",
+        "Sparse curve summary:",
+        sparse_summary or "(empty)",
+        "",
+        "Component curve summary:",
+        component_summary or "(empty)",
+        "",
+        "Component stats summary:",
+        component_stats_summary or "(empty)",
+        "",
+        "Metrics summary:",
+        metrics_summary or "(empty)",
+        "",
+        "Reward code (raw):",
+        reward_code or "(empty)",
+    ]
+    return "\n".join(
+        [
+            "[Reward reflection]",
+            reflection_text.strip(),
+            "",
+            "[Raw EUREKA inputs]",
+            "\n".join(raw_sections).strip(),
+        ]
+    ).strip()
 
 
 def _compose_fallback_text(

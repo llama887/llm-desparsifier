@@ -28,7 +28,7 @@ def to_float_list(value: Any) -> List[float]:
     return np.asarray(value, dtype=float).tolist()
 
 
-def load_sparse_baseline(path: Path) -> Optional[Tuple[Dict[str, Dict[str, Any]], float]]:
+def load_sparse_baseline_payload(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
@@ -38,6 +38,14 @@ def load_sparse_baseline(path: Path) -> Optional[Tuple[Dict[str, Dict[str, Any]]
     baselines = payload.get("sparse_baselines")
     if not isinstance(baselines, dict):
         return None
+    return payload
+
+
+def load_sparse_baseline(path: Path) -> Optional[Tuple[Dict[str, Dict[str, Any]], float]]:
+    payload = load_sparse_baseline_payload(path)
+    if payload is None:
+        return None
+    baselines = payload.get("sparse_baselines", {})
     mean_raw = payload.get("sparse_baseline_mean", 0.0)
     try:
         mean = float(mean_raw)
@@ -76,6 +84,7 @@ def run_sparse_baseline(
     jobs: List[JobLike],
     logs_root: Path,
     log_wandb: Callable[..., None],
+    config_clamper: Optional[Callable[[Mapping[str, Any]], Tuple[Dict[str, Any], List[str]]]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], float]:
     class _NullRewardGenerator:
         def generate(self, *_, **__):
@@ -90,10 +99,16 @@ def run_sparse_baseline(
         baseline_dir.mkdir(parents=True, exist_ok=True)
         print(f"[sparse-baseline] running {job.name} into {baseline_dir}")
         try:
+            job_cfg = job.to_config()
+            budget_notes: List[str] = []
+            if config_clamper is not None:
+                job_cfg, budget_notes = config_clamper(job_cfg)
+                if budget_notes:
+                    print(f"[sparse-baseline] budget clamp {job.name}: " + "; ".join(budget_notes))
             baseline_result = run_training_with_reward(
                 _NullRewardGenerator(),
                 output_dir=str(baseline_dir),
-                config_override=job.to_config(),
+                config_override=job_cfg,
                 reward_mode="sparse",
             )
             solve_rate = float(baseline_result.final_metrics.get("solve_rate", 0.0))
@@ -125,14 +140,25 @@ def ensure_sparse_baseline(
     log_wandb: Callable[..., None],
     env_grid_path: Optional[Path] = None,
     state_root: Optional[Path] = None,
+    config_clamper: Optional[Callable[[Mapping[str, Any]], Tuple[Dict[str, Any], List[str]]]] = None,
+    budget_signature: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], float]:
-    cached = load_sparse_baseline(baseline_json_path)
-    if cached is not None:
-        baselines, baseline_mean = cached
-        log_sparse_baseline(baselines, baseline_mean, log_wandb)
-        return baselines, baseline_mean
+    cached_payload = load_sparse_baseline_payload(baseline_json_path)
+    if cached_payload is not None:
+        cached_signature = cached_payload.get("budget_signature")
+        if budget_signature is None or cached_signature == budget_signature:
+            cached = load_sparse_baseline(baseline_json_path)
+            if cached is not None:
+                baselines, baseline_mean = cached
+                log_sparse_baseline(baselines, baseline_mean, log_wandb)
+                return baselines, baseline_mean
 
-    baselines, baseline_mean = run_sparse_baseline(jobs, logs_root, log_wandb)
+    baselines, baseline_mean = run_sparse_baseline(
+        jobs,
+        logs_root,
+        log_wandb,
+        config_clamper=config_clamper,
+    )
     payload: Dict[str, Any] = {
         "created_at": dt.datetime.utcnow().isoformat(timespec="seconds"),
         "sparse_baseline_mean": baseline_mean,
@@ -142,5 +168,7 @@ def ensure_sparse_baseline(
         payload["env_grid"] = str(env_grid_path)
     if state_root is not None:
         payload["state_root"] = str(state_root)
+    if budget_signature is not None:
+        payload["budget_signature"] = dict(budget_signature)
     save_sparse_baseline(baseline_json_path, payload)
     return baselines, baseline_mean
