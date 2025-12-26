@@ -83,6 +83,14 @@ Optional env vars:
 - `WANDB_DISABLED=1` to skip W&B logging.
 - `WANDB_PROJECT` to set the W&B project name.
 - `XLAND_MINIGRID_DATA` to override the XLand data cache location.
+- `GEPA_OCCUPY_GPU=0` to disable the GPU occupier helper (enabled by default).
+- `GEPA_OCCUPY_GPU_M` matrix size for the occupier (default: 4096).
+- `GEPA_OCCUPY_GPU_DTYPE` matmul dtype (`float16`, `bfloat16`, or `float32`, default: `float16`).
+- `GEPA_OCCUPY_GPU_DUTY_MS` optional sleep between matmuls in milliseconds (default: 0).
+
+## GPU occupier helper
+- During LLM-only phases (reward synthesis + reflection), the runner spawns `scripts/occupy_gpu.py` to keep the RTX8000 busy.
+- The occupier stops before PPO training starts, so it does not compete with RL training.
 
 ## Behavioral notes
 - The GEPA score is scale-free; multiplying a bad dense reward by 100 cannot improve solve rate.

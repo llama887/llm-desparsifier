@@ -40,7 +40,12 @@ from llm_desparsifier.rewards.reflection import EUREKA_GUIDANCE
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT
 from llm_desparsifier.rl.pipeline import TrainingResult, run_training_with_reward
 from llm_desparsifier.rl.sparse_baseline import DEFAULT_BASELINE_JSON, ensure_sparse_baseline
-from llm_desparsifier.utils import get_active_prompt_path, write_active_prompt
+from llm_desparsifier.utils import (
+    get_active_prompt_path,
+    start_gpu_occupier,
+    stop_gpu_occupier,
+    write_active_prompt,
+)
 
 DEFAULT_ENV_GRID = Path("configs/gepa_envs.yaml")
 BASE_PROMPT_PATH = Path("llm_desparsifier/rewards/prompts/base_reward_prompt.txt")
@@ -587,11 +592,15 @@ def run_batch() -> None:
             )
             row["job_name"] = example_id
 
-            reflection = build_reward_reflection(
-                row,
-                reflection_module=reflection_module,
-                guidance_text=EUREKA_GUIDANCE,
-            )
+            start_gpu_occupier()
+            try:
+                reflection = build_reward_reflection(
+                    row,
+                    reflection_module=reflection_module,
+                    guidance_text=EUREKA_GUIDANCE,
+                )
+            finally:
+                stop_gpu_occupier()
             sparse_curve = row.get("sparse_return_curve") or []
 
             gt_eval = result.ground_truth_eval or {}
