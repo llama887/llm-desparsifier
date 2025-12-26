@@ -1,32 +1,131 @@
 # Default batch of environments for GEPA data collection.
 jobs:
-  - name: trivial-r1-seed0
-    env_id: XLand-MiniGrid-R1-9x9
+  - name: trivial-r1-11x11-seed0
+    env_id: XLand-MiniGrid-R1-11x11
     benchmark_id: trivial-1m
     total_timesteps: 100000000
     train_seed: 0
     eval_seed: 1000
-  - name: trivial-r2-seed1
-    env_id: XLand-MiniGrid-R2-11x11
+  - name: trivial-r1-13x13-seed1
+    env_id: XLand-MiniGrid-R1-13x13
     benchmark_id: trivial-1m
     total_timesteps: 100000000
     train_seed: 1
     eval_seed: 1001
-  - name: trivial-r4-seed2
-    env_id: XLand-MiniGrid-R4-13x13
+  - name: trivial-r1-15x15-seed2
+    env_id: XLand-MiniGrid-R1-15x15
     benchmark_id: trivial-1m
     total_timesteps: 100000000
     train_seed: 2
     eval_seed: 1002
-  - name: trivial-r6-seed3
-    env_id: XLand-MiniGrid-R6-17x17
+  - name: trivial-r2-11x11-seed3
+    env_id: XLand-MiniGrid-R2-11x11
     benchmark_id: trivial-1m
     total_timesteps: 100000000
     train_seed: 3
     eval_seed: 1003
-  - name: trivial-r9-seed4
-    env_id: XLand-MiniGrid-R9-19x19
+  - name: trivial-r2-13x13-seed4
+    env_id: XLand-MiniGrid-R2-13x13
     benchmark_id: trivial-1m
     total_timesteps: 100000000
     train_seed: 4
     eval_seed: 1004
+  - name: trivial-r2-15x15-seed5
+    env_id: XLand-MiniGrid-R2-15x15
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 5
+    eval_seed: 1005
+  - name: trivial-r4-11x11-seed6
+    env_id: XLand-MiniGrid-R4-11x11
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 6
+    eval_seed: 1006
+  - name: trivial-r4-13x13-seed7
+    env_id: XLand-MiniGrid-R4-13x13
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 7
+    eval_seed: 1007
+  - name: trivial-r4-15x15-seed8
+    env_id: XLand-MiniGrid-R4-15x15
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 8
+    eval_seed: 1008
+  - name: trivial-r6-17x17-seed9
+    env_id: XLand-MiniGrid-R6-17x17
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 9
+    eval_seed: 1009
+  - name: trivial-r9-19x19-seed10
+    env_id: XLand-MiniGrid-R9-19x19
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 10
+    eval_seed: 1010
+
+# Held-out evaluation environments (smallest + largest per R type).
+eval_jobs:
+  - name: eval-r1-9x9-seed0
+    env_id: XLand-MiniGrid-R1-9x9
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 0
+    eval_seed: 2000
+  - name: eval-r1-17x17-seed1
+    env_id: XLand-MiniGrid-R1-17x17
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 1
+    eval_seed: 2001
+  - name: eval-r2-9x9-seed2
+    env_id: XLand-MiniGrid-R2-9x9
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 2
+    eval_seed: 2002
+  - name: eval-r2-17x17-seed3
+    env_id: XLand-MiniGrid-R2-17x17
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 3
+    eval_seed: 2003
+  - name: eval-r4-9x9-seed4
+    env_id: XLand-MiniGrid-R4-9x9
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 4
+    eval_seed: 2004
+  - name: eval-r4-17x17-seed5
+    env_id: XLand-MiniGrid-R4-17x17
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 5
+    eval_seed: 2005
+  - name: eval-r6-13x13-seed6
+    env_id: XLand-MiniGrid-R6-13x13
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 6
+    eval_seed: 2006
+  - name: eval-r6-19x19-seed7
+    env_id: XLand-MiniGrid-R6-19x19
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 7
+    eval_seed: 2007
+  - name: eval-r9-16x16-seed8
+    env_id: XLand-MiniGrid-R9-16x16
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 8
+    eval_seed: 2008
+  - name: eval-r9-25x25-seed9
+    env_id: XLand-MiniGrid-R9-25x25
+    benchmark_id: trivial-1m
+    total_timesteps: 100000000
+    train_seed: 9
+    eval_seed: 2009

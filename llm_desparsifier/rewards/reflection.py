@@ -83,15 +83,7 @@ def build_reward_reflection(
         )
         reflection_text = str(getattr(prediction, "reflection", "")).strip()
         if reflection_text:
-            return _compose_feedback_with_raw_inputs(
-                reflection_text,
-                env_summary=env_summary,
-                reward_code=reward_code,
-                sparse_summary=sparse_summary,
-                component_summary=component_summary,
-                component_stats_summary=component_stats_summary,
-                metrics_summary=metrics_summary,
-            )
+            return reflection_text
         raise ValueError("Empty reflection output from LM")
     except Exception as exc:  # pragma: no cover - exercised via fallback test
         return _compose_fallback_text(
@@ -173,46 +165,6 @@ def _sample_series(values: Any, num_points: int = 6) -> list[float]:
         return array.tolist()
     indices = np.linspace(0, array.size - 1, num_points, dtype=int)
     return [float(array[index]) for index in indices]
-
-
-def _compose_feedback_with_raw_inputs(
-    reflection_text: str,
-    *,
-    env_summary: str,
-    reward_code: str,
-    sparse_summary: str,
-    component_summary: str,
-    component_stats_summary: str,
-    metrics_summary: str,
-) -> str:
-    raw_sections = [
-        "Env summary:",
-        env_summary or "(empty)",
-        "",
-        "Sparse curve summary:",
-        sparse_summary or "(empty)",
-        "",
-        "Component curve summary:",
-        component_summary or "(empty)",
-        "",
-        "Component stats summary:",
-        component_stats_summary or "(empty)",
-        "",
-        "Metrics summary:",
-        metrics_summary or "(empty)",
-        "",
-        "Reward code (raw):",
-        reward_code or "(empty)",
-    ]
-    return "\n".join(
-        [
-            "[Reward reflection]",
-            reflection_text.strip(),
-            "",
-            "[Raw EUREKA inputs]",
-            "\n".join(raw_sections).strip(),
-        ]
-    ).strip()
 
 
 def _compose_fallback_text(
