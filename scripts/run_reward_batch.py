@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ from llm_desparsifier.rewards import (
     create_reward_reflection_module,
     configure_portkey_lm,
 )
+from llm_desparsifier.rewards.llm_client import DEFAULT_MODEL_ALIAS
 from llm_desparsifier.rewards.reflection import EUREKA_GUIDANCE
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT
 from llm_desparsifier.rl.pipeline import TrainingResult, run_training_with_reward
@@ -47,8 +49,8 @@ from llm_desparsifier.utils import (
 
 DEFAULT_ENV_GRID = Path("configs/gepa_envs.yaml")
 BASE_PROMPT_PATH = Path("llm_desparsifier/rewards/prompts/base_reward_prompt.txt")
-DEFAULT_MAX_METRIC_CALLS = 80
-MAX_TOTAL_TIMESTEPS = 20_000_000
+DEFAULT_MAX_METRIC_CALLS = 100
+MAX_TOTAL_TIMESTEPS = 10_000_000
 MAX_NUM_ENVS = 1_024
 MAX_EVAL_ENVS = 128
 MAX_EVAL_EPISODES = 20
@@ -141,8 +143,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-metric-calls",
         type=int,
-        default=None,
+        default=DEFAULT_MAX_METRIC_CALLS,
         help="Hard cap on GEPA metric calls (defaults to 80).",
+    )
+    parser.add_argument(
+        "--llm",
+        default=DEFAULT_MODEL_ALIAS,
+        help="Portkey model alias to use for GEPA (default: %(default)s)",
     )
     return parser.parse_args()
 
@@ -390,8 +397,6 @@ def build_examples(jobs: List[EnvJob], constraints_text: str) -> List[dspy.Examp
 
 def run_batch() -> None:
     args = parse_args()
-    if args.max_metric_calls is None:
-        args.max_metric_calls = DEFAULT_MAX_METRIC_CALLS
     state_root = args.state_root.expanduser().resolve()
     state_root.mkdir(parents=True, exist_ok=True)
     logs_root = state_root / "gepa_runs"
@@ -402,10 +407,9 @@ def run_batch() -> None:
     # Use all jobs from the grid; users can edit the YAML to reduce set.
 
     constraints_text, prompt_state, prompt_meta = load_prompt_payload(state_root)
-    reflection_module = create_reward_reflection_module()
-
     # Configure LM once; reuse for program + reflection.
-    base_lm = configure_portkey_lm()
+    base_lm = configure_portkey_lm(model_alias=args.llm)
+    reflection_module = create_reward_reflection_module(lm=base_lm)
     dspy.configure(lm=base_lm)
     dspy.settings.configure(provide_traceback=True)
     print(f"[run_reward_batch] provide_traceback={dspy.settings.provide_traceback}")
@@ -419,9 +423,12 @@ def run_batch() -> None:
     last_wandb_step = -1
 
     if wandb is not None and not os.environ.get("WANDB_DISABLED"):
+        # Match W&B project to the selected model alias; sanitize to allowed chars.
+        safe_model_alias = re.sub(r"[^a-zA-Z0-9_.-]+", "-", args.llm).strip("-")
+        wandb_project = os.environ.get("WANDB_PROJECT", safe_model_alias or "llm-desparsifier")
         try:
             wandb_run = wandb.init(
-                project=os.environ.get("WANDB_PROJECT", "llm-desparsifier"),
+                project=wandb_project,
                 name=f"gepa-{state_root.name}",
                 config={
                     "state_root": str(state_root),
@@ -700,6 +707,7 @@ def run_batch() -> None:
         metric=on_policy_metric,
         max_metric_calls=args.max_metric_calls,
         reflection_lm=base_lm,
+        reflection_minibatch_size=2,
         track_stats=True,
         num_threads=1,
     )
