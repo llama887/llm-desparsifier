@@ -375,10 +375,34 @@ class PromptOnlyProgram(dspy.Module):
             "Return only the rewritten constraints text."
         )
 
-    def forward(self, env_description: str, constraints: Optional[str] = None):
+    def forward(self, env_description: str, constraints: Optional[str] = None, return_trace: bool = False, **kwargs):
         # GEPA optimizes the rewrite of the base constraints; fallback to provided constraints.
         rewrite_prompt = self._build_rewrite_prompt()
-        prompt_text = constraints or self.prompt_generator(base_constraints=rewrite_prompt)
+        prompt_input = constraints or rewrite_prompt
+
+        if return_trace:
+            # Ask the underlying predictor for its trace so DSPy feedback flows stay rich.
+            pred_obj, lm_trace = self.prompt_generator.rewriter(
+                base_constraints=prompt_input, return_trace=True
+            )
+            prompt_text = pred_obj.prompt_text
+            prediction = dspy.Prediction(prompt_text=prompt_text)
+            trace = {
+                "env_description": env_description,
+                "prompt_input": prompt_input,
+                "prompt_text": prompt_text,
+                "lm_trace": lm_trace,
+            }
+            # Include a lightweight fingerprint of the rewriter state for debugging/deduping.
+            try:
+                state = self.prompt_generator.rewriter.dump_state()
+                state_bytes = json.dumps(state, sort_keys=True, default=str).encode("utf-8")
+                trace["prompt_state_sha256"] = hashlib.sha256(state_bytes).hexdigest()[:16]
+            except Exception:
+                trace["prompt_state_sha256"] = None
+            return prediction, trace
+
+        prompt_text = prompt_input if constraints else self.prompt_generator(base_constraints=rewrite_prompt)
         return dspy.Prediction(prompt_text=prompt_text)
 
 
@@ -707,7 +731,7 @@ def run_batch() -> None:
         metric=on_policy_metric,
         max_metric_calls=args.max_metric_calls,
         reflection_lm=base_lm,
-        reflection_minibatch_size=2,
+        reflection_minibatch_size=1,
         track_stats=True,
         num_threads=1,
     )
