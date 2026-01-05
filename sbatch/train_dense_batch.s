@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=gepa_onpolicy
+#SBATCH --job-name=gepa
 #SBATCH --account=pr_100_tandon_priority
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G

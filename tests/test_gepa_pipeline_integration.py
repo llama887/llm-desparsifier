@@ -93,7 +93,6 @@ def test_gepa_pipeline_runs_with_mocked_training(tmp_path, monkeypatch):
     monkeypatch.setattr(run_reward_batch, "ensure_sparse_baseline", _fake_sparse_baseline)
     monkeypatch.setattr(run_reward_batch, "build_reward_reflection", lambda *_args, **_kwargs: "reflection")
     monkeypatch.setattr(run_reward_batch, "create_reward_reflection_module", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(run_reward_batch, "configure_portkey_lm", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(run_reward_batch.dspy, "GEPA", _DummyGEPA)
 
     argv = [

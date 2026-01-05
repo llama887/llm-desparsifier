@@ -27,8 +27,18 @@ _ACTIONS_LINE = (
     "Actions: move_forward, turn_left, turn_right, pick_up, put_down, toggle (one object carried at a time)."
 )
 
-_GOAL_TILE_NEAR_RIGHT_RE = re.compile(
-    r"TileNearRightGoal\s*\(\s*([^) ,]+(?:\s+[^\),]+)?)\s*,\s*([^) ,]+(?:\s+[^\),]+)?)\s*\)",
+_GOAL_AGENT_HOLD_RE = re.compile(r"AgentHold\s*\(\s*([^)]+)\s*\)", re.IGNORECASE)
+_GOAL_AGENT_NEAR_RE = re.compile(r"AgentNear\s*\(\s*([^)]+)\s*\)", re.IGNORECASE)
+_GOAL_AGENT_NEAR_DIR_RE = re.compile(
+    r"AgentNear(Up|Right|Down|Left)Goal\s*\(\s*([^)]+)\s*\)",
+    re.IGNORECASE,
+)
+_GOAL_TILE_NEAR_RE = re.compile(
+    r"TileNear\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)",
+    re.IGNORECASE,
+)
+_GOAL_TILE_NEAR_DIR_RE = re.compile(
+    r"TileNear(Up|Right|Down|Left)Goal\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)",
     re.IGNORECASE,
 )
 
@@ -72,17 +82,107 @@ def _parse_ruleset_text(text: str) -> tuple[Optional[str], List[str], List[str]]
     return goal_line, rule_lines, init_lines
 
 
-def _explain_goal(goal_line: Optional[str]) -> Optional[str]:
+def _format_object_name(name: str) -> str:
+    cleaned = " ".join(name.split())
+    return cleaned.lower()
+
+
+def _goal_sentences(
+    goal_line: Optional[str],
+    *,
+    agent_pos_example: str,
+    obj_positions_example: str,
+) -> List[str]:
     if not goal_line:
-        return None
-    match = _GOAL_TILE_NEAR_RIGHT_RE.search(goal_line)
+        return [
+            "Your task is to satisfy the level goal condition.",
+            "Success is determined by the hidden ruleset goal.",
+        ]
+
+    goal_line = goal_line.strip()
+    if not goal_line:
+        return [
+            "Your task is to satisfy the level goal condition.",
+            "Success is determined by the hidden ruleset goal.",
+        ]
+
+    match = _GOAL_AGENT_HOLD_RE.search(goal_line)
     if match:
-        left_obj, right_obj = match.group(2).strip(), match.group(1).strip()
-        return (
-            f"SUCCESS when **{right_obj}** is immediately to the **left** of **{left_obj}** "
-            f"(i.e., {left_obj} is exactly one cell to the right of {right_obj}, same row, adjacent columns)."
-        )
-    return f"SUCCESS when condition holds: {goal_line}"
+        obj = _format_object_name(match.group(1))
+        return [
+            f"Your task is to pick up and hold the {obj}.",
+            (
+                f"Success when the agent is carrying the {obj}; "
+                f"use {obj_positions_example}.get(\"{obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                "to locate the object, and ctx.get(\"is_carrying\", jnp.array(False)) "
+                "plus ctx.get(\"carried_item\", jnp.array([-1, -1], dtype=jnp.int32)) to check inventory."
+            ),
+        ]
+
+    match = _GOAL_AGENT_NEAR_DIR_RE.search(goal_line)
+    if match:
+        direction = match.group(1).lower()
+        obj = _format_object_name(match.group(2))
+        return [
+            f"Your task is to move the agent immediately {direction} of the {obj}.",
+            (
+                f"Success when the agent is exactly one cell {direction} of the {obj}; "
+                f"use {agent_pos_example} for the agent and "
+                f"{obj_positions_example}.get(\"{obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                "for the object."
+            ),
+        ]
+
+    match = _GOAL_AGENT_NEAR_RE.search(goal_line)
+    if match:
+        obj = _format_object_name(match.group(1))
+        return [
+            f"Your task is to move next to the {obj}.",
+            (
+                f"Success when the agent is adjacent to the {obj}; "
+                f"use {agent_pos_example} for the agent and "
+                f"{obj_positions_example}.get(\"{obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                "for the object."
+            ),
+        ]
+
+    match = _GOAL_TILE_NEAR_DIR_RE.search(goal_line)
+    if match:
+        direction = match.group(1).lower()
+        first_obj = _format_object_name(match.group(2))
+        second_obj = _format_object_name(match.group(3))
+        alignment = "same row, adjacent columns" if direction in {"left", "right"} else "same column, adjacent rows"
+        return [
+            f"Your task is to place the {first_obj} immediately {direction} of the {second_obj}.",
+            (
+                f"Success when the {first_obj} is exactly one cell {direction} of the {second_obj} "
+                f"({alignment}); use "
+                f"{obj_positions_example}.get(\"{first_obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                "and "
+                f"{obj_positions_example}.get(\"{second_obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                "to locate the tiles."
+            ),
+        ]
+
+    match = _GOAL_TILE_NEAR_RE.search(goal_line)
+    if match:
+        first_obj = _format_object_name(match.group(1))
+        second_obj = _format_object_name(match.group(2))
+        return [
+            f"Your task is to bring the {first_obj} next to the {second_obj}.",
+            (
+                f"Success when the {first_obj} is adjacent to the {second_obj}; use "
+                f"{obj_positions_example}.get(\"{first_obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                "and "
+                f"{obj_positions_example}.get(\"{second_obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                "to locate the tiles."
+            ),
+        ]
+
+    return [
+        "Your task is to satisfy the level goal condition.",
+        f"Success when this condition holds: {goal_line}",
+    ]
 
 
 def describe_ruleset(env, env_params) -> str:
@@ -109,41 +209,54 @@ def describe_ruleset(env, env_params) -> str:
         except Exception:
             pass
 
-    goal_expl = _explain_goal(goal_line)
-
     init_obj_list = ", ".join(init_lines[:10]) if init_lines else "unknown (randomized at reset)"
     if init_lines and len(init_lines) > 10:
         init_obj_list += f", ... (+{len(init_lines) - 10} more)"
+    init_obj_keys = [obj.lower().replace(" ", "_") for obj in init_lines]
+    example_obj_key = init_obj_keys[0] if init_obj_keys else "red_square"
+    swap_obj_keys = init_obj_keys[1:] if len(init_obj_keys) > 1 else []
 
-    rules_summary = "\n".join(f"- {r}" for r in rule_lines[:8]) if rule_lines else "No explicit transformation rules provided."
-    if rule_lines and len(rule_lines) > 8:
-        rules_summary += f"\n- ... (+{len(rule_lines) - 8} more)"
+    goal_sentences = _goal_sentences(
+        goal_line,
+        agent_pos_example=agent_pos_example,
+        obj_positions_example=obj_positions_example,
+    )
 
+    ctx_prefix = "ctx"
+    agent_pos_example = (
+        f"{ctx_prefix}.get(\"agent_pos\", jnp.array([-1, -1], dtype=jnp.int32))"
+    )
+    obj_positions_example = f"{ctx_prefix}.get(\"object_positions\", {{}})"
     lines = [
-        f"grid_type={grid_type} → {layout_hint}",
-        f"size={height}x{width}, view={view} (agent-centered egocentric  {view}×{view}  symbolic grid), max_steps={max_steps}.",
-        _ACTIONS_LINE,
-        "",
+        "You are in the XLand MiniGrid world, a grid-based puzzle level.",
+        f"This level uses layout {grid_type}: {layout_hint}. The map is {height}x{width}, and you have up to {max_steps} steps.",
+        f"The agent sees an egocentric {view}x{view} symbolic window (partially observable, not pixels).",
+        (
+            "The agent position comes from "
+            f"{agent_pos_example}."
+        ),
+        (
+            "Available actions are move_forward, turn_left, turn_right, pick_up, put_down, and toggle; "
+            "the agent can carry only one object at a time "
+            "(check ctx.get(\"is_carrying\", jnp.array(False)) and "
+            "ctx.get(\"carried_item\", jnp.array([-1, -1], dtype=jnp.int32)))."
+        ),
+        (
+            f"Initial objects include: {init_obj_list}. "
+            "Object locations come from "
+            f"{obj_positions_example}.get(\"{example_obj_key}\", jnp.array([-1, -1], dtype=jnp.int32))."
+        ),
     ]
+    if swap_obj_keys:
+        lines.append(
+            "To get positions for the other initial objects, swap the key to one of: "
+            + ", ".join(f"\"{key}\"" for key in swap_obj_keys)
+            + "."
+        )
+    lines.extend(goal_sentences)
+    lines.append("Use distances and spatial relations; avoid Python-side branching.")
 
-    if goal_line:
-        lines.append("GOAL:")
-        lines.append(goal_line)
-        if goal_expl:
-            lines.append(goal_expl)
-        lines.append("")
-
-    lines.append("RULES:")
-    lines.append(rules_summary)
-    lines.append("")
-
-    lines.append("INITIAL OBJECTS:")
-    lines.append(init_obj_list)
-    lines.append("")
-
-    lines.append("Observations are partially observable and symbolic (not pixels). Use distances and spatial relations; avoid Python-side branching.")
-
-    return "\n".join(lines)
+    return " ".join(lines)
 
 
 CONSTRAINTS_TEXT = """
@@ -191,12 +304,7 @@ def dummy_dense_reward(env_params, ts_prev, action, ts_next, ctx):
 - Use ONLY jax.numpy as jnp (import not needed) and jax.lax if necessary.
 - Do NOT add import statements; jnp and jax are already available.
 - Use ONLY values that arrive via `ctx`. Every key is optional—*always* pull them with `.get` and provide explicit fallbacks (e.g., `ctx.get("agent_pos", jnp.array([-1, -1], dtype=jnp.int32))`). Accessing `ctx[...]` directly is invalid and will be rejected.
-- When dealing with nested structures such as `object_positions`, guard both the parent map and each child lookup. Example:
-  ```python
-  obj_pos = ctx.get("object_positions", {}) # you must use ctx.get(...) instead of ctx[...]
-  yellow_square = obj_pos.get("yellow_square", jnp.array([-1, -1], dtype=jnp.int32))
-  green_ball = obj_pos.get("green_ball", jnp.array([-1, -1], dtype=jnp.int32))
-  ```
+- When dealing with nested structures such as `object_positions`, guard both the parent map and each child lookup.
 - Call **only** JAX primitives (`jnp.*`, `jax.lax.*`) or helper functions you define inside `dense_reward`. Method calls are restricted to `.astype(...)`. Do **not** invoke Python `math.*`, `numpy.*`, or arbitrary library functions; the sanitizer will reject them.
 - If you define helper functions inside dense_reward, ensure they are pure, side-effect free, and only call jnp/jax operations.
 - Do NOT access Python globals, files, network, randomness, or environment internals.

@@ -20,7 +20,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import dspy
 import numpy as np
@@ -41,7 +41,14 @@ from llm_desparsifier.rewards.llm_client import DEFAULT_MODEL_ALIAS
 from llm_desparsifier.rewards.reflection import EUREKA_GUIDANCE
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT
 from llm_desparsifier.rl.pipeline import TrainingResult, run_training_with_reward
-from llm_desparsifier.rl.sparse_baseline import DEFAULT_BASELINE_JSON, ensure_sparse_baseline
+from llm_desparsifier.rl.sparse_baseline import (
+    DEFAULT_BASELINE_JSON,
+    ensure_sparse_baseline,
+    load_sparse_baseline_payload,
+    log_sparse_baseline,
+    run_sparse_baseline,
+    save_sparse_baseline,
+)
 from llm_desparsifier.utils import (
     get_active_prompt_path,
     write_active_prompt,
@@ -54,6 +61,17 @@ MAX_TOTAL_TIMESTEPS = 10_000_000
 MAX_NUM_ENVS = 1_024
 MAX_EVAL_ENVS = 128
 MAX_EVAL_EPISODES = 20
+HOLDOUT_ENVS = [
+    "XLand-MiniGrid-R1-17x17",
+    "XLand-MiniGrid-R2-9x9",
+    "XLand-MiniGrid-R2-17x17",
+    "XLand-MiniGrid-R4-9x9",
+    "XLand-MiniGrid-R4-17x17",
+    "XLand-MiniGrid-R6-13x13",
+    "XLand-MiniGrid-R6-19x19",
+    "XLand-MiniGrid-R9-16x16",
+    "XLand-MiniGrid-R9-25x25",
+]
 
 
 def safe_wandb_log(wandb_run: Any, payload: Mapping[str, Any], **kwargs: Any) -> None:
@@ -265,6 +283,33 @@ def derive_seed(example_id: str, candidate_fp: str) -> int:
     return int.from_bytes(digest, "big") % 2_147_483_647
 
 
+def build_holdout_jobs() -> List[EnvJob]:
+    """Construct EnvJob list for the reserved holdout environments."""
+
+    jobs: List[EnvJob] = []
+    for idx, env_id in enumerate(HOLDOUT_ENVS):
+        jobs.append(
+            EnvJob(
+                name=f"holdout-{idx:02d}",
+                env_id=env_id,
+                benchmark_id="trivial-1m",
+                total_timesteps=MAX_TOTAL_TIMESTEPS,
+                train_seed=10_000 + idx * 2,
+                eval_seed=10_000 + idx * 2 + 1,
+            )
+        )
+    return jobs
+
+
+def save_best_prompt_text(state_root: Path, model_alias: str, prompt_text: str) -> Path:
+    """Persist the best prompt as a plain .txt for quick reuse."""
+
+    safe_model_alias = re.sub(r"[^a-zA-Z0-9_.-]+", "-", model_alias).strip("-") or "model"
+    best_prompt_path = state_root / f"{safe_model_alias}.txt"
+    best_prompt_path.write_text(prompt_text.strip() + "\n", encoding="utf-8")
+    return best_prompt_path
+
+
 def get_example_id(example: dspy.Example) -> str:
     return str(getattr(example, "job_name", getattr(example, "env_description", "example")))
 
@@ -419,6 +464,181 @@ def build_examples(jobs: List[EnvJob], constraints_text: str) -> List[dspy.Examp
     return examples
 
 
+def ensure_holdout_sparse_baselines(
+    holdout_jobs: List[EnvJob],
+    *,
+    logs_root: Path,
+    baseline_json_path: Path,
+    log_wandb: Any,
+    config_clamper: Optional[Callable[[Mapping[str, Any]], Tuple[Dict[str, Any], List[str]]]] = None,
+    budget_signature: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], float]:
+    """Cache sparse baselines for holdouts, merging into the shared JSON payload."""
+
+    payload = load_sparse_baseline_payload(baseline_json_path) or {}
+    baselines: Dict[str, Dict[str, Any]] = dict(payload.get("sparse_baselines", {}))
+    existing_mean = float(payload.get("sparse_baseline_mean", 0.0) or 0.0)
+    signature_matches = budget_signature is None or payload.get("budget_signature") == budget_signature
+
+    missing_jobs = [job for job in holdout_jobs if job.name not in baselines]
+    if missing_jobs or not signature_matches:
+        new_baselines, _ = run_sparse_baseline(
+            missing_jobs if signature_matches else holdout_jobs,
+            logs_root,
+            log_wandb,
+            config_clamper=config_clamper,
+        )
+        baselines.update(new_baselines)
+        values = [float(row.get("solve_rate", 0.0)) for row in baselines.values() if row]
+        existing_mean = float(np.mean(values)) if values else 0.0
+        merged_payload = dict(payload)
+        merged_payload["sparse_baselines"] = baselines
+        merged_payload["sparse_baseline_mean"] = existing_mean
+        if budget_signature is not None:
+            merged_payload["budget_signature"] = dict(budget_signature)
+        save_sparse_baseline(baseline_json_path, merged_payload)
+
+    log_sparse_baseline({k: v for k, v in baselines.items() if k in {j.name for j in holdout_jobs}}, existing_mean, log_wandb)
+    return baselines, existing_mean
+
+
+def evaluate_dense_on_jobs(
+    *,
+    jobs: List[EnvJob],
+    prompt_text: str,
+    base_lm: Any,
+    logs_root: Path,
+    config_clamper: Callable[[Mapping[str, Any]], Tuple[Dict[str, Any], List[str]]],
+) -> Tuple[Dict[str, Dict[str, Any]], float]:
+    """Run dense reward evaluation with the fixed prompt on the provided jobs."""
+
+    results: Dict[str, Dict[str, Any]] = {}
+    solve_rates: List[float] = []
+    for job in jobs:
+        job_cfg_raw = job.to_config()
+        budgeted_cfg, budget_notes = config_clamper(job_cfg_raw)
+        seed = derive_seed(job.name, prompt_text)
+        budgeted_cfg.setdefault("train_seed", seed)
+        budgeted_cfg.setdefault("eval_seed", seed + 1)
+
+        run_dir = logs_root / "holdout-dense" / job.name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if budget_notes:
+            print(f"[holdout-dense] budget clamp {job.name}: " + "; ".join(budget_notes))
+        print(f"[holdout-dense] evaluating {job.env_id} seed={seed} dir={run_dir.name}")
+
+        start = time.time()
+        solve_rate = 0.0
+        reward_hash = ""
+        artifacts: Dict[str, str] = {}
+        try:
+            reward_generator = RewardGenerator(
+                constraints_text=prompt_text,
+                lm=base_lm,
+                max_sanitize_attempts=5,
+            )
+            result = run_training_with_reward(
+                reward_generator,
+                output_dir=str(run_dir),
+                config_override={k: v for k, v in budgeted_cfg.items() if k != "name"},
+                reward_mode="dense",
+            )
+            gt_eval = result.ground_truth_eval or {}
+            returns = gt_eval.get("returns") or []
+            successes = gt_eval.get("successes")
+            if successes is None:
+                successes = sum(1 for r in returns if r > 0.0)
+            total_eps = len(returns)
+            solve_rate = float(successes) / float(total_eps) if total_eps else float(gt_eval.get("success_rate", 0.0) or 0.0)
+            if total_eps == 0 and gt_eval.get("success_rate") is None:
+                sparse_curve = to_float_list(result.train_info.get("loss_info", {}).get("eval/ground_truth_returns_mean"))
+                solve_rate = float(sparse_curve[-1]) if sparse_curve else 0.0
+            reward_hash = hashlib.sha256((result.emitted_reward_code or "").encode("utf-8")).hexdigest()[:16]
+            artifacts = dict(result.artifacts)
+        except Exception as exc:  # pragma: no cover - eval best-effort
+            print(f"[holdout-dense] FAILED {job.name}: {exc}")
+        elapsed = time.time() - start
+        results[job.name] = {
+            "env_id": job.env_id,
+            "solve_rate": solve_rate,
+            "reward_hash": reward_hash,
+            "run_dir": str(run_dir),
+            "train_seed": budgeted_cfg.get("train_seed"),
+            "eval_seed": budgeted_cfg.get("eval_seed"),
+            "elapsed_sec": elapsed,
+            "artifacts": artifacts,
+        }
+        solve_rates.append(solve_rate)
+    mean_solve_rate = float(np.mean(solve_rates)) if solve_rates else 0.0
+    return results, mean_solve_rate
+
+
+def write_holdout_bar_plots(
+    *,
+    dense_results: Mapping[str, Mapping[str, Any]],
+    sparse_baselines: Mapping[str, Mapping[str, Any]],
+    logs_root: Path,
+) -> List[Path]:
+    """Create bar charts comparing dense vs sparse solve rates."""
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - plotting optional
+        print(f"[holdout-plots] matplotlib unavailable; skipping plots ({exc})")
+        return []
+
+    envs = sorted(dense_results.keys(), key=lambda k: dense_results[k].get("env_id", k))
+    dense_vals = [float(dense_results[e].get("solve_rate", 0.0)) for e in envs]
+    sparse_vals = [float((sparse_baselines.get(e) or {}).get("solve_rate", 0.0)) for e in envs]
+
+    paths: List[Path] = []
+
+    if envs:
+        x = np.arange(len(envs))
+        width = 0.35
+        plt.figure(figsize=(12, 5))
+        plt.bar(x - width / 2, dense_vals, width, label="Dense (optimized)")
+        plt.bar(x + width / 2, sparse_vals, width, label="Sparse baseline")
+        plt.xticks(x, envs, rotation=45, ha="right")
+        plt.ylabel("Solve rate")
+        plt.title("Holdout solve rate by environment")
+        plt.ylim(0, 1.05)
+        plt.grid(True, axis="y", alpha=0.3)
+        plt.legend(loc="best")
+        plt.tight_layout()
+        out_path = logs_root / "holdout_solve_rates_by_env.png"
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        paths.append(out_path)
+
+    if dense_vals or sparse_vals:
+        labels = ["Dense (optimized)", "Sparse baseline"]
+        means = [
+            float(np.mean(dense_vals)) if dense_vals else 0.0,
+            float(np.mean(sparse_vals)) if sparse_vals else 0.0,
+        ]
+        plt.figure(figsize=(6, 4))
+        x = np.arange(len(labels))
+        plt.bar(x, means, width=0.6, color=["#1f77b4", "#ff7f0e"])
+        plt.xticks(x, labels, rotation=15, ha="right")
+        plt.ylabel("Solve rate")
+        plt.title("Holdout aggregate solve rate")
+        plt.ylim(0, 1.05)
+        plt.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+        out_path = logs_root / "holdout_solve_rate_aggregate.png"
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        paths.append(out_path)
+
+    for p in paths:
+        print(f"[holdout-plots] wrote {p}")
+    return paths
+
+
 def run_batch() -> None:
     args = parse_args()
     state_root = args.state_root.expanduser().resolve()
@@ -440,6 +660,7 @@ def run_batch() -> None:
 
     wandb_run = None
     candidate_table = None
+    reward_log_table = None
     io_table = None
     sparse_baselines: Dict[str, Dict[str, Any]] = {}
     sparse_baseline_mean: float = 0.0
@@ -467,9 +688,23 @@ def run_batch() -> None:
                     "solve_rate",
                     "sparse_baseline",
                     "reward_code_sha16",
+                    "reward_code",
                     "prompt_text",
                     "feedback",
+                    "sanitizer_feedback",
                     "run_dir",
+                ],
+                log_mode="MUTABLE",
+            )
+            reward_log_table = wandb.Table(
+                columns=[
+                    "step",
+                    "env_id",
+                    "env_text",
+                    "system_prompt",
+                    "reward_code",
+                    "solve_rate",
+                    "feedback",
                 ],
                 log_mode="MUTABLE",
             )
@@ -485,6 +720,7 @@ def run_batch() -> None:
         except Exception as exc:  # pragma: no cover - defensive
             print(f"[wandb] init failed, continuing without logging: {exc}")
             wandb_run = None
+            reward_log_table = None
             io_table = None
 
     def log_wandb(payload: Mapping[str, Any], *, step: Optional[int] = None) -> None:
@@ -705,11 +941,25 @@ def run_batch() -> None:
                 solve_rate,
                 baseline_solve_rate,
                 reward_hash,
+                emitted_code,
                 candidate_prompt,
                 feedback_text,
+                sanitizer_feedback,
                 str(run_dir),
             )
             log_wandb({"gepa/candidates": candidate_table}, step=metric_call_idx)
+
+        if reward_log_table is not None:
+            reward_log_table.add_data(
+                run_id,
+                job.env_id,
+                env_description,
+                candidate_prompt,
+                emitted_code,
+                solve_rate,
+                feedback_text,
+            )
+            log_wandb({"gepa/reward_log": reward_log_table}, step=metric_call_idx)
 
         payload = {
             "gepa/solve_rate": solve_rate,
@@ -738,6 +988,12 @@ def run_batch() -> None:
 
     optimized_program = compiler.compile(program, trainset=trainset)
 
+    # Materialize and persist the best prompt text.
+    best_prompt_text = optimized_program.prompt_generator(
+        base_constraints=optimized_program._build_rewrite_prompt()
+    )
+    best_prompt_path = save_best_prompt_text(state_root, args.llm, best_prompt_text)
+
     prompt_payload = {
         "constraints_text": constraints_text,
         "prompt_state": optimized_program.prompt_generator.dump_state(),
@@ -752,10 +1008,41 @@ def run_batch() -> None:
     stats_payload["sparse_baseline_mean"] = sparse_baseline_mean
     stats_payload["gepa_solve_rate_series"] = gepa_solve_rates
     stats_payload["baseline_budget_signature"] = baseline_budget_signature
+
+    # Holdout evaluation using the optimized prompt.
+    holdout_jobs = build_holdout_jobs()
+    holdout_sparse, holdout_sparse_mean = ensure_holdout_sparse_baselines(
+        holdout_jobs,
+        logs_root=logs_root,
+        baseline_json_path=DEFAULT_BASELINE_JSON,
+        log_wandb=log_wandb,
+        config_clamper=clamp_job_budget,
+        budget_signature=baseline_budget_signature,
+    )
+    holdout_dense, holdout_dense_mean = evaluate_dense_on_jobs(
+        jobs=holdout_jobs,
+        prompt_text=best_prompt_text,
+        base_lm=base_lm,
+        logs_root=logs_root,
+        config_clamper=clamp_job_budget,
+    )
+
+    stats_payload["holdout_sparse_baselines"] = holdout_sparse
+    stats_payload["holdout_sparse_baseline_mean"] = holdout_sparse_mean
+    stats_payload["holdout_dense_results"] = holdout_dense
+    stats_payload["holdout_dense_mean"] = holdout_dense_mean
+
+    holdout_plot_paths = write_holdout_bar_plots(
+        dense_results=holdout_dense,
+        sparse_baselines=holdout_sparse,
+        logs_root=logs_root,
+    )
+
     stats_path.write_text(json.dumps(stats_payload, indent=2, sort_keys=True), encoding="utf-8")
 
     print(f"[run_reward_batch] GEPA completed. Active prompt updated at {get_active_prompt_path(state_root)}")
     print(f"[run_reward_batch] GEPA stats written to {stats_path}")
+    print(f"[run_reward_batch] Best prompt saved to {best_prompt_path}")
 
     training_curve_path = logs_root / "training_curve.png"
     baseline_line = sparse_baseline_mean if sparse_baselines else None
@@ -772,8 +1059,13 @@ def run_batch() -> None:
             art.add_file(str(_active), name="active_prompt.json")
         if stats_path.exists():
             art.add_file(str(stats_path), name="gepa_stats.json")
+        if best_prompt_path.exists():
+            art.add_file(str(best_prompt_path), name=best_prompt_path.name)
         if training_curve_path.exists():
             art.add_file(str(training_curve_path), name="training_curve.png")
+        for p in holdout_plot_paths:
+            if p.exists():
+                art.add_file(str(p), name=p.name)
         safe_wandb_log_artifact(wandb_run, art)
         safe_wandb_finish(wandb_run)
 

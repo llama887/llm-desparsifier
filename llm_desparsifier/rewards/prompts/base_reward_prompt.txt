@@ -43,12 +43,7 @@ def dummy_dense_reward(env_params, ts_prev, action, ts_next, ctx):
 - Do NOT add import statements; jnp and jax are already available.
 - Use ONLY values that arrive via `ctx`. Every key is optional—*always* pull them with `.get` and provide explicit fallbacks (e.g., `ctx.get("agent_pos", jnp.array([-1, -1], dtype=jnp.int32))`). Accessing `ctx[...]` directly is invalid and will be rejected.
 - Do NOT create, reference, or emit any identifiers named `EUREKA_GUIDANCE`.
-- When dealing with nested structures such as `object_positions`, guard both the parent map and each child lookup. Example:
-  ```python
-  obj_pos = ctx.get("object_positions", {}) # you must use ctx.get(...) instead of ctx[...]
-  yellow_square = obj_pos.get("yellow_square", jnp.array([-1, -1], dtype=jnp.int32))
-  green_ball = obj_pos.get("green_ball", jnp.array([-1, -1], dtype=jnp.int32))
-  ```
+- When dealing with nested structures such as `object_positions`, guard both the parent map and each child lookup.
 - Call **only** JAX primitives (`jnp.*`, `jax.lax.*`) or helper functions you define inside `dense_reward`. Method calls are restricted to `.astype(...)`. Do **not** invoke Python `math.*`, `numpy.*`, or arbitrary library functions; the sanitizer will reject them.
 - If you define helper functions inside dense_reward, ensure they are pure, side-effect free, and only call jnp/jax operations.
 - Do NOT access Python globals, files, network, randomness, or environment internals.
