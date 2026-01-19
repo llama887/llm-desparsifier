@@ -61,6 +61,11 @@ MAX_TOTAL_TIMESTEPS = 10_000_000
 MAX_NUM_ENVS = 1_024
 MAX_EVAL_ENVS = 128
 MAX_EVAL_EPISODES = 20
+SINGLE_ENV_ID = "XLand-MiniGrid-R1-9x9"
+SINGLE_ENV_BENCHMARK = "trivial-1m"
+SINGLE_ENV_TOTAL_TIMESTEPS = 1_000_000
+SINGLE_ENV_TRAIN_SEED = 0
+SINGLE_ENV_EVAL_SEED = 1
 HOLDOUT_ENVS = [
     "XLand-MiniGrid-R1-17x17",
     "XLand-MiniGrid-R2-9x9",
@@ -169,6 +174,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MODEL_ALIAS,
         help="Portkey model alias to use for GEPA (default: %(default)s)",
     )
+    parser.add_argument(
+        "--test-single-env",
+        action="store_true",
+        help="Run GEPA on a single tiny environment with locked seeds for overfitting.",
+    )
     return parser.parse_args()
 
 
@@ -184,6 +194,19 @@ def load_env_jobs(env_grid_path: Path) -> List[EnvJob]:
     if not jobs:
         raise ValueError("No environment jobs found in grid")
     return jobs
+
+
+def build_single_env_job() -> List[EnvJob]:
+    return [
+        EnvJob(
+            name="single-env-test",
+            env_id=SINGLE_ENV_ID,
+            benchmark_id=SINGLE_ENV_BENCHMARK,
+            total_timesteps=SINGLE_ENV_TOTAL_TIMESTEPS,
+            train_seed=SINGLE_ENV_TRAIN_SEED,
+            eval_seed=SINGLE_ENV_EVAL_SEED,
+        )
+    ]
 
 
 def load_prompt_payload(state_root: Path) -> tuple[str, Optional[Dict[str, Any]], Dict[str, Any]]:
@@ -514,6 +537,8 @@ def evaluate_dense_on_jobs(
 
     results: Dict[str, Dict[str, Any]] = {}
     solve_rates: List[float] = []
+    reward_records: List[Dict[str, Any]] = []
+    prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
     for job in jobs:
         job_cfg_raw = job.to_config()
         budgeted_cfg, budget_notes = config_clamper(job_cfg_raw)
@@ -530,6 +555,7 @@ def evaluate_dense_on_jobs(
         start = time.time()
         solve_rate = 0.0
         reward_hash = ""
+        emitted_code = ""
         artifacts: Dict[str, str] = {}
         try:
             reward_generator = RewardGenerator(
@@ -544,6 +570,7 @@ def evaluate_dense_on_jobs(
                 reward_mode="dense",
             )
             gt_eval = result.ground_truth_eval or {}
+            emitted_code = result.emitted_reward_code or ""
             returns = gt_eval.get("returns") or []
             successes = gt_eval.get("successes")
             if successes is None:
@@ -553,15 +580,39 @@ def evaluate_dense_on_jobs(
             if total_eps == 0 and gt_eval.get("success_rate") is None:
                 sparse_curve = to_float_list(result.train_info.get("loss_info", {}).get("eval/ground_truth_returns_mean"))
                 solve_rate = float(sparse_curve[-1]) if sparse_curve else 0.0
-            reward_hash = hashlib.sha256((result.emitted_reward_code or "").encode("utf-8")).hexdigest()[:16]
+            reward_hash = hashlib.sha256(emitted_code.encode("utf-8")).hexdigest()[:16]
             artifacts = dict(result.artifacts)
+            reward_records.append(
+                {
+                    "job_name": job.name,
+                    "env_id": job.env_id,
+                    "prompt_sha16": prompt_hash,
+                    "train_seed": budgeted_cfg.get("train_seed"),
+                    "eval_seed": budgeted_cfg.get("eval_seed"),
+                    "reward_hash": reward_hash,
+                    "reward_code": emitted_code,
+                    "reward_code_path": artifacts.get("dense_reward_path"),
+                    "config": {k: v for k, v in budgeted_cfg.items() if k != "name"},
+                }
+            )
         except Exception as exc:  # pragma: no cover - eval best-effort
             print(f"[holdout-dense] FAILED {job.name}: {exc}")
+            reward_records.append(
+                {
+                    "job_name": job.name,
+                    "env_id": job.env_id,
+                    "prompt_sha16": prompt_hash,
+                    "train_seed": budgeted_cfg.get("train_seed"),
+                    "eval_seed": budgeted_cfg.get("eval_seed"),
+                    "error": str(exc),
+                }
+            )
         elapsed = time.time() - start
         results[job.name] = {
             "env_id": job.env_id,
             "solve_rate": solve_rate,
             "reward_hash": reward_hash,
+            "reward_code_path": artifacts.get("dense_reward_path"),
             "run_dir": str(run_dir),
             "train_seed": budgeted_cfg.get("train_seed"),
             "eval_seed": budgeted_cfg.get("eval_seed"),
@@ -570,6 +621,10 @@ def evaluate_dense_on_jobs(
         }
         solve_rates.append(solve_rate)
     mean_solve_rate = float(np.mean(solve_rates)) if solve_rates else 0.0
+    if reward_records:
+        out_path = logs_root / "holdout_reward_functions.jsonl"
+        out_path.write_text("\n".join(json.dumps(r, sort_keys=True) for r in reward_records) + "\n", encoding="utf-8")
+        print(f"[holdout-dense] wrote reward functions to {out_path}")
     return results, mean_solve_rate
 
 
@@ -647,8 +702,15 @@ def run_batch() -> None:
     logs_root.mkdir(exist_ok=True)
 
     env_grid_path = args.env_grid.expanduser().resolve()
-    jobs = load_env_jobs(env_grid_path)
-    # Use all jobs from the grid; users can edit the YAML to reduce set.
+    if args.test_single_env:
+        jobs = build_single_env_job()
+        print(
+            "[run_reward_batch] single-env test enabled: "
+            f"{SINGLE_ENV_ID} train_seed={SINGLE_ENV_TRAIN_SEED} eval_seed={SINGLE_ENV_EVAL_SEED}"
+        )
+    else:
+        jobs = load_env_jobs(env_grid_path)
+        # Use all jobs from the grid; users can edit the YAML to reduce set.
 
     constraints_text, prompt_state, prompt_meta = load_prompt_payload(state_root)
     # Configure LM once; reuse for program + reflection.
@@ -670,7 +732,10 @@ def run_batch() -> None:
     if wandb is not None and not os.environ.get("WANDB_DISABLED"):
         # Match W&B project to the selected model alias; sanitize to allowed chars.
         safe_model_alias = re.sub(r"[^a-zA-Z0-9_.-]+", "-", args.llm).strip("-")
-        wandb_project = os.environ.get("WANDB_PROJECT", safe_model_alias or "llm-desparsifier")
+        default_project = safe_model_alias or "llm-desparsifier"
+        if args.test_single_env:
+            default_project = f"single_env_test-{default_project}"
+        wandb_project = os.environ.get("WANDB_PROJECT", default_project)
         try:
             wandb_run = wandb.init(
                 project=wandb_project,
@@ -679,6 +744,10 @@ def run_batch() -> None:
                     "state_root": str(state_root),
                     "env_grid": str(env_grid_path),
                     "max_metric_calls": args.max_metric_calls,
+                    "test_single_env": bool(args.test_single_env),
+                    "single_env_id": SINGLE_ENV_ID if args.test_single_env else None,
+                    "single_env_train_seed": SINGLE_ENV_TRAIN_SEED if args.test_single_env else None,
+                    "single_env_eval_seed": SINGLE_ENV_EVAL_SEED if args.test_single_env else None,
                 },
             )
             candidate_table = wandb.Table(
@@ -740,12 +809,16 @@ def run_batch() -> None:
         "eval_num_envs": MAX_EVAL_ENVS,
         "eval_num_episodes": MAX_EVAL_EPISODES,
     }
+    baseline_json_path = DEFAULT_BASELINE_JSON
+    if args.test_single_env:
+        baseline_json_path = state_root / "sparse_baseline.single_env.json"
+
     sparse_baselines, sparse_baseline_mean = ensure_sparse_baseline(
         jobs,
         logs_root=logs_root,
-        baseline_json_path=DEFAULT_BASELINE_JSON,
+        baseline_json_path=baseline_json_path,
         log_wandb=log_wandb,
-        env_grid_path=env_grid_path,
+        env_grid_path=None if args.test_single_env else env_grid_path,
         state_root=state_root,
         config_clamper=clamp_job_budget,
         budget_signature=baseline_budget_signature,
@@ -826,9 +899,14 @@ def run_batch() -> None:
 
         job_cfg_raw = job.to_config()
         budgeted_cfg, budget_notes = clamp_job_budget(job_cfg_raw)
-        seed = derive_seed(example_id, candidate_prompt)
+        if args.test_single_env:
+            seed = job.train_seed
+            eval_seed = job.eval_seed
+        else:
+            seed = derive_seed(example_id, candidate_prompt)
+            eval_seed = seed + 1
         budgeted_cfg.setdefault("train_seed", seed)
-        budgeted_cfg.setdefault("eval_seed", seed + 1)
+        budgeted_cfg.setdefault("eval_seed", eval_seed)
         random.seed(seed)
         np.random.seed(seed % (2**32 - 1))
 
@@ -1008,35 +1086,50 @@ def run_batch() -> None:
     stats_payload["sparse_baseline_mean"] = sparse_baseline_mean
     stats_payload["gepa_solve_rate_series"] = gepa_solve_rates
     stats_payload["baseline_budget_signature"] = baseline_budget_signature
+    stats_payload["test_single_env"] = bool(args.test_single_env)
+    if args.test_single_env:
+        stats_payload["single_env_job"] = {
+            "env_id": SINGLE_ENV_ID,
+            "benchmark_id": SINGLE_ENV_BENCHMARK,
+            "total_timesteps": SINGLE_ENV_TOTAL_TIMESTEPS,
+            "train_seed": SINGLE_ENV_TRAIN_SEED,
+            "eval_seed": SINGLE_ENV_EVAL_SEED,
+        }
+        stats_payload["baseline_json_path"] = str(baseline_json_path)
 
     # Holdout evaluation using the optimized prompt.
-    holdout_jobs = build_holdout_jobs()
-    holdout_sparse, holdout_sparse_mean = ensure_holdout_sparse_baselines(
-        holdout_jobs,
-        logs_root=logs_root,
-        baseline_json_path=DEFAULT_BASELINE_JSON,
-        log_wandb=log_wandb,
-        config_clamper=clamp_job_budget,
-        budget_signature=baseline_budget_signature,
-    )
-    holdout_dense, holdout_dense_mean = evaluate_dense_on_jobs(
-        jobs=holdout_jobs,
-        prompt_text=best_prompt_text,
-        base_lm=base_lm,
-        logs_root=logs_root,
-        config_clamper=clamp_job_budget,
-    )
+    holdout_plot_paths: List[Path] = []
+    if args.test_single_env:
+        stats_payload["holdout_skipped"] = True
+        stats_payload["holdout_skip_reason"] = "single-env test mode"
+    else:
+        holdout_jobs = build_holdout_jobs()
+        holdout_sparse, holdout_sparse_mean = ensure_holdout_sparse_baselines(
+            holdout_jobs,
+            logs_root=logs_root,
+            baseline_json_path=DEFAULT_BASELINE_JSON,
+            log_wandb=log_wandb,
+            config_clamper=clamp_job_budget,
+            budget_signature=baseline_budget_signature,
+        )
+        holdout_dense, holdout_dense_mean = evaluate_dense_on_jobs(
+            jobs=holdout_jobs,
+            prompt_text=best_prompt_text,
+            base_lm=base_lm,
+            logs_root=logs_root,
+            config_clamper=clamp_job_budget,
+        )
 
-    stats_payload["holdout_sparse_baselines"] = holdout_sparse
-    stats_payload["holdout_sparse_baseline_mean"] = holdout_sparse_mean
-    stats_payload["holdout_dense_results"] = holdout_dense
-    stats_payload["holdout_dense_mean"] = holdout_dense_mean
+        stats_payload["holdout_sparse_baselines"] = holdout_sparse
+        stats_payload["holdout_sparse_baseline_mean"] = holdout_sparse_mean
+        stats_payload["holdout_dense_results"] = holdout_dense
+        stats_payload["holdout_dense_mean"] = holdout_dense_mean
 
-    holdout_plot_paths = write_holdout_bar_plots(
-        dense_results=holdout_dense,
-        sparse_baselines=holdout_sparse,
-        logs_root=logs_root,
-    )
+        holdout_plot_paths = write_holdout_bar_plots(
+            dense_results=holdout_dense,
+            sparse_baselines=holdout_sparse,
+            logs_root=logs_root,
+        )
 
     stats_path.write_text(json.dumps(stats_payload, indent=2, sort_keys=True), encoding="utf-8")
 

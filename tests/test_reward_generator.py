@@ -124,3 +124,50 @@ def test_reward_generator_raises_after_max_attempts():
     message = str(excinfo.value)
     assert "Failed to sanitize" in message
     assert "Attempt 1" in message and "Attempt 2" in message
+
+
+def test_reward_generator_preserves_env_text_in_retry_loop():
+    xminigrid = pytest.importorskip("xminigrid")
+
+    class _CaptureEnvSynth:
+        def __init__(self) -> None:
+            self.env_descriptions: list[str] = []
+
+        def __call__(self, env_description: str, constraints: str) -> str:
+            self.env_descriptions.append(env_description)
+            return (
+                "def dense_reward(env_params, ts_prev, action, ts_next, ctx):\n"
+                "    progress = jnp.asarray(1.0, dtype=jnp.float32)\n"
+                "    reward_components = {'progress': progress}\n"
+                "    return progress, reward_components\n"
+            )
+
+    env, env_params = xminigrid.make("XLand-MiniGrid-R1-11x11")
+    synth = _CaptureEnvSynth()
+    attempt_counter = {"count": 0}
+
+    def flaky_sanitize(_code: str):
+        attempt_counter["count"] += 1
+        if attempt_counter["count"] == 1:
+            raise ValueError("simulated failure")
+
+        def dense_reward(*_args, **_kwargs):
+            return 1.0, {"progress": 1.0}
+
+        return dense_reward
+
+    generator = _TestableRewardGenerator(
+        synthesizer=synth,
+        sanitize_fn=flaky_sanitize,
+        lm=object(),
+        max_sanitize_attempts=2,
+    )
+
+    dense_fn, _ = generator.generate(env=env, env_params=env_params)
+
+    assert dense_fn(None, None, None, None, {})[0] == 1.0
+    assert len(synth.env_descriptions) == 2
+    assert synth.env_descriptions[0] == synth.env_descriptions[1]
+    env_text = synth.env_descriptions[0]
+    assert "XLand MiniGrid world" in env_text
+    assert 'ctx.get("object_positions", {})' in env_text

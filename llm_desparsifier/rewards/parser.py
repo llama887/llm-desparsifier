@@ -216,17 +216,16 @@ def describe_ruleset(env, env_params) -> str:
     example_obj_key = init_obj_keys[0] if init_obj_keys else "red_square"
     swap_obj_keys = init_obj_keys[1:] if len(init_obj_keys) > 1 else []
 
-    goal_sentences = _goal_sentences(
-        goal_line,
-        agent_pos_example=agent_pos_example,
-        obj_positions_example=obj_positions_example,
-    )
-
     ctx_prefix = "ctx"
     agent_pos_example = (
         f"{ctx_prefix}.get(\"agent_pos\", jnp.array([-1, -1], dtype=jnp.int32))"
     )
     obj_positions_example = f"{ctx_prefix}.get(\"object_positions\", {{}})"
+    goal_sentences = _goal_sentences(
+        goal_line,
+        agent_pos_example=agent_pos_example,
+        obj_positions_example=obj_positions_example,
+    )
     lines = [
         "You are in the XLand MiniGrid world, a grid-based puzzle level.",
         f"This level uses layout {grid_type}: {layout_hint}. The map is {height}x{width}, and you have up to {max_steps} steps.",
