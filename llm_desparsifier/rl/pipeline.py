@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import math
@@ -35,8 +34,11 @@ from llm_desparsifier.utils import extract_xland_ctx
 class RewardGeneratorProtocol(Protocol):
     """Interface for reward generators consumed by the RL pipeline."""
 
-    def generate(self, env: Environment, env_params: EnvParams) -> tuple[Callable[..., Any], str]:
+    def generate(
+        self, env: Environment, env_params: EnvParams
+    ) -> tuple[Callable[..., Any], str]:
         """Return a dense reward function and the emitted source code."""
+
 
 RewardMode = Literal["dense", "sparse"]
 
@@ -61,6 +63,7 @@ class TrainingResult:
 # Model adapted from minigrid baselines:
 # https://github.com/lcswillems/rl-starter-files/blob/master/model.py
 
+
 # custom RNN cell, which is more convenient that default in flax
 class GRU(nn.Module):
     hidden_dim: int
@@ -69,8 +72,12 @@ class GRU(nn.Module):
     def __call__(self, xs, init_state):
         seq_len, input_dim = xs.shape
         # this init might not be optimal, for example bias for reset gate should be -1 (for now ok)
-        Wi = self.param("Wi", glorot_normal(in_axis=1, out_axis=0), (self.hidden_dim * 3, input_dim))
-        Wh = self.param("Wh", orthogonal(column_axis=0), (self.hidden_dim * 3, self.hidden_dim))
+        Wi = self.param(
+            "Wi", glorot_normal(in_axis=1, out_axis=0), (self.hidden_dim * 3, input_dim)
+        )
+        Wh = self.param(
+            "Wh", orthogonal(column_axis=0), (self.hidden_dim * 3, self.hidden_dim)
+        )
         bi = self.param("bi", zeros_init(), (self.hidden_dim * 3,))
         bn = self.param("bn", zeros_init(), (self.hidden_dim,))
 
@@ -87,6 +94,7 @@ class GRU(nn.Module):
 
         last_state, all_states = jax.lax.scan(_step_fn, init=init_state, xs=xs)
         return all_states, last_state
+
 
 class RNNModel(nn.Module):
     hidden_dim: int
@@ -105,8 +113,12 @@ class RNNModel(nn.Module):
         # sum outputs from all layers, kinda like in ResNet
         return jnp.array(outs).sum(0), jnp.array(states)
 
+
 BatchedRNNModel = flax.linen.vmap(
-    RNNModel, variable_axes={"params": None}, split_rngs={"params": False}, axis_name="batch"
+    RNNModel,
+    variable_axes={"params": None},
+    split_rngs={"params": False},
+    axis_name="batch",
 )
 
 
@@ -131,23 +143,62 @@ class ActorCriticRNN(nn.Module):
         if self.img_obs:
             img_encoder = nn.Sequential(
                 [
-                    nn.Conv(16, (3, 3), strides=2, padding="VALID", kernel_init=orthogonal(math.sqrt(2))),
+                    nn.Conv(
+                        16,
+                        (3, 3),
+                        strides=2,
+                        padding="VALID",
+                        kernel_init=orthogonal(math.sqrt(2)),
+                    ),
                     nn.relu,
-                    nn.Conv(32, (3, 3), strides=2, padding="VALID", kernel_init=orthogonal(math.sqrt(2))),
+                    nn.Conv(
+                        32,
+                        (3, 3),
+                        strides=2,
+                        padding="VALID",
+                        kernel_init=orthogonal(math.sqrt(2)),
+                    ),
                     nn.relu,
-                    nn.Conv(32, (3, 3), strides=2, padding="VALID", kernel_init=orthogonal(math.sqrt(2))),
+                    nn.Conv(
+                        32,
+                        (3, 3),
+                        strides=2,
+                        padding="VALID",
+                        kernel_init=orthogonal(math.sqrt(2)),
+                    ),
                     nn.relu,
-                    nn.Conv(32, (3, 3), strides=2, padding="VALID", kernel_init=orthogonal(math.sqrt(2))),
+                    nn.Conv(
+                        32,
+                        (3, 3),
+                        strides=2,
+                        padding="VALID",
+                        kernel_init=orthogonal(math.sqrt(2)),
+                    ),
                 ]
             )
         else:
             img_encoder = nn.Sequential(
                 [
-                    nn.Conv(16, (2, 2), padding="VALID", kernel_init=orthogonal(math.sqrt(2))),
+                    nn.Conv(
+                        16,
+                        (2, 2),
+                        padding="VALID",
+                        kernel_init=orthogonal(math.sqrt(2)),
+                    ),
                     nn.relu,
-                    nn.Conv(32, (2, 2), padding="VALID", kernel_init=orthogonal(math.sqrt(2))),
+                    nn.Conv(
+                        32,
+                        (2, 2),
+                        padding="VALID",
+                        kernel_init=orthogonal(math.sqrt(2)),
+                    ),
                     nn.relu,
-                    nn.Conv(64, (2, 2), padding="VALID", kernel_init=orthogonal(math.sqrt(2))),
+                    nn.Conv(
+                        64,
+                        (2, 2),
+                        padding="VALID",
+                        kernel_init=orthogonal(math.sqrt(2)),
+                    ),
                     nn.relu,
                 ]
             )
@@ -173,7 +224,9 @@ class ActorCriticRNN(nn.Module):
         obs_emb = img_encoder(inputs["observation"]).reshape(B, S, -1)
         act_emb = action_encoder(inputs["prev_action"])
         # [batch_size, seq_len, hidden_dim + act_emb_dim + 1]
-        out = jnp.concatenate([obs_emb, act_emb, inputs["prev_reward"][..., None]], axis=-1)
+        out = jnp.concatenate(
+            [obs_emb, act_emb, inputs["prev_reward"][..., None]], axis=-1
+        )
         # core networks
         out, new_hidden = rnn_core(out, hidden)
         dist = distrax.Categorical(logits=actor(out))
@@ -194,7 +247,11 @@ def calculate_gae(
     # single iteration for the loop
     def _get_advantages(gae_and_next_value, transition):
         gae, next_value = gae_and_next_value
-        delta = transition.reward + gamma * next_value * (1 - transition.done) - transition.value
+        delta = (
+            transition.reward
+            + gamma * next_value * (1 - transition.done)
+            - transition.value
+        )
         gae = delta + gamma * gae_lambda * (1 - transition.done) * gae
         return (gae, transition.value), gae
 
@@ -236,7 +293,9 @@ def ppo_update_networks(
         log_prob = dist.log_prob(transitions.action)
 
         # CALCULATE VALUE LOSS
-        value_pred_clipped = transitions.value + (value - transitions.value).clip(-clip_eps, clip_eps)
+        value_pred_clipped = transitions.value + (value - transitions.value).clip(
+            -clip_eps, clip_eps
+        )
         value_loss = jnp.square(value - targets)
         value_loss_clipped = jnp.square(value_pred_clipped - targets)
         value_loss = 0.5 * jnp.maximum(value_loss, value_loss_clipped).mean()
@@ -251,8 +310,12 @@ def ppo_update_networks(
         total_loss = actor_loss + vf_coef * value_loss - ent_coef * entropy
         return total_loss, (value_loss, actor_loss, entropy)
 
-    (loss, (vloss, aloss, entropy)), grads = jax.value_and_grad(_loss_fn, has_aux=True)(train_state.params)
-    (loss, vloss, aloss, entropy, grads) = jax.lax.pmean((loss, vloss, aloss, entropy, grads), axis_name="devices")
+    (loss, (vloss, aloss, entropy)), grads = jax.value_and_grad(_loss_fn, has_aux=True)(
+        train_state.params
+    )
+    (loss, vloss, aloss, entropy, grads) = jax.lax.pmean(
+        (loss, vloss, aloss, entropy, grads), axis_name="devices"
+    )
     train_state = train_state.apply_gradients(grads=grads)
     update_info = {
         "total_loss": loss,
@@ -291,17 +354,9 @@ def rollout(
         action = dist.sample(seed=_rng).squeeze()
         timestep = env.step(env_params, timestep, action)
 
-        extras = getattr(timestep, "extras", None)
-        if extras is not None:
-            get_fn = getattr(extras, "get", None)
-            if callable(get_fn):
-                gt_reward = get_fn("ground_truth_reward", timestep.reward)
-            elif "ground_truth_reward" in extras:
-                gt_reward = extras["ground_truth_reward"]
-            else:
-                gt_reward = timestep.reward
-        else:
-            gt_reward = timestep.reward
+        gt_reward = getattr(timestep, "ground_truth_reward", timestep.reward)
+        if isinstance(gt_reward, float) or isinstance(gt_reward, int):
+            gt_reward = jnp.asarray(gt_reward)
 
         stats = stats.replace(
             reward=stats.reward + timestep.reward,
@@ -324,6 +379,7 @@ def rollout(
 # ======================
 # Training
 # ======================
+
 
 @dataclass
 class TrainConfig:
@@ -354,20 +410,28 @@ class TrainConfig:
     eval_seed: int = 42
     train_seed: int = 42
     gt_success_threshold: Optional[float] = None
+    deterministic_rulesets: bool = False
 
     def __post_init__(self):
         num_devices = jax.local_device_count()
-        
+
         # splitting computation across all available devices
         self.num_envs_per_device = self.num_envs // num_devices
         self.total_timesteps_per_device = self.total_timesteps // num_devices
         self.eval_num_envs_per_device = self.eval_num_envs // num_devices
         assert self.num_envs % num_devices == 0
-        
-        self.num_meta_updates = round(self.total_timesteps_per_device / (self.num_envs_per_device * self.num_steps_per_env))
+
+        self.num_meta_updates = max(
+            1,
+            round(
+                self.total_timesteps_per_device
+                / (self.num_envs_per_device * self.num_steps_per_env)
+            ),
+        )
         self.num_inner_updates = self.num_steps_per_env // self.num_steps_per_update
         assert self.num_steps_per_env % self.num_steps_per_update == 0
         print(f"Num devices: {num_devices}, Num meta updates: {self.num_meta_updates}")
+
 
 def make_states(
     config: "TrainConfig",
@@ -379,7 +443,9 @@ def make_states(
 ):
     # for learning rage scheduling
     def linear_schedule(count):
-        total_inner_updates = config.num_minibatches * config.update_epochs * config.num_inner_updates
+        total_inner_updates = (
+            config.num_minibatches * config.update_epochs * config.num_inner_updates
+        )
         frac = 1.0 - (count // total_inner_updates) / config.num_meta_updates
         return config.lr * frac
 
@@ -406,7 +472,9 @@ def make_states(
 
     if reward_mode == "dense":
         if reward_generator is None:
-            raise ValueError("reward_generator must be provided for dense training runs")
+            raise ValueError(
+                "reward_generator must be provided for dense training runs"
+            )
         dense_reward, emitted_code = reward_generator.generate(env, env_params)
         os.makedirs(output_dir, exist_ok=True)
         dense_path = os.path.join(output_dir, "dense_reward_synthesized.py")
@@ -421,7 +489,7 @@ def make_states(
         from xminigrid.experimental.img_obs import RGBImgObservationWrapper
 
         env = RGBImgObservationWrapper(env)
-    
+
     # set up training state
     rng = jax.random.key(config.train_seed)
     rng, _rng = jax.random.split(rng)
@@ -436,7 +504,9 @@ def make_states(
     )
     # [batch_size, seq_len, ...]
     init_obs = {
-        "observation": jnp.zeros((config.num_envs_per_device, 1, *env.observation_shape(env_params))),
+        "observation": jnp.zeros(
+            (config.num_envs_per_device, 1, *env.observation_shape(env_params))
+        ),
         "prev_action": jnp.zeros((config.num_envs_per_device, 1), dtype=jnp.int32),
         "prev_reward": jnp.zeros((config.num_envs_per_device, 1)),
     }
@@ -445,11 +515,42 @@ def make_states(
     network_params = network.init(_rng, init_obs, init_hstate)
     tx = optax.chain(
         optax.clip_by_global_norm(config.max_grad_norm),
-        optax.inject_hyperparams(optax.adam)(learning_rate=linear_schedule, eps=1e-8),  # eps=1e-5
+        optax.inject_hyperparams(optax.adam)(
+            learning_rate=linear_schedule, eps=1e-8
+        ),  # eps=1e-5
     )
-    train_state = TrainState.create(apply_fn=network.apply, params=network_params, tx=tx)
+    train_state = TrainState.create(
+        apply_fn=network.apply, params=network_params, tx=tx
+    )
 
-    return rng, env, env_params, benchmark, init_hstate, train_state, emitted_code, dense_path, ctx_fn_used
+    return (
+        rng,
+        env,
+        env_params,
+        benchmark,
+        init_hstate,
+        train_state,
+        emitted_code,
+        dense_path,
+        ctx_fn_used,
+    )
+
+
+def _broadcast_ruleset(ruleset: Any, batch_size: int) -> Any:
+    """Broadcast a single ruleset into a batched ruleset PyTree.
+
+    This helper is required to reuse one deterministic ruleset across all
+    parallel environments without changing the rollout shape that vectorized
+    training expects. It differs from `Benchmark.sample_ruleset`, which creates
+    a new stochastic ruleset per environment, by cloning a fixed ruleset into
+    the leading batch dimension.
+    """
+
+    def _tile(value: Any) -> jax.Array:
+        arr = jnp.asarray(value)
+        return jnp.broadcast_to(arr, (batch_size,) + arr.shape)
+
+    return jtu.tree_map(_tile, ruleset)
 
 
 def make_train(
@@ -458,6 +559,27 @@ def make_train(
     benchmark: Benchmark,
     config: TrainConfig,
 ):
+    """Create the compiled PPO training function for the current config.
+
+    The returned callable performs the full meta-training loop inside a
+    `jax.pmap`, including data collection, PPO updates, and evaluation. It is
+    needed because `run_training_with_reward` must compile a single JAX program
+    with fixed shapes for speed. This differs from `run_training_with_reward`,
+    which orchestrates environment setup and logging around the compiled
+    training function.
+    """
+    fixed_ruleset = None
+    fixed_train_rulesets = None
+    fixed_eval_rulesets = None
+    if config.deterministic_rulesets:
+        fixed_ruleset = benchmark.get_ruleset(0)
+        fixed_train_rulesets = _broadcast_ruleset(
+            fixed_ruleset, config.num_envs_per_device
+        )
+        fixed_eval_rulesets = _broadcast_ruleset(
+            fixed_ruleset, config.eval_num_envs_per_device
+        )
+
     @partial(jax.pmap, axis_name="devices")
     def train(
         rng: jax.Array,
@@ -474,7 +596,10 @@ def make_train(
             reset_rng = jax.random.split(rng, num=config.num_envs_per_device)
 
             # sample rulesets for this meta update
-            rulesets = jax.vmap(benchmark.sample_ruleset)(ruleset_rng)
+            if fixed_train_rulesets is None:
+                rulesets = jax.vmap(benchmark.sample_ruleset)(ruleset_rng)
+            else:
+                rulesets = fixed_train_rulesets
             meta_env_params = env_params.replace(ruleset=rulesets)
 
             timestep = jax.vmap(env.reset, in_axes=(0, 0))(meta_env_params, reset_rng)
@@ -485,7 +610,14 @@ def make_train(
             def _update_step(runner_state, _):
                 # COLLECT TRAJECTORIES
                 def _env_step(runner_state, _):
-                    rng, train_state, prev_timestep, prev_action, prev_reward, prev_hstate = runner_state
+                    (
+                        rng,
+                        train_state,
+                        prev_timestep,
+                        prev_action,
+                        prev_reward,
+                        prev_hstate,
+                    ) = runner_state
 
                     # SELECT ACTION
                     rng, _rng = jax.random.split(rng)
@@ -501,10 +633,16 @@ def make_train(
                     )
                     action, log_prob = dist.sample_and_log_prob(seed=_rng)
                     # squeeze seq_len where possible
-                    action, value, log_prob = action.squeeze(1), value.squeeze(1), log_prob.squeeze(1)
+                    action, value, log_prob = (
+                        action.squeeze(1),
+                        value.squeeze(1),
+                        log_prob.squeeze(1),
+                    )
 
                     # STEP ENV
-                    timestep = jax.vmap(env.step, in_axes=0)(meta_env_params, prev_timestep, action)
+                    timestep = jax.vmap(env.step, in_axes=0)(
+                        meta_env_params, prev_timestep, action
+                    )
                     transition = Transition(
                         # ATTENTION: done is always false, as we optimize for entire meta-rollout
                         done=jnp.zeros_like(timestep.last()),
@@ -516,15 +654,26 @@ def make_train(
                         prev_action=prev_action,
                         prev_reward=prev_reward,
                     )
-                    runner_state = (rng, train_state, timestep, action, timestep.reward, hstate)
+                    runner_state = (
+                        rng,
+                        train_state,
+                        timestep,
+                        action,
+                        timestep.reward,
+                        hstate,
+                    )
                     return runner_state, transition
 
                 initial_hstate = runner_state[-1]
                 # transitions: [seq_len, batch_size, ...]
-                runner_state, transitions = jax.lax.scan(_env_step, runner_state, None, config.num_steps_per_update)
+                runner_state, transitions = jax.lax.scan(
+                    _env_step, runner_state, None, config.num_steps_per_update
+                )
 
                 # CALCULATE ADVANTAGE
-                rng, train_state, timestep, prev_action, prev_reward, hstate = runner_state
+                rng, train_state, timestep, prev_action, prev_reward, hstate = (
+                    runner_state
+                )
                 # calculate value of the last step for bootstrapping
                 _, last_val, _ = train_state.apply_fn(
                     train_state.params,
@@ -535,7 +684,9 @@ def make_train(
                     },
                     hstate,
                 )
-                advantages, targets = calculate_gae(transitions, last_val.squeeze(1), config.gamma, config.gae_lambda)
+                advantages, targets = calculate_gae(
+                    transitions, last_val.squeeze(1), config.gamma, config.gae_lambda
+                )
 
                 # UPDATE NETWORK
                 def _update_epoch(update_state, _):
@@ -553,49 +704,101 @@ def make_train(
                         )
                         return new_train_state, update_info
 
-                    rng, train_state, init_hstate, transitions, advantages, targets = update_state
+                    rng, train_state, init_hstate, transitions, advantages, targets = (
+                        update_state
+                    )
 
                     # MINIBATCHES PREPARATION
                     rng, _rng = jax.random.split(rng)
-                    permutation = jax.random.permutation(_rng, config.num_envs_per_device)
+                    permutation = jax.random.permutation(
+                        _rng, config.num_envs_per_device
+                    )
                     # [seq_len, batch_size, ...]
                     batch = (init_hstate, transitions, advantages, targets)
                     # [batch_size, seq_len, ...], as our model assumes
                     batch = jtu.tree_map(lambda x: x.swapaxes(0, 1), batch)
 
-                    shuffled_batch = jtu.tree_map(lambda x: jnp.take(x, permutation, axis=0), batch)
+                    shuffled_batch = jtu.tree_map(
+                        lambda x: jnp.take(x, permutation, axis=0), batch
+                    )
                     # [num_minibatches, minibatch_size, ...]
                     minibatches = jtu.tree_map(
-                        lambda x: jnp.reshape(x, (config.num_minibatches, -1) + x.shape[1:]), shuffled_batch
+                        lambda x: jnp.reshape(
+                            x, (config.num_minibatches, -1) + x.shape[1:]
+                        ),
+                        shuffled_batch,
                     )
-                    train_state, update_info = jax.lax.scan(_update_minbatch, train_state, minibatches)
+                    train_state, update_info = jax.lax.scan(
+                        _update_minbatch, train_state, minibatches
+                    )
 
-                    update_state = (rng, train_state, init_hstate, transitions, advantages, targets)
+                    update_state = (
+                        rng,
+                        train_state,
+                        init_hstate,
+                        transitions,
+                        advantages,
+                        targets,
+                    )
                     return update_state, update_info
 
                 # hstate shape: [seq_len=None, batch_size, num_layers, hidden_dim]
-                update_state = (rng, train_state, initial_hstate[None, :], transitions, advantages, targets)
-                update_state, loss_info = jax.lax.scan(_update_epoch, update_state, None, config.update_epochs)
+                update_state = (
+                    rng,
+                    train_state,
+                    initial_hstate[None, :],
+                    transitions,
+                    advantages,
+                    targets,
+                )
+                update_state, loss_info = jax.lax.scan(
+                    _update_epoch, update_state, None, config.update_epochs
+                )
                 # WARN: do not forget to get updated params
                 rng, train_state = update_state[:2]
 
                 # averaging over minibatches then over epochs
                 loss_info = jtu.tree_map(lambda x: x.mean(-1).mean(-1), loss_info)
-                runner_state = (rng, train_state, timestep, prev_action, prev_reward, hstate)
+                runner_state = (
+                    rng,
+                    train_state,
+                    timestep,
+                    prev_action,
+                    prev_reward,
+                    hstate,
+                )
                 return runner_state, loss_info
 
             # on each meta-update we reset hidden to init_hstate
-            runner_state = (rng, train_state, timestep, prev_action, prev_reward, init_hstate)
-            runner_state, loss_info = jax.lax.scan(_update_step, runner_state, None, config.num_inner_updates)
+            runner_state = (
+                rng,
+                train_state,
+                timestep,
+                prev_action,
+                prev_reward,
+                init_hstate,
+            )
+            runner_state, loss_info = jax.lax.scan(
+                _update_step, runner_state, None, config.num_inner_updates
+            )
             # WARN: do not forget to get updated params
             rng, train_state = runner_state[:2]
 
             # EVALUATE AGENT
-            eval_ruleset_rng, eval_reset_rng = jax.random.split(jax.random.key(config.eval_seed))
-            eval_ruleset_rng = jax.random.split(eval_ruleset_rng, num=config.eval_num_envs_per_device)
-            eval_reset_rng = jax.random.split(eval_reset_rng, num=config.eval_num_envs_per_device)
+            eval_ruleset_rng, eval_reset_rng = jax.random.split(
+                jax.random.key(config.eval_seed)
+            )
+            eval_ruleset_rng = jax.random.split(
+                eval_ruleset_rng, num=config.eval_num_envs_per_device
+            )
+            eval_reset_rng = jax.random.split(
+                eval_reset_rng, num=config.eval_num_envs_per_device
+            )
 
-            eval_ruleset = jax.vmap(benchmark.sample_ruleset)(eval_ruleset_rng)
+            if fixed_eval_rulesets is None:
+                eval_ruleset = jax.vmap(benchmark.sample_ruleset)(eval_ruleset_rng)
+            else:
+                eval_ruleset = fixed_eval_rulesets
             eval_env_params = env_params.replace(ruleset=eval_ruleset)
 
             eval_stats = jax.vmap(rollout, in_axes=(0, None, 0, None, None, None))(
@@ -616,12 +819,22 @@ def make_train(
                     "eval/returns_mean": eval_stats.reward.mean(0),
                     "eval/returns_median": jnp.median(eval_stats.reward),
                     "eval/returns_std": jnp.std(eval_stats.reward),
-                    "eval/ground_truth_returns_mean": eval_stats.ground_truth_reward.mean(0),
-                    "eval/ground_truth_returns_median": jnp.median(eval_stats.ground_truth_reward),
-                    "eval/ground_truth_returns_std": jnp.std(eval_stats.ground_truth_reward),
+                    "eval/ground_truth_returns_mean": eval_stats.ground_truth_reward.mean(
+                        0
+                    ),
+                    "eval/ground_truth_returns_median": jnp.median(
+                        eval_stats.ground_truth_reward
+                    ),
+                    "eval/ground_truth_returns_std": jnp.std(
+                        eval_stats.ground_truth_reward
+                    ),
                     "eval/lengths": eval_stats.length.mean(0),
-                    "eval/lengths_20percentile": jnp.percentile(eval_stats.length, q=20),
-                    "eval/returns_20percentile": jnp.percentile(eval_stats.reward, q=20),
+                    "eval/lengths_20percentile": jnp.percentile(
+                        eval_stats.length, q=20
+                    ),
+                    "eval/returns_20percentile": jnp.percentile(
+                        eval_stats.reward, q=20
+                    ),
                     "eval/ground_truth_returns_20percentile": jnp.percentile(
                         eval_stats.ground_truth_reward, q=20
                     ),
@@ -635,7 +848,9 @@ def make_train(
             return meta_state, loss_info
 
         meta_state = (rng, train_state)
-        meta_state, loss_info = jax.lax.scan(_meta_step, meta_state, None, config.num_meta_updates)
+        meta_state, loss_info = jax.lax.scan(
+            _meta_step, meta_state, None, config.num_meta_updates
+        )
         return {"state": meta_state[-1], "loss_info": loss_info}
 
     return train
@@ -650,10 +865,20 @@ def run_training_with_reward(
     progress_callback: Optional[Callable[[int, Mapping[str, float]], None]] = None,
     reward_mode: RewardMode = "dense",
 ) -> TrainingResult:
-    """Execute the full RL pipeline with a supplied dense reward generator."""
+    """Run PPO training and evaluation with optional dense reward shaping.
+
+    This function stitches together environment construction, reward synthesis
+    (when dense), JAX compilation, training, and sparse evaluation so callers
+    can request a single end-to-end run. It is needed by the GEPA loop to score
+    candidate reward prompts, and it differs from `make_train` by owning the
+    outer orchestration, artifacts, and evaluation harness rather than just
+    returning a compiled training function.
+    """
 
     if reward_mode not in ("dense", "sparse"):
-        raise ValueError(f"Unsupported reward_mode '{reward_mode}'. Expected 'dense' or 'sparse'.")
+        raise ValueError(
+            f"Unsupported reward_mode '{reward_mode}'. Expected 'dense' or 'sparse'."
+        )
 
     config_kwargs = dict(config_override or {})
     config = TrainConfig(**config_kwargs)
@@ -691,13 +916,17 @@ def run_training_with_reward(
     print("Compiling...")
     compile_start = time.time()
     train_fn = make_train(env, env_params, benchmark, config)
-    train_fn = train_fn.lower(rng_devices, train_state_devices, init_hstate_devices).compile()
+    train_fn = train_fn.lower(
+        rng_devices, train_state_devices, init_hstate_devices
+    ).compile()
     compile_elapsed = time.time() - compile_start
     print(f"Done in {compile_elapsed:.2f}s.")
 
     print("Training...")
     train_start = time.time()
-    train_info = jax.block_until_ready(train_fn(rng_devices, train_state_devices, init_hstate_devices))
+    train_info = jax.block_until_ready(
+        train_fn(rng_devices, train_state_devices, init_hstate_devices)
+    )
     train_elapsed = time.time() - train_start
     print(f"Done in {train_elapsed / 60:.2f}min")
 
@@ -720,7 +949,11 @@ def run_training_with_reward(
         for idx in range(steps):
             step_metrics: dict[str, float] = {}
             global_step = int((idx + 1) * steps_per_meta)
-            wall_time_sec = float(train_elapsed * ((idx + 1) / total_meta_updates)) if total_meta_updates else 0.0
+            wall_time_sec = (
+                float(train_elapsed * ((idx + 1) / total_meta_updates))
+                if total_meta_updates
+                else 0.0
+            )
             for name, value in loss_info.items():
                 value_arr = jnp.asarray(value)
                 if value_arr.ndim == 0:
@@ -760,6 +993,7 @@ def run_training_with_reward(
         seed=config.eval_seed,
         img_obs=config.img_obs,
         capture_video=False,
+        deterministic_rulesets=config.deterministic_rulesets,
     )
     gt_eval_result = run_ground_truth_eval(
         train_state=train_info["state"],
@@ -770,7 +1004,11 @@ def run_training_with_reward(
     rollout_path = ""
     print(
         "Ground-truth eval: mean=%.4f ± %.4f over %d episodes"
-        % (gt_eval_result.mean_return, gt_eval_result.std_return, len(gt_eval_result.returns))
+        % (
+            gt_eval_result.mean_return,
+            gt_eval_result.std_return,
+            len(gt_eval_result.returns),
+        )
     )
 
     successes = sum(1 for r in gt_eval_result.returns if r > 0.0)
@@ -803,7 +1041,9 @@ def run_training_with_reward(
         "training_curve_dense": dense_curve_path,
         "training_curve_combined": combined_curve_path,
         "eval_rollout": rollout_path,
-        "ctx_fn": "None" if ctx_fn_used is None else f"{ctx_fn_used.__module__}.{ctx_fn_used.__name__}",
+        "ctx_fn": "None"
+        if ctx_fn_used is None
+        else f"{ctx_fn_used.__module__}.{ctx_fn_used.__name__}",
         "reward_mode": reward_mode,
         "ground_truth_metrics_csv": "",
         "ground_truth_summary": "",

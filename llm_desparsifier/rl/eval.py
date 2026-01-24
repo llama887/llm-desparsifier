@@ -26,6 +26,7 @@ class GroundTruthEvalConfig:
     img_obs: bool = False
     capture_video: bool = False
     video_episode_index: int = 0
+    deterministic_rulesets: bool = False
 
 
 @dataclass
@@ -38,7 +39,9 @@ class GroundTruthEvalResult:
     frames: Optional[List] = None
 
 
-def _build_eval_env(cfg: GroundTruthEvalConfig) -> tuple[Environment, EnvParams, Benchmark]:
+def _build_eval_env(
+    cfg: GroundTruthEvalConfig,
+) -> tuple[Environment, EnvParams, Benchmark]:
     env, env_params = xminigrid.make(cfg.env_id)
     env = GymAutoResetWrapper(env)
 
@@ -66,7 +69,15 @@ def run_ground_truth_eval(
     *,
     checkpoint_path: Optional[str] = None,
 ) -> GroundTruthEvalResult:
-    """Roll out a policy on the sparse environment and report per-episode stats."""
+    """Roll out a trained policy on sparse rewards and return episode stats.
+
+    This evaluation isolates the ground-truth success signal so GEPA can score
+    candidate dense rewards without being biased by shaping scale. It is needed
+    because the training loop evaluates on dense rewards, while GEPA requires a
+    consistent sparse metric; it differs from the training-time eval inside
+    `make_train` by running on the host with optional deterministic rulesets and
+    by returning full per-episode trajectories.
+    """
 
     resolved_state = _maybe_restore_train_state(train_state, checkpoint_path)
     env, env_params, benchmark = _build_eval_env(cfg)
@@ -82,7 +93,10 @@ def run_ground_truth_eval(
 
     for episode_idx in range(cfg.num_episodes):
         rng, ruleset_key, reset_key = jax.random.split(rng, 3)
-        ruleset = benchmark.sample_ruleset(ruleset_key)
+        if cfg.deterministic_rulesets:
+            ruleset = benchmark.get_ruleset(0)
+        else:
+            ruleset = benchmark.sample_ruleset(ruleset_key)
         episode_params = env_params.replace(ruleset=ruleset)
 
         timestep = reset_fn(episode_params, reset_key)

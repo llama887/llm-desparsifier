@@ -12,6 +12,7 @@ from flax import struct
 try:
     from flax.core.frozen_dict import freeze
 except ImportError:  # pragma: no cover - flax always available during training
+
     def freeze(value):
         return value
 
@@ -22,6 +23,7 @@ class RewardTimeStep(struct.PyTreeNode):
 
     base: object
     extras: Mapping = struct.field(default_factory=dict)
+    ground_truth_reward: object = 0.0
 
     def __getattr__(self, name):
         return getattr(self.base, name)
@@ -45,10 +47,16 @@ class DesparsifyRewardWrapper:
         self.ctx_fn = ctx_fn
         self._dense_nargs = len(inspect.signature(dense_fn).parameters)
         self._component_keys = tuple(getattr(dense_fn, "__reward_component_keys__", ()))
-        self._component_template = freeze({name: jnp.float32(0.0) for name in self._component_keys}) if self._component_keys else None
+        self._component_template = (
+            freeze({name: jnp.float32(0.0) for name in self._component_keys})
+            if self._component_keys
+            else None
+        )
 
     def _augment_extras(self, ts, original_reward, dense_reward, reward_components):
-        source = ts.extras if isinstance(ts, RewardTimeStep) else getattr(ts, "extras", None)
+        source = (
+            ts.extras if isinstance(ts, RewardTimeStep) else getattr(ts, "extras", None)
+        )
         if isinstance(source, Mapping):
             extras_out = dict(source)
         elif source is not None:
@@ -67,17 +75,25 @@ class DesparsifyRewardWrapper:
         normalized = self._normalize_reward_components(reward_components)
         if normalized is not None:
             extras_out["reward_components"] = normalized
-        elif self._component_template is not None and "reward_components" not in extras_out:
+        elif (
+            self._component_template is not None
+            and "reward_components" not in extras_out
+        ):
             extras_out["reward_components"] = self._component_template
         return freeze(extras_out)
 
     def _wrap_timestep(self, ts, original_reward, dense_reward, reward_components=None):
-        extras = self._augment_extras(ts, original_reward, dense_reward, reward_components)
+        original_reward = jnp.asarray(original_reward)
+        extras = self._augment_extras(
+            ts, original_reward, dense_reward, reward_components
+        )
         if hasattr(ts, "replace"):
             base = ts.replace(reward=dense_reward)
         else:
             base = _py_replace(ts, reward=dense_reward)
-        return RewardTimeStep(base=base, extras=extras)
+        return RewardTimeStep(
+            base=base, extras=extras, ground_truth_reward=original_reward
+        )
 
     def reset(self, env_params, key):
         ts = self.env.reset(env_params, key)
@@ -104,11 +120,17 @@ class DesparsifyRewardWrapper:
         reward_components = None
         if isinstance(dense_output, tuple) and len(dense_output) == 2:
             dense_reward, reward_components = dense_output
-            if reward_components is not None and not isinstance(reward_components, Mapping):
-                raise TypeError("reward_components must be a mapping of component_name -> value")
+            if reward_components is not None and not isinstance(
+                reward_components, Mapping
+            ):
+                raise TypeError(
+                    "reward_components must be a mapping of component_name -> value"
+                )
         else:
             dense_reward = dense_output
-        return self._wrap_timestep(ts_next, original_reward, dense_reward, reward_components)
+        return self._wrap_timestep(
+            ts_next, original_reward, dense_reward, reward_components
+        )
 
     def _normalize_reward_components(self, reward_components):
         if reward_components is None:

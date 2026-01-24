@@ -26,6 +26,7 @@ import dspy
 import numpy as np
 import yaml
 from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
+
 try:
     import wandb
 except ImportError:  # pragma: no cover - wandb optional
@@ -61,6 +62,8 @@ MAX_TOTAL_TIMESTEPS = 10_000_000
 MAX_NUM_ENVS = 1_024
 MAX_EVAL_ENVS = 128
 MAX_EVAL_EPISODES = 20
+DEFAULT_REWARD_LLM_TEMP = 0.0
+DEFAULT_REFLECTION_LLM_TEMP = 0.5
 SINGLE_ENV_ID = "XLand-MiniGrid-R1-9x9"
 SINGLE_ENV_BENCHMARK = "trivial-1m"
 SINGLE_ENV_TOTAL_TIMESTEPS = 1_000_000
@@ -82,12 +85,18 @@ HOLDOUT_ENVS = [
 def safe_wandb_log(wandb_run: Any, payload: Mapping[str, Any], **kwargs: Any) -> None:
     if wandb_run is None:
         return
-    if getattr(wandb_run, "_is_finished", False) or getattr(wandb_run, "finished", False):
+    if getattr(wandb_run, "_is_finished", False) or getattr(
+        wandb_run, "finished", False
+    ):
         return
     try:
         wandb_run.log(payload, **kwargs)
     except Exception as exc:  # pragma: no cover - defensive for late-finish errors
-        if wandb is not None and isinstance(exc, wandb.errors.UsageError) and "finished" in str(exc):
+        if (
+            wandb is not None
+            and isinstance(exc, wandb.errors.UsageError)
+            and "finished" in str(exc)
+        ):
             return
         raise
 
@@ -95,12 +104,18 @@ def safe_wandb_log(wandb_run: Any, payload: Mapping[str, Any], **kwargs: Any) ->
 def safe_wandb_log_artifact(wandb_run: Any, artifact: Any) -> None:
     if wandb_run is None:
         return
-    if getattr(wandb_run, "_is_finished", False) or getattr(wandb_run, "finished", False):
+    if getattr(wandb_run, "_is_finished", False) or getattr(
+        wandb_run, "finished", False
+    ):
         return
     try:
         wandb_run.log_artifact(artifact)
     except Exception as exc:  # pragma: no cover - defensive for late-finish errors
-        if wandb is not None and isinstance(exc, wandb.errors.UsageError) and "finished" in str(exc):
+        if (
+            wandb is not None
+            and isinstance(exc, wandb.errors.UsageError)
+            and "finished" in str(exc)
+        ):
             return
         raise
 
@@ -108,12 +123,18 @@ def safe_wandb_log_artifact(wandb_run: Any, artifact: Any) -> None:
 def safe_wandb_finish(wandb_run: Any) -> None:
     if wandb_run is None:
         return
-    if getattr(wandb_run, "_is_finished", False) or getattr(wandb_run, "finished", False):
+    if getattr(wandb_run, "_is_finished", False) or getattr(
+        wandb_run, "finished", False
+    ):
         return
     try:
         wandb_run.finish(quiet=True)
     except Exception as exc:  # pragma: no cover - defensive for late-finish errors
-        if wandb is not None and isinstance(exc, wandb.errors.UsageError) and "finished" in str(exc):
+        if (
+            wandb is not None
+            and isinstance(exc, wandb.errors.UsageError)
+            and "finished" in str(exc)
+        ):
             return
         raise
 
@@ -150,7 +171,17 @@ class EnvJob:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run GEPA with on-policy RL evaluation")
+    """Parse CLI arguments that configure the GEPA runner.
+
+    This function consolidates all user-facing switches so the rest of the
+    pipeline can assume a validated config object. It is needed to keep the
+    runner reproducible across local, SLURM, and test entrypoints, and it
+    differs from environment grid parsing by only handling top-level CLI
+    concerns rather than per-job settings.
+    """
+    parser = argparse.ArgumentParser(
+        description="Run GEPA with on-policy RL evaluation"
+    )
     parser.add_argument(
         "--state-root",
         type=Path,
@@ -175,9 +206,26 @@ def parse_args() -> argparse.Namespace:
         help="Portkey model alias to use for GEPA (default: %(default)s)",
     )
     parser.add_argument(
+        "--reward-llm-temp",
+        type=float,
+        default=DEFAULT_REWARD_LLM_TEMP,
+        help="Temperature for the reward-synthesis LLM (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--reflection-llm-temp",
+        type=float,
+        default=DEFAULT_REFLECTION_LLM_TEMP,
+        help="Temperature for the GEPA reflection/prompt LLM (default: %(default)s)",
+    )
+    parser.add_argument(
         "--test-single-env",
         action="store_true",
         help="Run GEPA on a single tiny environment with locked seeds for overfitting.",
+    )
+    parser.add_argument(
+        "--deterministic-envs",
+        action="store_true",
+        help="Use a fixed benchmark ruleset instead of sampling new ones.",
     )
     return parser.parse_args()
 
@@ -189,7 +237,9 @@ def load_env_jobs(env_grid_path: Path) -> List[EnvJob]:
     else:
         entries = data
     if not isinstance(entries, list):
-        raise ValueError("Environment grid must be a list under 'jobs' or a top-level list")
+        raise ValueError(
+            "Environment grid must be a list under 'jobs' or a top-level list"
+        )
     jobs = [EnvJob.from_mapping(idx, entry) for idx, entry in enumerate(entries)]
     if not jobs:
         raise ValueError("No environment jobs found in grid")
@@ -209,7 +259,9 @@ def build_single_env_job() -> List[EnvJob]:
     ]
 
 
-def load_prompt_payload(state_root: Path) -> tuple[str, Optional[Dict[str, Any]], Dict[str, Any]]:
+def load_prompt_payload(
+    state_root: Path,
+) -> tuple[str, Optional[Dict[str, Any]], Dict[str, Any]]:
     prompt_path = get_active_prompt_path(state_root)
     if prompt_path.exists():
         payload = json.loads(prompt_path.read_text())
@@ -219,10 +271,14 @@ def load_prompt_payload(state_root: Path) -> tuple[str, Optional[Dict[str, Any]]
             meta = {"source": "active_prompt", "path": str(prompt_path)}
             return text, prompt_state, meta
     if BASE_PROMPT_PATH.exists():
-        return BASE_PROMPT_PATH.read_text(), None, {
-            "source": "base_prompt_file",
-            "path": str(BASE_PROMPT_PATH),
-        }
+        return (
+            BASE_PROMPT_PATH.read_text(),
+            None,
+            {
+                "source": "base_prompt_file",
+                "path": str(BASE_PROMPT_PATH),
+            },
+        )
     return CONSTRAINTS_TEXT, None, {"source": "default_constraints"}
 
 
@@ -241,12 +297,19 @@ def build_dataset_row(
     sanitizer_feedback: Optional[str] = None,
     budget_cfg: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    loss_info = result.train_info.get("loss_info", {}) if isinstance(result.train_info, Mapping) else {}
+    loss_info = (
+        result.train_info.get("loss_info", {})
+        if isinstance(result.train_info, Mapping)
+        else {}
+    )
     sparse_curve = to_float_list(loss_info.get("eval/ground_truth_returns_mean"))
-    component_logs = result.train_info.get("component_logs", {}) if isinstance(result.train_info, Mapping) else {}
+    component_logs = (
+        result.train_info.get("component_logs", {})
+        if isinstance(result.train_info, Mapping)
+        else {}
+    )
     component_curves = {
-        name: to_float_list(series)
-        for name, series in component_logs.items()
+        name: to_float_list(series) for name, series in component_logs.items()
     }
     return {
         "job_name": job.name,
@@ -298,11 +361,15 @@ def make_candidate_fingerprint(reward_code: str, job_cfg: Mapping[str, Any]) -> 
         "eval_num_episodes": job_cfg.get("eval_num_episodes"),
         "eval_seed": job_cfg.get("eval_seed"),
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def derive_seed(example_id: str, candidate_fp: str) -> int:
-    digest = hashlib.blake2b(f"{example_id}:{candidate_fp}".encode("utf-8"), digest_size=8).digest()
+    digest = hashlib.blake2b(
+        f"{example_id}:{candidate_fp}".encode("utf-8"), digest_size=8
+    ).digest()
     return int.from_bytes(digest, "big") % 2_147_483_647
 
 
@@ -327,17 +394,23 @@ def build_holdout_jobs() -> List[EnvJob]:
 def save_best_prompt_text(state_root: Path, model_alias: str, prompt_text: str) -> Path:
     """Persist the best prompt as a plain .txt for quick reuse."""
 
-    safe_model_alias = re.sub(r"[^a-zA-Z0-9_.-]+", "-", model_alias).strip("-") or "model"
+    safe_model_alias = (
+        re.sub(r"[^a-zA-Z0-9_.-]+", "-", model_alias).strip("-") or "model"
+    )
     best_prompt_path = state_root / f"{safe_model_alias}.txt"
     best_prompt_path.write_text(prompt_text.strip() + "\n", encoding="utf-8")
     return best_prompt_path
 
 
 def get_example_id(example: dspy.Example) -> str:
-    return str(getattr(example, "job_name", getattr(example, "env_description", "example")))
+    return str(
+        getattr(example, "job_name", getattr(example, "env_description", "example"))
+    )
 
 
-def format_feedback(feedback_text: str, pred_name: Optional[str], pred_trace: Any) -> str:
+def format_feedback(
+    feedback_text: str, pred_name: Optional[str], pred_trace: Any
+) -> str:
     if pred_name:
         header = f"[Predictor feedback: {pred_name}]"
         if pred_trace is not None:
@@ -354,7 +427,9 @@ def write_training_curve_png(
     sparse_baseline_mean: Optional[float],
 ) -> None:
     if not gepa_solve_rates:
-        print("[training-curve] no GEPA solve rates to plot; skipping training_curve.png")
+        print(
+            "[training-curve] no GEPA solve rates to plot; skipping training_curve.png"
+        )
         return
     try:
         import matplotlib
@@ -370,7 +445,9 @@ def write_training_curve_png(
     plt.plot(xs, gepa_solve_rates, marker="o", linewidth=2.0, label="GEPA solve rate")
     if sparse_baseline_mean is not None:
         baseline_series = [float(sparse_baseline_mean)] * len(xs)
-        plt.plot(xs, baseline_series, linestyle="--", linewidth=2.0, label="Sparse baseline")
+        plt.plot(
+            xs, baseline_series, linestyle="--", linewidth=2.0, label="Sparse baseline"
+        )
     plt.xlabel("GEPA metric call")
     plt.ylabel("Solve rate")
     plt.title("Training Curve")
@@ -415,7 +492,9 @@ class PromptOnlyProgram(dspy.Module):
 
         class PromptSearch(dspy.Signature):
             base_constraints: str = dspy.InputField()
-            prompt_text: str = dspy.OutputField(desc="Evolved constraints for reward synthesis")
+            prompt_text: str = dspy.OutputField(
+                desc="Evolved constraints for reward synthesis"
+            )
 
         class PromptGenerator(dspy.Module):
             def __init__(self, state: Optional[Mapping[str, Any]] = None):
@@ -443,7 +522,13 @@ class PromptOnlyProgram(dspy.Module):
             "Return only the rewritten constraints text."
         )
 
-    def forward(self, env_description: str, constraints: Optional[str] = None, return_trace: bool = False, **kwargs):
+    def forward(
+        self,
+        env_description: str,
+        constraints: Optional[str] = None,
+        return_trace: bool = False,
+        **kwargs,
+    ):
         # GEPA optimizes the rewrite of the base constraints; fallback to provided constraints.
         rewrite_prompt = self._build_rewrite_prompt()
         prompt_input = constraints or rewrite_prompt
@@ -464,13 +549,21 @@ class PromptOnlyProgram(dspy.Module):
             # Include a lightweight fingerprint of the rewriter state for debugging/deduping.
             try:
                 state = self.prompt_generator.rewriter.dump_state()
-                state_bytes = json.dumps(state, sort_keys=True, default=str).encode("utf-8")
-                trace["prompt_state_sha256"] = hashlib.sha256(state_bytes).hexdigest()[:16]
+                state_bytes = json.dumps(state, sort_keys=True, default=str).encode(
+                    "utf-8"
+                )
+                trace["prompt_state_sha256"] = hashlib.sha256(state_bytes).hexdigest()[
+                    :16
+                ]
             except Exception:
                 trace["prompt_state_sha256"] = None
             return prediction, trace
 
-        prompt_text = prompt_input if constraints else self.prompt_generator(base_constraints=rewrite_prompt)
+        prompt_text = (
+            prompt_input
+            if constraints
+            else self.prompt_generator(base_constraints=rewrite_prompt)
+        )
         return dspy.Prediction(prompt_text=prompt_text)
 
 
@@ -493,7 +586,9 @@ def ensure_holdout_sparse_baselines(
     logs_root: Path,
     baseline_json_path: Path,
     log_wandb: Any,
-    config_clamper: Optional[Callable[[Mapping[str, Any]], Tuple[Dict[str, Any], List[str]]]] = None,
+    config_clamper: Optional[
+        Callable[[Mapping[str, Any]], Tuple[Dict[str, Any], List[str]]]
+    ] = None,
     budget_signature: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], float]:
     """Cache sparse baselines for holdouts, merging into the shared JSON payload."""
@@ -501,7 +596,9 @@ def ensure_holdout_sparse_baselines(
     payload = load_sparse_baseline_payload(baseline_json_path) or {}
     baselines: Dict[str, Dict[str, Any]] = dict(payload.get("sparse_baselines", {}))
     existing_mean = float(payload.get("sparse_baseline_mean", 0.0) or 0.0)
-    signature_matches = budget_signature is None or payload.get("budget_signature") == budget_signature
+    signature_matches = (
+        budget_signature is None or payload.get("budget_signature") == budget_signature
+    )
 
     missing_jobs = [job for job in holdout_jobs if job.name not in baselines]
     if missing_jobs or not signature_matches:
@@ -512,7 +609,9 @@ def ensure_holdout_sparse_baselines(
             config_clamper=config_clamper,
         )
         baselines.update(new_baselines)
-        values = [float(row.get("solve_rate", 0.0)) for row in baselines.values() if row]
+        values = [
+            float(row.get("solve_rate", 0.0)) for row in baselines.values() if row
+        ]
         existing_mean = float(np.mean(values)) if values else 0.0
         merged_payload = dict(payload)
         merged_payload["sparse_baselines"] = baselines
@@ -521,7 +620,11 @@ def ensure_holdout_sparse_baselines(
             merged_payload["budget_signature"] = dict(budget_signature)
         save_sparse_baseline(baseline_json_path, merged_payload)
 
-    log_sparse_baseline({k: v for k, v in baselines.items() if k in {j.name for j in holdout_jobs}}, existing_mean, log_wandb)
+    log_sparse_baseline(
+        {k: v for k, v in baselines.items() if k in {j.name for j in holdout_jobs}},
+        existing_mean,
+        log_wandb,
+    )
     return baselines, existing_mean
 
 
@@ -549,7 +652,9 @@ def evaluate_dense_on_jobs(
         run_dir = logs_root / "holdout-dense" / job.name
         run_dir.mkdir(parents=True, exist_ok=True)
         if budget_notes:
-            print(f"[holdout-dense] budget clamp {job.name}: " + "; ".join(budget_notes))
+            print(
+                f"[holdout-dense] budget clamp {job.name}: " + "; ".join(budget_notes)
+            )
         print(f"[holdout-dense] evaluating {job.env_id} seed={seed} dir={run_dir.name}")
 
         start = time.time()
@@ -576,9 +681,17 @@ def evaluate_dense_on_jobs(
             if successes is None:
                 successes = sum(1 for r in returns if r > 0.0)
             total_eps = len(returns)
-            solve_rate = float(successes) / float(total_eps) if total_eps else float(gt_eval.get("success_rate", 0.0) or 0.0)
+            solve_rate = (
+                float(successes) / float(total_eps)
+                if total_eps
+                else float(gt_eval.get("success_rate", 0.0) or 0.0)
+            )
             if total_eps == 0 and gt_eval.get("success_rate") is None:
-                sparse_curve = to_float_list(result.train_info.get("loss_info", {}).get("eval/ground_truth_returns_mean"))
+                sparse_curve = to_float_list(
+                    result.train_info.get("loss_info", {}).get(
+                        "eval/ground_truth_returns_mean"
+                    )
+                )
                 solve_rate = float(sparse_curve[-1]) if sparse_curve else 0.0
             reward_hash = hashlib.sha256(emitted_code.encode("utf-8")).hexdigest()[:16]
             artifacts = dict(result.artifacts)
@@ -623,9 +736,117 @@ def evaluate_dense_on_jobs(
     mean_solve_rate = float(np.mean(solve_rates)) if solve_rates else 0.0
     if reward_records:
         out_path = logs_root / "holdout_reward_functions.jsonl"
-        out_path.write_text("\n".join(json.dumps(r, sort_keys=True) for r in reward_records) + "\n", encoding="utf-8")
+        out_path.write_text(
+            "\n".join(json.dumps(r, sort_keys=True) for r in reward_records) + "\n",
+            encoding="utf-8",
+        )
         print(f"[holdout-dense] wrote reward functions to {out_path}")
     return results, mean_solve_rate
+
+
+def extract_solve_rate(result: TrainingResult) -> float:
+    """Compute a solve rate from a training result with robust fallbacks.
+
+    This helper centralizes the logic for extracting solve rates from a
+    TrainingResult so single-env comparisons and GEPA metrics stay consistent.
+    It is needed because ground-truth evaluation metadata can be partially
+    populated depending on evaluator settings, and it differs from per-call
+    solve-rate snippets by also falling back to the sparse-return curve when
+    no explicit success counters are available.
+    """
+
+    gt_eval = result.ground_truth_eval or {}
+    returns = gt_eval.get("returns") or []
+    successes = gt_eval.get("successes")
+    if successes is None:
+        successes = sum(1 for r in returns if r > 0.0)
+    total_eps = len(returns)
+    if total_eps:
+        return float(successes) / float(total_eps)
+    if gt_eval.get("success_rate") is not None:
+        return float(gt_eval.get("success_rate", 0.0))
+    sparse_curve = (
+        result.train_info.get("loss_info", {}).get("eval/ground_truth_returns_mean")
+        if isinstance(result.train_info, Mapping)
+        else None
+    )
+    if sparse_curve is None:
+        return 0.0
+    return float(sparse_curve[-1]) if sparse_curve else 0.0
+
+
+def evaluate_single_env_dense(
+    *,
+    job: EnvJob,
+    prompt_text: str,
+    base_lm: Any,
+    logs_root: Path,
+    config_clamper: Callable[[Mapping[str, Any]], Tuple[Dict[str, Any], List[str]]],
+) -> Dict[str, Any]:
+    """Evaluate the optimized prompt on the single-env test configuration.
+
+    This helper runs the dense reward generation pipeline using the optimized
+    prompt on the locked single-env test job so we can compare it directly
+    against the sparse baseline within the same GEPA run. It is needed because
+    the main GEPA loop only evaluates candidates during optimization, while the
+    final prompt should be tested once with fixed seeds. It differs from
+    `evaluate_dense_on_jobs` by targeting exactly one job, keeping the original
+    train/eval seeds, and returning a compact payload tailored for logging and
+    end-of-run summaries.
+    """
+
+    job_cfg_raw = job.to_config()
+    budgeted_cfg, budget_notes = config_clamper(job_cfg_raw)
+    budgeted_cfg["train_seed"] = job.train_seed
+    budgeted_cfg["eval_seed"] = job.eval_seed
+
+    run_stamp = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    run_dir = logs_root / "compare-single-env" / run_stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    if budget_notes:
+        print(
+            f"[single-env-compare] budget clamp {job.name}: " + "; ".join(budget_notes)
+        )
+    print(
+        "[single-env-compare] running dense eval for "
+        f"{job.env_id} train_seed={job.train_seed} eval_seed={job.eval_seed} "
+        f"dir={run_dir}"
+    )
+
+    reward_generator = RewardGenerator(
+        constraints_text=prompt_text,
+        lm=base_lm,
+        max_sanitize_attempts=5,
+    )
+    start = time.time()
+    result = run_training_with_reward(
+        reward_generator,
+        output_dir=str(run_dir),
+        config_override={k: v for k, v in budgeted_cfg.items() if k != "name"},
+        reward_mode="dense",
+    )
+    elapsed = time.time() - start
+    solve_rate = extract_solve_rate(result)
+    emitted_code = result.emitted_reward_code or ""
+    reward_hash = hashlib.sha256(emitted_code.encode("utf-8")).hexdigest()[:16]
+    prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+    reward_path = (
+        result.artifacts.get("dense_reward_path") if result.artifacts else None
+    )
+
+    return {
+        "env_id": job.env_id,
+        "benchmark_id": job.benchmark_id,
+        "train_seed": job.train_seed,
+        "eval_seed": job.eval_seed,
+        "prompt_sha16": prompt_hash,
+        "reward_sha16": reward_hash,
+        "solve_rate": solve_rate,
+        "elapsed_sec": elapsed,
+        "run_dir": str(run_dir),
+        "reward_code_path": reward_path,
+    }
 
 
 def write_holdout_bar_plots(
@@ -647,7 +868,9 @@ def write_holdout_bar_plots(
 
     envs = sorted(dense_results.keys(), key=lambda k: dense_results[k].get("env_id", k))
     dense_vals = [float(dense_results[e].get("solve_rate", 0.0)) for e in envs]
-    sparse_vals = [float((sparse_baselines.get(e) or {}).get("solve_rate", 0.0)) for e in envs]
+    sparse_vals = [
+        float((sparse_baselines.get(e) or {}).get("solve_rate", 0.0)) for e in envs
+    ]
 
     paths: List[Path] = []
 
@@ -695,6 +918,14 @@ def write_holdout_bar_plots(
 
 
 def run_batch() -> None:
+    """Run the integrated GEPA + on-policy RL loop end to end.
+
+    This is the orchestration entrypoint that wires CLI flags into prompt
+    loading, LLM configuration, sparse baseline caching, GEPA optimization,
+    holdout evaluation, and artifact persistence. It is needed to keep the
+    experiment flow in one place and differs from lower-level training helpers
+    by coordinating multiple runs and stateful outputs.
+    """
     args = parse_args()
     state_root = args.state_root.expanduser().resolve()
     state_root.mkdir(parents=True, exist_ok=True)
@@ -713,21 +944,27 @@ def run_batch() -> None:
         # Use all jobs from the grid; users can edit the YAML to reduce set.
 
     constraints_text, prompt_state, prompt_meta = load_prompt_payload(state_root)
-    # Configure LM once; reuse for program + reflection.
-    base_lm = configure_portkey_lm(model_alias=args.llm)
-    reflection_module = create_reward_reflection_module(lm=base_lm)
-    dspy.configure(lm=base_lm)
+    reward_lm = configure_portkey_lm(
+        model_alias=args.llm,
+        temperature=args.reward_llm_temp,
+    )
+    reflection_lm = configure_portkey_lm(
+        model_alias=args.llm,
+        temperature=args.reflection_llm_temp,
+    )
+    reflection_module = create_reward_reflection_module(lm=reflection_lm)
+    dspy.configure(lm=reflection_lm)
     dspy.settings.configure(provide_traceback=True)
     print(f"[run_reward_batch] provide_traceback={dspy.settings.provide_traceback}")
 
     wandb_run = None
-    candidate_table = None
-    reward_log_table = None
-    io_table = None
+    rl_runs_table = None
     sparse_baselines: Dict[str, Dict[str, Any]] = {}
     sparse_baseline_mean: float = 0.0
     gepa_solve_rates: List[float] = []
     last_wandb_step = -1
+    single_env_compare: Optional[Dict[str, Any]] = None
+    single_env_console_summary: Optional[str] = None
 
     if wandb is not None and not os.environ.get("WANDB_DISABLED"):
         # Match W&B project to the selected model alias; sanitize to allowed chars.
@@ -746,51 +983,37 @@ def run_batch() -> None:
                     "max_metric_calls": args.max_metric_calls,
                     "test_single_env": bool(args.test_single_env),
                     "single_env_id": SINGLE_ENV_ID if args.test_single_env else None,
-                    "single_env_train_seed": SINGLE_ENV_TRAIN_SEED if args.test_single_env else None,
-                    "single_env_eval_seed": SINGLE_ENV_EVAL_SEED if args.test_single_env else None,
+                    "single_env_train_seed": SINGLE_ENV_TRAIN_SEED
+                    if args.test_single_env
+                    else None,
+                    "single_env_eval_seed": SINGLE_ENV_EVAL_SEED
+                    if args.test_single_env
+                    else None,
+                    "deterministic_envs": bool(args.deterministic_envs),
+                    "reward_llm_temp": args.reward_llm_temp,
+                    "reflection_llm_temp": args.reflection_llm_temp,
                 },
             )
-            candidate_table = wandb.Table(
+            rl_runs_table = wandb.Table(
                 columns=[
-                    "step",
+                    "rl_run_id",
                     "env_id",
-                    "solve_rate",
-                    "sparse_baseline",
+                    "env_text",
+                    "prompt_text",
                     "reward_code_sha16",
                     "reward_code",
-                    "prompt_text",
+                    "solve_rate",
+                    "sparse_baseline",
                     "feedback",
                     "sanitizer_feedback",
                     "run_dir",
                 ],
                 log_mode="MUTABLE",
             )
-            reward_log_table = wandb.Table(
-                columns=[
-                    "step",
-                    "env_id",
-                    "env_text",
-                    "system_prompt",
-                    "reward_code",
-                    "solve_rate",
-                    "feedback",
-                ],
-                log_mode="MUTABLE",
-            )
-            io_table = wandb.Table(
-                columns=[
-                    "metric_call",
-                    "score",
-                    "feedback",
-                    "prompt_text",
-                ],
-                log_mode="MUTABLE",
-            )
         except Exception as exc:  # pragma: no cover - defensive
             print(f"[wandb] init failed, continuing without logging: {exc}")
             wandb_run = None
-            reward_log_table = None
-            io_table = None
+            rl_runs_table = None
 
     def log_wandb(payload: Mapping[str, Any], *, step: Optional[int] = None) -> None:
         nonlocal last_wandb_step
@@ -803,11 +1026,28 @@ def run_batch() -> None:
         last_wandb_step = step
         safe_wandb_log(wandb_run, payload, step=step)
 
+    def clamp_with_determinism(
+        job_cfg: Mapping[str, Any],
+    ) -> tuple[Dict[str, Any], List[str]]:
+        """Clamp per-job budgets while optionally forcing deterministic rulesets.
+
+        This helper preserves the existing runtime caps but guarantees that the
+        deterministic ruleset flag is propagated consistently to baselines,
+        GEPA candidates, and holdout checks when enabled via CLI. It differs
+        from `clamp_job_budget` by injecting `deterministic_rulesets` into the
+        returned config without altering any other knobs.
+        """
+        cfg, notes = clamp_job_budget(job_cfg)
+        if args.deterministic_envs:
+            cfg["deterministic_rulesets"] = True
+        return cfg, notes
+
     baseline_budget_signature = {
         "total_timesteps": MAX_TOTAL_TIMESTEPS,
         "num_envs": MAX_NUM_ENVS,
         "eval_num_envs": MAX_EVAL_ENVS,
         "eval_num_episodes": MAX_EVAL_EPISODES,
+        "deterministic_envs": bool(args.deterministic_envs),
     }
     baseline_json_path = DEFAULT_BASELINE_JSON
     if args.test_single_env:
@@ -820,7 +1060,7 @@ def run_batch() -> None:
         log_wandb=log_wandb,
         env_grid_path=None if args.test_single_env else env_grid_path,
         state_root=state_root,
-        config_clamper=clamp_job_budget,
+        config_clamper=clamp_with_determinism,
         budget_signature=baseline_budget_signature,
     )
 
@@ -888,17 +1128,20 @@ def run_batch() -> None:
                     "ensure scores are captured during primary metric evaluation."
                 )
             feedback_text = format_feedback(
-                cached_feedback or "Missing cached feedback for predictor; returning score only.",
+                cached_feedback
+                or "Missing cached feedback for predictor; returning score only.",
                 pred_name,
                 pred_trace,
             )
             return ScoreWithFeedback(score=cached_score, feedback=feedback_text)
         metric_call_idx += 1
         baseline_solve_rate = sparse_baselines.get(example_id, {}).get("solve_rate")
-        baseline_solve_rate_mean = sparse_baseline_mean if sparse_baseline_mean else None
+        baseline_solve_rate_mean = (
+            sparse_baseline_mean if sparse_baseline_mean else None
+        )
 
         job_cfg_raw = job.to_config()
-        budgeted_cfg, budget_notes = clamp_job_budget(job_cfg_raw)
+        budgeted_cfg, budget_notes = clamp_with_determinism(job_cfg_raw)
         if args.test_single_env:
             seed = job.train_seed
             eval_seed = job.eval_seed
@@ -917,14 +1160,19 @@ def run_batch() -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
 
         if budget_notes:
-            print(f"[on_policy_metric] budget clamp {example_id}: " + "; ".join(budget_notes))
-        print(f"[on_policy_metric] evaluating {example_id} seed={seed} dir={run_dir.name}")
+            print(
+                f"[on_policy_metric] budget clamp {example_id}: "
+                + "; ".join(budget_notes)
+            )
+        print(
+            f"[on_policy_metric] evaluating {example_id} seed={seed} dir={run_dir.name}"
+        )
 
         start = time.time()
         try:
             reward_generator = RewardGenerator(
                 constraints_text=candidate_prompt,
-                lm=base_lm,
+                lm=reward_lm,
                 max_sanitize_attempts=5,
             )
             result = run_training_with_reward(
@@ -934,9 +1182,9 @@ def run_batch() -> None:
                 reward_mode="dense",
             )
 
-            env_description = getattr(reward_generator, "last_env_description", None) or getattr(
-                example, "env_description", None
-            )
+            env_description = getattr(
+                reward_generator, "last_env_description", None
+            ) or getattr(example, "env_description", None)
             sanitizer_feedback = None
             if getattr(reward_generator, "last_attempt_history", None):
                 try:
@@ -969,7 +1217,11 @@ def run_batch() -> None:
             if successes is None:
                 successes = sum(1 for r in returns if r > 0.0)
             total_eps = len(returns)
-            solve_rate = float(successes) / float(total_eps) if total_eps else float(gt_eval.get("success_rate", 0.0))
+            solve_rate = (
+                float(successes) / float(total_eps)
+                if total_eps
+                else float(gt_eval.get("success_rate", 0.0))
+            )
             # Fallback to the previous metric if eval returns are missing.
             if total_eps == 0 and not gt_eval:
                 solve_rate = float(sparse_curve[-1]) if sparse_curve else 0.0
@@ -978,14 +1230,18 @@ def run_batch() -> None:
             elapsed = time.time() - start
         except Exception as exc:
             elapsed = time.time() - start
-            print(f"[on_policy_metric] failure {example_id} after {elapsed / 60:.2f}m: {exc}")
+            print(
+                f"[on_policy_metric] failure {example_id} after {elapsed / 60:.2f}m: {exc}"
+            )
             failure_feedback = f"Training failed: {exc}"
             if "reward_generator" in locals():
                 attempts = getattr(reward_generator, "last_attempt_history", None)
                 if attempts:
                     try:
                         extra = reward_generator._build_feedback_block(attempts)  # type: ignore[attr-defined]
-                        failure_feedback = f"{failure_feedback}\n\nSanitizer feedback:\n{extra}"
+                        failure_feedback = (
+                            f"{failure_feedback}\n\nSanitizer feedback:\n{extra}"
+                        )
                     except Exception:
                         pass
             metric_cache[cache_key] = {
@@ -997,7 +1253,9 @@ def run_batch() -> None:
             feedback_text = format_feedback(failure_feedback, pred_name, pred_trace)
             gepa_solve_rates.append(failsafe_score)
             baseline_line = sparse_baseline_mean if sparse_baselines else None
-            write_training_curve_png(training_curve_path, gepa_solve_rates, baseline_line)
+            write_training_curve_png(
+                training_curve_path, gepa_solve_rates, baseline_line
+            )
             return ScoreWithFeedback(score=failsafe_score, feedback=feedback_text)
 
         reward_hash = hashlib.sha256(emitted_code.encode("utf-8")).hexdigest()[:16]
@@ -1012,53 +1270,38 @@ def run_batch() -> None:
         baseline_line = sparse_baseline_mean if sparse_baselines else None
         write_training_curve_png(training_curve_path, gepa_solve_rates, baseline_line)
 
-        if candidate_table is not None:
-            candidate_table.add_data(
-                run_id,
-                job.env_id,
-                solve_rate,
-                baseline_solve_rate,
-                reward_hash,
-                emitted_code,
-                candidate_prompt,
-                feedback_text,
-                sanitizer_feedback,
-                str(run_dir),
-            )
-            log_wandb({"gepa/candidates": candidate_table}, step=metric_call_idx)
-
-        if reward_log_table is not None:
-            reward_log_table.add_data(
+        if rl_runs_table is not None:
+            rl_runs_table.add_data(
                 run_id,
                 job.env_id,
                 env_description,
                 candidate_prompt,
+                reward_hash,
                 emitted_code,
                 solve_rate,
+                baseline_solve_rate,
                 feedback_text,
+                sanitizer_feedback,
+                str(run_dir),
             )
-            log_wandb({"gepa/reward_log": reward_log_table}, step=metric_call_idx)
+            log_wandb({"gepa/rl_runs": rl_runs_table}, step=metric_call_idx)
 
         payload = {
             "gepa/solve_rate": solve_rate,
-            "gepa/solve_rate_mean": solve_rate,
         }
         if baseline_solve_rate_mean is not None:
             payload["gepa/sparse_baseline_solve_rate"] = baseline_solve_rate_mean
         log_wandb(payload, step=metric_call_idx)
 
         print(
-            f"[on_policy_metric] solve_rate={solve_rate:.4f} env={example_id} elapsed={elapsed/60:.2f}m"
+            f"[on_policy_metric] solve_rate={solve_rate:.4f} env={example_id} elapsed={elapsed / 60:.2f}m"
         )
-        if io_table is not None:
-            io_table.add_data(metric_call_idx, solve_rate, feedback_text, candidate_prompt)
-            log_wandb({"gepa/io_table": io_table}, step=metric_call_idx)
         return ScoreWithFeedback(score=solve_rate, feedback=feedback_text)
 
     compiler = dspy.GEPA(
         metric=on_policy_metric,
         max_metric_calls=args.max_metric_calls,
-        reflection_lm=base_lm,
+        reflection_lm=reflection_lm,
         reflection_minibatch_size=1,
         track_stats=True,
         num_threads=1,
@@ -1087,6 +1330,9 @@ def run_batch() -> None:
     stats_payload["gepa_solve_rate_series"] = gepa_solve_rates
     stats_payload["baseline_budget_signature"] = baseline_budget_signature
     stats_payload["test_single_env"] = bool(args.test_single_env)
+    stats_payload["deterministic_envs"] = bool(args.deterministic_envs)
+    stats_payload["reward_llm_temp"] = args.reward_llm_temp
+    stats_payload["reflection_llm_temp"] = args.reflection_llm_temp
     if args.test_single_env:
         stats_payload["single_env_job"] = {
             "env_id": SINGLE_ENV_ID,
@@ -1109,15 +1355,15 @@ def run_batch() -> None:
             logs_root=logs_root,
             baseline_json_path=DEFAULT_BASELINE_JSON,
             log_wandb=log_wandb,
-            config_clamper=clamp_job_budget,
+            config_clamper=clamp_with_determinism,
             budget_signature=baseline_budget_signature,
         )
         holdout_dense, holdout_dense_mean = evaluate_dense_on_jobs(
             jobs=holdout_jobs,
             prompt_text=best_prompt_text,
-            base_lm=base_lm,
+            base_lm=reward_lm,
             logs_root=logs_root,
-            config_clamper=clamp_job_budget,
+            config_clamper=clamp_with_determinism,
         )
 
         stats_payload["holdout_sparse_baselines"] = holdout_sparse
@@ -1131,9 +1377,55 @@ def run_batch() -> None:
             logs_root=logs_root,
         )
 
-    stats_path.write_text(json.dumps(stats_payload, indent=2, sort_keys=True), encoding="utf-8")
+    if args.test_single_env:
+        job = jobs[0]
+        single_env_compare = evaluate_single_env_dense(
+            job=job,
+            prompt_text=best_prompt_text,
+            base_lm=reward_lm,
+            logs_root=logs_root,
+            config_clamper=clamp_with_determinism,
+        )
+        baseline_entry = sparse_baselines.get(job.name, {}) if sparse_baselines else {}
+        baseline_solve_rate = float(baseline_entry.get("solve_rate", 0.0))
+        dense_solve_rate = float(single_env_compare.get("solve_rate", 0.0))
+        delta = dense_solve_rate - baseline_solve_rate
+        relative = delta / baseline_solve_rate if baseline_solve_rate > 0 else None
+        single_env_compare.update(
+            {
+                "baseline_solve_rate": baseline_solve_rate,
+                "delta": delta,
+                "relative_improvement": relative,
+            }
+        )
+        stats_payload["single_env_compare"] = dict(single_env_compare)
+        log_wandb(
+            {
+                "compare/dense_solve_rate": dense_solve_rate,
+                "compare/sparse_baseline_solve_rate": baseline_solve_rate,
+                "compare/delta": delta,
+                "compare/relative_improvement": relative,
+                "compare/prompt_sha16": single_env_compare.get("prompt_sha16"),
+                "compare/reward_sha16": single_env_compare.get("reward_sha16"),
+                "compare/elapsed_sec": single_env_compare.get("elapsed_sec"),
+            }
+        )
+        relative_str = f"{relative:.4f}" if relative is not None else "n/a"
+        single_env_console_summary = (
+            "[run_reward_batch] single-env comparison "
+            f"dense={dense_solve_rate:.4f} "
+            f"sparse={baseline_solve_rate:.4f} "
+            f"delta={delta:.4f} "
+            f"relative={relative_str}"
+        )
 
-    print(f"[run_reward_batch] GEPA completed. Active prompt updated at {get_active_prompt_path(state_root)}")
+    stats_path.write_text(
+        json.dumps(stats_payload, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+    print(
+        f"[run_reward_batch] GEPA completed. Active prompt updated at {get_active_prompt_path(state_root)}"
+    )
     print(f"[run_reward_batch] GEPA stats written to {stats_path}")
     print(f"[run_reward_batch] Best prompt saved to {best_prompt_path}")
 
@@ -1142,10 +1434,8 @@ def run_batch() -> None:
     write_training_curve_png(training_curve_path, gepa_solve_rates, baseline_line)
 
     if wandb_run is not None:
-        if candidate_table is not None:
-            log_wandb({"gepa/candidates": candidate_table})
-        if io_table is not None:
-            log_wandb({"gepa/io_table": io_table})
+        if rl_runs_table is not None:
+            log_wandb({"gepa/rl_runs": rl_runs_table})
         art = wandb.Artifact(f"{state_root.name}-gepa", type="gepa-state")
         _active = get_active_prompt_path(state_root)
         if _active.exists():
@@ -1161,6 +1451,9 @@ def run_batch() -> None:
                 art.add_file(str(p), name=p.name)
         safe_wandb_log_artifact(wandb_run, art)
         safe_wandb_finish(wandb_run)
+
+    if single_env_console_summary:
+        print(single_env_console_summary)
 
 
 if __name__ == "__main__":
