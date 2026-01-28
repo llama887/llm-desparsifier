@@ -23,9 +23,7 @@ _LAYOUT_HINTS = {
     "R9": "nine rooms in a 3×3 arrangement with interior doors",
 }
 
-_ACTIONS_LINE = (
-    "Actions: move_forward, turn_left, turn_right, pick_up, put_down, toggle (one object carried at a time)."
-)
+_ACTIONS_LINE = "Actions: move_forward, turn_left, turn_right, pick_up, put_down, toggle (one object carried at a time)."
 
 _GOAL_AGENT_HOLD_RE = re.compile(r"AgentHold\s*\(\s*([^)]+)\s*\)", re.IGNORECASE)
 _GOAL_AGENT_NEAR_RE = re.compile(r"AgentNear\s*\(\s*([^)]+)\s*\)", re.IGNORECASE)
@@ -113,9 +111,9 @@ def _goal_sentences(
             f"Your task is to pick up and hold the {obj}.",
             (
                 f"Success when the agent is carrying the {obj}; "
-                f"use {obj_positions_example}.get(\"{obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
-                "to locate the object, and ctx.get(\"is_carrying\", jnp.array(False)) "
-                "plus ctx.get(\"carried_item\", jnp.array([-1, -1], dtype=jnp.int32)) to check inventory."
+                f'use {obj_positions_example}.get("{obj.replace(" ", "_")}", jnp.array([-1, -1], dtype=jnp.int32)) '
+                'to locate the object, and ctx.get("is_carrying", jnp.array(False)) '
+                'plus ctx.get("carried_item", jnp.array([-1, -1], dtype=jnp.int32)) to check inventory.'
             ),
         ]
 
@@ -128,7 +126,7 @@ def _goal_sentences(
             (
                 f"Success when the agent is exactly one cell {direction} of the {obj}; "
                 f"use {agent_pos_example} for the agent and "
-                f"{obj_positions_example}.get(\"{obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                f'{obj_positions_example}.get("{obj.replace(" ", "_")}", jnp.array([-1, -1], dtype=jnp.int32)) '
                 "for the object."
             ),
         ]
@@ -141,7 +139,7 @@ def _goal_sentences(
             (
                 f"Success when the agent is adjacent to the {obj}; "
                 f"use {agent_pos_example} for the agent and "
-                f"{obj_positions_example}.get(\"{obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                f'{obj_positions_example}.get("{obj.replace(" ", "_")}", jnp.array([-1, -1], dtype=jnp.int32)) '
                 "for the object."
             ),
         ]
@@ -151,15 +149,19 @@ def _goal_sentences(
         direction = match.group(1).lower()
         first_obj = _format_object_name(match.group(2))
         second_obj = _format_object_name(match.group(3))
-        alignment = "same row, adjacent columns" if direction in {"left", "right"} else "same column, adjacent rows"
+        alignment = (
+            "same row, adjacent columns"
+            if direction in {"left", "right"}
+            else "same column, adjacent rows"
+        )
         return [
             f"Your task is to place the {first_obj} immediately {direction} of the {second_obj}.",
             (
                 f"Success when the {first_obj} is exactly one cell {direction} of the {second_obj} "
                 f"({alignment}); use "
-                f"{obj_positions_example}.get(\"{first_obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                f'{obj_positions_example}.get("{first_obj.replace(" ", "_")}", jnp.array([-1, -1], dtype=jnp.int32)) '
                 "and "
-                f"{obj_positions_example}.get(\"{second_obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                f'{obj_positions_example}.get("{second_obj.replace(" ", "_")}", jnp.array([-1, -1], dtype=jnp.int32)) '
                 "to locate the tiles."
             ),
         ]
@@ -172,9 +174,9 @@ def _goal_sentences(
             f"Your task is to bring the {first_obj} next to the {second_obj}.",
             (
                 f"Success when the {first_obj} is adjacent to the {second_obj}; use "
-                f"{obj_positions_example}.get(\"{first_obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                f'{obj_positions_example}.get("{first_obj.replace(" ", "_")}", jnp.array([-1, -1], dtype=jnp.int32)) '
                 "and "
-                f"{obj_positions_example}.get(\"{second_obj.replace(' ', '_')}\", jnp.array([-1, -1], dtype=jnp.int32)) "
+                f'{obj_positions_example}.get("{second_obj.replace(" ", "_")}", jnp.array([-1, -1], dtype=jnp.int32)) '
                 "to locate the tiles."
             ),
         ]
@@ -193,7 +195,9 @@ def describe_ruleset(env, env_params) -> str:
     max_steps = _safe_getattr(env_params, "max_steps", "?")
     grid_type = _safe_getattr(env_params, "grid_type", "unknown")
 
-    layout_hint = _LAYOUT_HINTS.get(str(grid_type), "a grid-world layout with interior walls and doors")
+    layout_hint = _LAYOUT_HINTS.get(
+        str(grid_type), "a grid-world layout with interior walls and doors"
+    )
 
     goal_line = None
     rule_lines: List[str] = []
@@ -209,7 +213,9 @@ def describe_ruleset(env, env_params) -> str:
         except Exception:
             pass
 
-    init_obj_list = ", ".join(init_lines[:10]) if init_lines else "unknown (randomized at reset)"
+    init_obj_list = (
+        ", ".join(init_lines[:10]) if init_lines else "unknown (randomized at reset)"
+    )
     if init_lines and len(init_lines) > 10:
         init_obj_list += f", ... (+{len(init_lines) - 10} more)"
     init_obj_keys = [obj.lower().replace(" ", "_") for obj in init_lines]
@@ -218,9 +224,9 @@ def describe_ruleset(env, env_params) -> str:
 
     ctx_prefix = "ctx"
     agent_pos_example = (
-        f"{ctx_prefix}.get(\"agent_pos\", jnp.array([-1, -1], dtype=jnp.int32))"
+        f'{ctx_prefix}.get("agent_pos", jnp.array([-1, -1], dtype=jnp.int32))'
     )
-    obj_positions_example = f"{ctx_prefix}.get(\"object_positions\", {{}})"
+    obj_positions_example = f'{ctx_prefix}.get("object_positions", {{}})'
     goal_sentences = _goal_sentences(
         goal_line,
         agent_pos_example=agent_pos_example,
@@ -230,26 +236,23 @@ def describe_ruleset(env, env_params) -> str:
         "You are in the XLand MiniGrid world, a grid-based puzzle level.",
         f"This level uses layout {grid_type}: {layout_hint}. The map is {height}x{width}, and you have up to {max_steps} steps.",
         f"The agent sees an egocentric {view}x{view} symbolic window (partially observable, not pixels).",
-        (
-            "The agent position comes from "
-            f"{agent_pos_example}."
-        ),
+        (f"The agent position comes from {agent_pos_example}."),
         (
             "Available actions are move_forward, turn_left, turn_right, pick_up, put_down, and toggle; "
             "the agent can carry only one object at a time "
-            "(check ctx.get(\"is_carrying\", jnp.array(False)) and "
-            "ctx.get(\"carried_item\", jnp.array([-1, -1], dtype=jnp.int32)))."
+            '(check ctx.get("is_carrying", jnp.array(False)) and '
+            'ctx.get("carried_item", jnp.array([-1, -1], dtype=jnp.int32))).'
         ),
         (
             f"Initial objects include: {init_obj_list}. "
             "Object locations come from "
-            f"{obj_positions_example}.get(\"{example_obj_key}\", jnp.array([-1, -1], dtype=jnp.int32))."
+            f'{obj_positions_example}.get("{example_obj_key}", jnp.array([-1, -1], dtype=jnp.int32)).'
         ),
     ]
     if swap_obj_keys:
         lines.append(
             "To get positions for the other initial objects, swap the key to one of: "
-            + ", ".join(f"\"{key}\"" for key in swap_obj_keys)
+            + ", ".join(f'"{key}"' for key in swap_obj_keys)
             + "."
         )
     lines.extend(goal_sentences)
@@ -268,6 +271,7 @@ Hard requirements the sanitizer enforces:
 - The return statement must be `return total_reward, reward_components` where `reward_components` is a Python dict with string keys and scalar jnp arrays as values, **or** `return total_reward, { ... }` using a dict literal with string keys.
 - Access every ctx field with `.get(key, fallback)`; using `ctx[...]` is invalid.
 - Guard nested maps like `object_positions` with `.get` at each level.
+- Do NOT add any import statements; the sanitizer only tolerates the tiny allowlist (`import jax`, `import jax.numpy as jnp`, `import jax.lax`) and everything else is rejected.
 
 Minimal valid pattern:
 ```python

@@ -27,13 +27,44 @@ _ALLOWED_FUNCS = {
     "jax": {"lax"},
 }
 _ALLOWED_TOP = {"jnp", "jax"}
-_ALLOWED_IMPORTS = {("jax.numpy", "jnp")}
+_ALLOWED_IMPORTS = {
+    ("jax", None),
+    ("jax.numpy", "jnp"),
+    ("jax.lax", None),
+}
 _ALLOWED_VALUE_ATTRS = {"dtype", "shape", "ndim", "size"}
 _ALLOWED_ATTRS = {
     "ctx": {"get"},
-    "ts_prev": {"reward", "discount", "observation", "step_type", "last", "shape", "dtype", "size"},
-    "ts_next": {"reward", "discount", "observation", "step_type", "last", "shape", "dtype", "size"},
-    "ts": {"reward", "discount", "observation", "step_type", "last", "shape", "dtype", "size"},
+    "ts_prev": {
+        "reward",
+        "discount",
+        "observation",
+        "step_type",
+        "last",
+        "shape",
+        "dtype",
+        "size",
+    },
+    "ts_next": {
+        "reward",
+        "discount",
+        "observation",
+        "step_type",
+        "last",
+        "shape",
+        "dtype",
+        "size",
+    },
+    "ts": {
+        "reward",
+        "discount",
+        "observation",
+        "step_type",
+        "last",
+        "shape",
+        "dtype",
+        "size",
+    },
     "action": {"shape", "dtype", "size"},
     "env_params": {"height", "width", "view_size", "max_steps", "grid_type", "ruleset"},
 }
@@ -121,7 +152,9 @@ class _Sanitizer(ast.NodeVisitor):
     def visit_Attribute(self, node):  # type: ignore[override]
         if getattr(node, "attr", None) == "astype":
             return self.generic_visit(node)
-        if getattr(node, "attr", None) == "get" and isinstance(node.value, (ast.Name, ast.Attribute)):
+        if getattr(node, "attr", None) == "get" and isinstance(
+            node.value, (ast.Name, ast.Attribute)
+        ):
             return self.generic_visit(node)
         root, chain = _decompose_attribute(node)
         if isinstance(root, ast.Name) and root.id in _ALLOWED_TOP:
@@ -138,7 +171,9 @@ class _Sanitizer(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             if node.func.attr == "astype":
                 return self.generic_visit(node)
-            if node.func.attr == "get" and isinstance(node.func.value, (ast.Name, ast.Attribute)):
+            if node.func.attr == "get" and isinstance(
+                node.func.value, (ast.Name, ast.Attribute)
+            ):
                 return self.generic_visit(node)
             root, chain = _decompose_attribute(node.func)
             if isinstance(root, ast.Name) and root.id in _ALLOWED_TOP:
@@ -180,7 +215,9 @@ def _validate_reward_structure(func_node: ast.FunctionDef) -> list[str]:
         @staticmethod
         def _extract_keys(node: ast.Dict) -> list[str]:
             if not node.keys:
-                raise ValueError("reward_components dict must contain at least one entry")
+                raise ValueError(
+                    "reward_components dict must contain at least one entry"
+                )
             keys: list[str] = []
             for key in node.keys:
                 if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
@@ -199,7 +236,9 @@ def _validate_reward_structure(func_node: ast.FunctionDef) -> list[str]:
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == "reward_components":
                     if not isinstance(node.value, ast.Dict):
-                        raise ValueError("reward_components must be defined as a dict literal")
+                        raise ValueError(
+                            "reward_components must be defined as a dict literal"
+                        )
                     keys = self._extract_keys(node.value)
                     self._register_keys(keys)
             self.generic_visit(node)
@@ -208,13 +247,19 @@ def _validate_reward_structure(func_node: ast.FunctionDef) -> list[str]:
             if self._func_depth != 1:
                 return
             if node.value is None:
-                raise ValueError("dense_reward must return (total_reward, reward_components)")
+                raise ValueError(
+                    "dense_reward must return (total_reward, reward_components)"
+                )
             if not isinstance(node.value, ast.Tuple) or len(node.value.elts) != 2:
-                raise ValueError("dense_reward must return (total_reward, reward_components)")
+                raise ValueError(
+                    "dense_reward must return (total_reward, reward_components)"
+                )
             components_node = node.value.elts[1]
             if isinstance(components_node, ast.Name):
                 if components_node.id != "reward_components":
-                    raise ValueError("second element of return must be reward_components")
+                    raise ValueError(
+                        "second element of return must be reward_components"
+                    )
             elif isinstance(components_node, ast.Dict):
                 keys = self._extract_keys(components_node)
                 self._register_keys(keys)
@@ -235,7 +280,9 @@ def sanitize_and_compile(code: str):
     tree = ast.parse(code)
     fdefs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
     if len(fdefs) != 1 or fdefs[0].name != "dense_reward":
-        raise ValueError("output must define dense_reward(...) as the first top-level def")
+        raise ValueError(
+            "output must define dense_reward(...) as the first top-level def"
+        )
     component_keys = _validate_reward_structure(fdefs[0])
     _Sanitizer().visit(tree)
 

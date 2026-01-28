@@ -57,19 +57,20 @@ from llm_desparsifier.utils import (
 
 DEFAULT_ENV_GRID = Path("configs/gepa_envs.yaml")
 BASE_PROMPT_PATH = Path("llm_desparsifier/rewards/prompts/base_reward_prompt.txt")
-DEFAULT_MAX_METRIC_CALLS = 100
-MAX_TOTAL_TIMESTEPS = 10_000_000
-MAX_NUM_ENVS = 1_024
+DEFAULT_MAX_METRIC_CALLS = 50
+MAX_TOTAL_TIMESTEPS = 170_000_000
+MAX_NUM_ENVS = 2_048
 MAX_EVAL_ENVS = 128
 MAX_EVAL_EPISODES = 20
 DEFAULT_REWARD_LLM_TEMP = 0.0
 DEFAULT_REFLECTION_LLM_TEMP = 0.5
 SINGLE_ENV_ID = "XLand-MiniGrid-R1-9x9"
 SINGLE_ENV_BENCHMARK = "trivial-1m"
-SINGLE_ENV_TOTAL_TIMESTEPS = 1_000_000
+SINGLE_ENV_TOTAL_TIMESTEPS = 170_000_000
 SINGLE_ENV_TRAIN_SEED = 0
 SINGLE_ENV_EVAL_SEED = 1
 HOLDOUT_ENVS = [
+    "XLand-MiniGrid-R1-9x9",
     "XLand-MiniGrid-R1-17x17",
     "XLand-MiniGrid-R2-9x9",
     "XLand-MiniGrid-R2-17x17",
@@ -198,7 +199,7 @@ def parse_args() -> argparse.Namespace:
         "--max-metric-calls",
         type=int,
         default=DEFAULT_MAX_METRIC_CALLS,
-        help="Hard cap on GEPA metric calls (defaults to 80).",
+        help="Hard cap on GEPA metric calls (defaults to 100).",
     )
     parser.add_argument(
         "--llm",
@@ -230,20 +231,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_env_jobs(env_grid_path: Path) -> List[EnvJob]:
+def load_env_grid(env_grid_path: Path) -> tuple[List[EnvJob], List[EnvJob]]:
+    """Load training and holdout environment jobs from a YAML grid file.
+
+    This helper centralizes environment-grid parsing so GEPA optimization and
+    holdout evaluation share the same source of truth for job definitions. It is
+    needed because the runner now supports a dedicated `eval_jobs` list for
+    holdout evaluation while still accepting the legacy top-level list format
+    used for training-only runs. It differs from the earlier `load_env_jobs`
+    helper by returning both the training set (`jobs`) and the optional holdout
+    set (`eval_jobs`) in one pass, validating each section independently.
+    """
     data = yaml.safe_load(env_grid_path.read_text())
-    if isinstance(data, Mapping) and "jobs" in data:
-        entries = data["jobs"]
+    if isinstance(data, Mapping):
+        job_entries = data.get("jobs", [])
+        eval_entries = data.get("eval_jobs", [])
+    elif isinstance(data, list):
+        job_entries = data
+        eval_entries = []
     else:
-        entries = data
-    if not isinstance(entries, list):
-        raise ValueError(
-            "Environment grid must be a list under 'jobs' or a top-level list"
-        )
-    jobs = [EnvJob.from_mapping(idx, entry) for idx, entry in enumerate(entries)]
+        raise ValueError("Environment grid must be a mapping or list")
+
+    if not isinstance(job_entries, list):
+        raise ValueError("Environment grid 'jobs' must be a list")
+    if not isinstance(eval_entries, list):
+        raise ValueError("Environment grid 'eval_jobs' must be a list")
+
+    jobs = [EnvJob.from_mapping(idx, entry) for idx, entry in enumerate(job_entries)]
+    eval_jobs = [
+        EnvJob.from_mapping(idx, entry) for idx, entry in enumerate(eval_entries)
+    ]
     if not jobs:
         raise ValueError("No environment jobs found in grid")
-    return jobs
+    return jobs, eval_jobs
 
 
 def build_single_env_job() -> List[EnvJob]:
@@ -374,7 +394,14 @@ def derive_seed(example_id: str, candidate_fp: str) -> int:
 
 
 def build_holdout_jobs() -> List[EnvJob]:
-    """Construct EnvJob list for the reserved holdout environments."""
+    """Construct the default holdout EnvJob list when no eval_jobs are configured.
+
+    This helper preserves the historical hard-coded holdout set so the runner
+    can still execute a post-GEPA evaluation even if an environment grid omits
+    `eval_jobs`. It is needed as a compatibility fallback for older YAML files
+    and differs from the main `load_env_grid` path by providing fixed seeds and
+    budgets instead of reading job definitions from configuration.
+    """
 
     jobs: List[EnvJob] = []
     for idx, env_id in enumerate(HOLDOUT_ENVS):
@@ -935,12 +962,13 @@ def run_batch() -> None:
     env_grid_path = args.env_grid.expanduser().resolve()
     if args.test_single_env:
         jobs = build_single_env_job()
+        eval_jobs: List[EnvJob] = []
         print(
             "[run_reward_batch] single-env test enabled: "
             f"{SINGLE_ENV_ID} train_seed={SINGLE_ENV_TRAIN_SEED} eval_seed={SINGLE_ENV_EVAL_SEED}"
         )
     else:
-        jobs = load_env_jobs(env_grid_path)
+        jobs, eval_jobs = load_env_grid(env_grid_path)
         # Use all jobs from the grid; users can edit the YAML to reduce set.
 
     constraints_text, prompt_state, prompt_meta = load_prompt_payload(state_root)
@@ -1349,7 +1377,12 @@ def run_batch() -> None:
         stats_payload["holdout_skipped"] = True
         stats_payload["holdout_skip_reason"] = "single-env test mode"
     else:
-        holdout_jobs = build_holdout_jobs()
+        holdout_jobs = eval_jobs
+        if not holdout_jobs:
+            print(
+                "[run_reward_batch] no eval_jobs in env grid; using default holdout list"
+            )
+            holdout_jobs = build_holdout_jobs()
         holdout_sparse, holdout_sparse_mean = ensure_holdout_sparse_baselines(
             holdout_jobs,
             logs_root=logs_root,

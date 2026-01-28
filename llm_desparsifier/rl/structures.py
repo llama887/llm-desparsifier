@@ -24,9 +24,14 @@ class RolloutStats(struct.PyTreeNode):
     """Aggregate statistics from evaluation rollouts."""
 
     reward: jax.Array = struct.field(default_factory=lambda: jnp.asarray(0.0))
-    ground_truth_reward: jax.Array = struct.field(default_factory=lambda: jnp.asarray(0.0))
+    ground_truth_reward: jax.Array = struct.field(
+        default_factory=lambda: jnp.asarray(0.0)
+    )
     length: jax.Array = struct.field(default_factory=lambda: jnp.asarray(0))
     episodes: jax.Array = struct.field(default_factory=lambda: jnp.asarray(0))
+    component_sums: jax.Array = struct.field(
+        default_factory=lambda: jnp.zeros((0,), dtype=jnp.float32)
+    )
 
 
 __all__ = ["Transition", "RolloutStats"]

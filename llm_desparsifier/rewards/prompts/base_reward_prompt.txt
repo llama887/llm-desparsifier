@@ -7,6 +7,7 @@ Hard requirements the sanitizer enforces:
 - The return statement must be `return total_reward, reward_components` where `reward_components` is a Python dict with string keys and scalar jnp arrays as values, **or** `return total_reward, { ... }` using a dict literal with string keys.
 - Access every ctx field with `.get(key, fallback)`; using `ctx[...]` is invalid.
 - Guard nested maps like `object_positions` with `.get` at each level.
+- Do NOT add any import statements; the sanitizer only tolerates the tiny allowlist (`import jax`, `import jax.numpy as jnp`, `import jax.lax`) and everything else is rejected.
 
 Minimal valid pattern:
 ```python

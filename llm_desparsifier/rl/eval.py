@@ -14,6 +14,8 @@ from xminigrid.benchmarks import Benchmark
 from xminigrid.environment import EnvParams, Environment
 from xminigrid.wrappers import GymAutoResetWrapper
 
+DEFAULT_RULESET_INDEX = 42
+
 
 @dataclass
 class GroundTruthEvalConfig:
@@ -76,7 +78,9 @@ def run_ground_truth_eval(
     because the training loop evaluates on dense rewards, while GEPA requires a
     consistent sparse metric; it differs from the training-time eval inside
     `make_train` by running on the host with optional deterministic rulesets and
-    by returning full per-episode trajectories.
+    by returning full per-episode trajectories. When deterministic rulesets are
+    enabled, the evaluation uses the same fixed ruleset index as the training
+    loop so solve rates reflect the final policy on the same single task.
     """
 
     resolved_state = _maybe_restore_train_state(train_state, checkpoint_path)
@@ -94,7 +98,7 @@ def run_ground_truth_eval(
     for episode_idx in range(cfg.num_episodes):
         rng, ruleset_key, reset_key = jax.random.split(rng, 3)
         if cfg.deterministic_rulesets:
-            ruleset = benchmark.get_ruleset(0)
+            ruleset = benchmark.get_ruleset(DEFAULT_RULESET_INDEX)
         else:
             ruleset = benchmark.sample_ruleset(ruleset_key)
         episode_params = env_params.replace(ruleset=ruleset)

@@ -27,6 +27,8 @@ from xminigrid.wrappers import GymAutoResetWrapper
 
 from llm_desparsifier.rl.eval import GroundTruthEvalConfig, run_ground_truth_eval
 from llm_desparsifier.rl.structures import RolloutStats, Transition
+
+DEFAULT_RULESET_INDEX = 42
 from llm_desparsifier.rl.wrappers import DesparsifyRewardWrapper
 from llm_desparsifier.utils import extract_xland_ctx
 
@@ -326,6 +328,33 @@ def ppo_update_networks(
     return train_state, update_info
 
 
+def _stack_reward_components(
+    reward_components: Optional[Mapping[str, Any]],
+    component_keys: tuple[str, ...],
+    component_template: jax.Array,
+) -> jax.Array:
+    """Stack per-component reward values into a fixed-order JAX vector.
+
+    This helper converts the `reward_components` mapping attached to a timestep
+    into a dense JAX array that preserves a stable ordering of component keys.
+    It is needed so evaluation rollouts can accumulate component totals inside
+    `jax.lax` loops without relying on Python dict ordering or dynamic key
+    discovery at runtime. It differs from the dataset-row formatting utilities
+    in `scripts/run_reward_batch.py` by operating on JAX arrays during JIT
+    execution and returning a fixed-shape vector rather than Python lists.
+    """
+    if not component_keys:
+        return component_template
+    if reward_components is None:
+        return component_template
+    fallback = jnp.asarray(0.0, dtype=jnp.float32)
+    values = [
+        jnp.asarray(reward_components.get(key, fallback), dtype=jnp.float32)
+        for key in component_keys
+    ]
+    return jnp.stack(values)
+
+
 def rollout(
     rng: jax.Array,
     env: Environment,
@@ -334,6 +363,19 @@ def rollout(
     init_hstate: jax.Array,
     num_consecutive_episodes: int = 1,
 ) -> RolloutStats:
+    """Roll out a trained policy for evaluation and aggregate dense stats.
+
+    The rollout loop executes `num_consecutive_episodes` episodes in a single
+    environment, returning total dense reward, sparse reward, length, and
+    per-component reward sums. It is needed to generate evaluation metrics for
+    GEPA and reflection (including component curves) while remaining fully JAX
+    compatible inside `pmap`/`vmap`. It differs from the training-time rollout
+    inside PPO updates by using the evaluation policy only and by preserving
+    dense component totals for logging.
+    """
+    component_keys = tuple(getattr(env, "_component_keys", ()))
+    component_template = jnp.zeros((len(component_keys),), dtype=jnp.float32)
+
     def _cond_fn(carry):
         rng, stats, timestep, prev_action, prev_reward, hstate = carry
         return jnp.less(stats.episodes, num_consecutive_episodes)
@@ -358,11 +400,23 @@ def rollout(
         if isinstance(gt_reward, float) or isinstance(gt_reward, int):
             gt_reward = jnp.asarray(gt_reward)
 
+        component_sums = stats.component_sums
+        if component_keys:
+            extras = getattr(timestep, "extras", None)
+            reward_components = (
+                extras.get("reward_components") if extras is not None else None
+            )
+            component_values = _stack_reward_components(
+                reward_components, component_keys, component_template
+            )
+            component_sums = component_sums + component_values
+
         stats = stats.replace(
             reward=stats.reward + timestep.reward,
             ground_truth_reward=stats.ground_truth_reward + gt_reward,
             length=stats.length + 1,
             episodes=stats.episodes + timestep.last(),
+            component_sums=component_sums,
         )
         carry = (rng, stats, timestep, action, timestep.reward, hstate)
         return carry
@@ -370,7 +424,8 @@ def rollout(
     timestep = env.reset(env_params, rng)
     prev_action = jnp.asarray(0)
     prev_reward = jnp.asarray(0)
-    init_carry = (rng, RolloutStats(), timestep, prev_action, prev_reward, init_hstate)
+    init_stats = RolloutStats(component_sums=component_template)
+    init_carry = (rng, init_stats, timestep, prev_action, prev_reward, init_hstate)
 
     final_carry = jax.lax.while_loop(_cond_fn, _body_fn, init_val=init_carry)
     return final_carry[1]
@@ -463,7 +518,7 @@ def make_states(
 
     benchmark = xminigrid.load_benchmark(config.benchmark_id)
     # Use a deterministic ruleset example so the LLM sees a concrete task description.
-    example_ruleset = benchmark.get_ruleset(0)
+    example_ruleset = benchmark.get_ruleset(DEFAULT_RULESET_INDEX)
     env_params = env_params.replace(ruleset=example_ruleset)
 
     emitted_code = ""
@@ -572,13 +627,14 @@ def make_train(
     fixed_train_rulesets = None
     fixed_eval_rulesets = None
     if config.deterministic_rulesets:
-        fixed_ruleset = benchmark.get_ruleset(0)
+        fixed_ruleset = benchmark.get_ruleset(DEFAULT_RULESET_INDEX)
         fixed_train_rulesets = _broadcast_ruleset(
             fixed_ruleset, config.num_envs_per_device
         )
         fixed_eval_rulesets = _broadcast_ruleset(
             fixed_ruleset, config.eval_num_envs_per_device
         )
+    component_keys = tuple(getattr(env, "_component_keys", ()))
 
     @partial(jax.pmap, axis_name="devices")
     def train(
@@ -812,6 +868,12 @@ def make_train(
             )
             eval_stats = jax.lax.pmean(eval_stats, axis_name="devices")
 
+            component_metrics: dict[str, jax.Array] = {}
+            if component_keys:
+                component_means = eval_stats.component_sums.mean(0)
+                for idx, name in enumerate(component_keys):
+                    component_metrics[f"eval/component_{name}"] = component_means[idx]
+
             # averaging over inner updates, adding evaluation metrics
             loss_info = jtu.tree_map(lambda x: x.mean(-1), loss_info)
             loss_info.update(
@@ -844,6 +906,8 @@ def make_train(
                     "lr": train_state.opt_state[-1].hyperparams["learning_rate"],
                 }
             )
+            if component_metrics:
+                loss_info.update(component_metrics)
             meta_state = (rng, train_state)
             return meta_state, loss_info
 
@@ -854,6 +918,34 @@ def make_train(
         return {"state": meta_state[-1], "loss_info": loss_info}
 
     return train
+
+
+def extract_component_logs(
+    loss_info: Mapping[str, Any],
+    *,
+    prefix: str = "eval/component_",
+) -> dict[str, Any]:
+    """Extract per-component evaluation series from the training loss map.
+
+    This helper scans the `loss_info` dictionary emitted by the PPO training
+    loop and returns a new mapping from component name to its logged time
+    series. It is needed because reward component curves are stored alongside
+    other evaluation metrics in `loss_info`, but GEPA reflections expect a
+    compact `component_logs` mapping attached to `TrainingResult.train_info`.
+    It differs from the dataset-row formatting in `run_reward_batch.py` by
+    operating directly on raw JAX arrays and leaving type conversion to the
+    caller so downstream code can decide when to materialize Python lists.
+    """
+    if not loss_info:
+        return {}
+    component_logs: dict[str, Any] = {}
+    for key in sorted(loss_info.keys()):
+        if not key.startswith(prefix):
+            continue
+        component_name = key[len(prefix) :]
+        if component_name:
+            component_logs[component_name] = loss_info[key]
+    return component_logs
 
 
 def run_training_with_reward(
@@ -872,7 +964,9 @@ def run_training_with_reward(
     can request a single end-to-end run. It is needed by the GEPA loop to score
     candidate reward prompts, and it differs from `make_train` by owning the
     outer orchestration, artifacts, and evaluation harness rather than just
-    returning a compiled training function.
+    returning a compiled training function. It also extracts per-component
+    evaluation curves into `train_info["component_logs"]` so reward reflection
+    can reason about the magnitude of each reward term.
     """
 
     if reward_mode not in ("dense", "sparse"):
@@ -933,6 +1027,9 @@ def run_training_with_reward(
     # Bring results back to host.
     train_info = unreplicate(train_info)
     loss_info = jtu.tree_map(lambda x: jnp.asarray(x), train_info["loss_info"])
+    component_logs = extract_component_logs(loss_info)
+    train_info = dict(train_info)
+    train_info["component_logs"] = component_logs
 
     final_train_reward = float(loss_info["eval/returns_mean"][-1])
     final_gt_return = float(loss_info["eval/ground_truth_returns_mean"][-1])
