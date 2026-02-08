@@ -1,18 +1,18 @@
 # llm-desparsifier - GEPA On-Policy Loop
 
-This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for XLand-MiniGrid. The main loop proposes reward prompts, runs the RL pipeline for each proposal, and feeds solve-rate scores plus EUREKA-style reflection text back into GEPA. LLM calls are routed through a Portkey gateway and require `PORTKEY_API_KEY`.
+This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for XLand-MiniGrid. The main loop proposes reward prompts, runs the RL pipeline for each proposal, and feeds solve-rate scores plus EUREKA-style reflection text back into GEPA. LLM calls can be routed through the Portkey gateway or sent directly to Gemini depending on `--llm-provider`.
 
 ## DSPy GEPA contract (top level)
 - **Program under optimization**: `PromptOnlyProgram` in `scripts/run_reward_batch.py`. Its `forward(env_description, constraints=None)`:
   - Uses `PromptGenerator` (`dspy.Predict(PromptSearch)`) to rewrite the current constraints block unless GEPA passes `constraints` explicitly.
   - Returns `dspy.Prediction(prompt_text=...)` only (no reward-code predictor in the program graph).
-- **Optimizer**: `dspy.GEPA(metric=on_policy_metric, max_metric_calls, reflection_lm, reflection_minibatch_size=1, track_stats=True, num_threads=1)` created in `run_batch()`.
+- **Optimizer**: `dspy.GEPA(metric=on_policy_metric, max_metric_calls, reflection_lm, reflection_minibatch_size=1, track_stats=True, num_threads=1)` created in `run_batch()` where `max_metric_calls = max_gepa_iterations * num_jobs`.
 - **Metric contract**: `metric(gold: Example, pred: Prediction, trace=None, pred_name=None, pred_trace=None) -> float | ScoreWithFeedback`. `ScoreWithFeedback` contains a numeric `score` and free-form `feedback` text. Higher scores are better and are expected to be in `[0, 1]`.
 - **How GEPA uses it here**: `on_policy_metric` runs a full RL training + evaluation loop per *example* and returns `ScoreWithFeedback(score=solve_rate, feedback=reflection_text)`. Feedback requests for predictors reuse the cached `solve_rate` for that example+prompt so the feedback score matches the module score.
 
 ## Inputs and state
 - **Env grid -> DSPy examples**: `configs/gepa_envs.yaml` is parsed into training `jobs` plus holdout `eval_jobs` (`env_id`, `benchmark_id`, `total_timesteps`, `train_seed`, `eval_seed`). `build_examples()` converts each training job into a `dspy.Example(env_description="<env_id> | benchmark=<id>")`, attaches `example.job_config`, and sets `example.job_name`.
-- **Holdout envs**: `eval_jobs` from `configs/gepa_envs.yaml` drive the post-GEPA holdout evaluation (skipped when `--test-single-env` is enabled). If `eval_jobs` is missing, the runner falls back to the default list in `scripts/run_reward_batch.py`.
+- **Holdout envs**: `eval_jobs` from `configs/gepa_envs.yaml` drive the post-GEPA holdout evaluation (skipped when `--test-single-env` is enabled). If `eval_jobs` is missing, the runner falls back to the default list in `scripts/run_reward_batch.py`. Each holdout environment is evaluated with multiple reward generations (default 5) at the reward LLM temperature, and the reported solve rates aggregate mean and standard deviation across tries.
 - **Prompt state**: `STATE_ROOT/active_prompt.json` (default `artifacts/gepa_state/`) stores:
   - `constraints_text` (the base constraints block used as the rewrite starting point),
   - `prompt_state` (DSPy weights for `PromptGenerator`),
@@ -21,13 +21,16 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 - **Best prompt text**: the optimized prompt text is saved to `STATE_ROOT/<model_alias>.txt` via `save_best_prompt_text`.
 - **Run artifacts**:
   - `STATE_ROOT/gepa_runs/candidate-####-<job>`: per-candidate training outputs, reward code, metrics, W&B run dir.
+  - `STATE_ROOT/gepa_runs/candidate-####-<job>/eval_trajectory.json`: compact eval trajectory (ruleset/reset keys + action sequence, plus `env_seed` and human-readable `env_text`) for deterministic replay and goal inspection; if the main eval produces no trajectory, a single-episode fallback capture is run.
+  - `STATE_ROOT/gepa_runs/candidate-####-<job>/training_curve_dense_vs_sparse.png`: dense return curve normalized to [-1, 1] alongside the ground-truth sparse return curve scaled by `eval_num_episodes` to a [0, 1] success rate over training.
   - `STATE_ROOT/gepa_runs/sparse_baseline/<job>`: sparse baseline runs (cached).
-  - `STATE_ROOT/gepa_runs/holdout-dense/<job>`: holdout dense evaluations.
-  - `STATE_ROOT/gepa_runs/holdout_reward_functions.jsonl`: reward code emitted for holdout runs.
-  - `STATE_ROOT/gepa_runs/training_curve.png`: solve-rate series across GEPA calls.
-  - `STATE_ROOT/gepa_runs/holdout_solve_rates_by_env.png`, `STATE_ROOT/gepa_runs/holdout_solve_rate_aggregate.png`: holdout plots (if matplotlib available).
-  - `sparse_baseline.json`: cached sparse baseline summary (repo root).
-  - `STATE_ROOT/active_prompt.json`: latest prompt state after GEPA completes.
+  - `STATE_ROOT/gepa_runs/holdout-dense/<job>/try-##`: holdout dense evaluations (one subdir per reward generation).
+  - `STATE_ROOT/gepa_runs/holdout_reward_functions.jsonl`: per-try reward code and solve rates emitted for holdout runs.
+- `STATE_ROOT/gepa_runs/training_curve.png`: solve-rate series across GEPA iterations (only when `--plot-training-curves` is set).
+- `STATE_ROOT/gepa_runs/holdout_solve_rates_by_env.png`, `STATE_ROOT/gepa_runs/holdout_solve_rate_aggregate.png`: holdout plots with mean +/- std error bars and the try count (if matplotlib available).
+- `STATE_ROOT/gepa_runs/last_stage.json`: heartbeat snapshot of the most recent GEPA stage/event (useful for diagnosing stalls).
+- `sparse_baseline.json`: cached sparse baseline summary (repo root).
+- `STATE_ROOT/active_prompt.json`: latest prompt state after GEPA completes.
   - `STATE_ROOT/gepa_runs/gepa_stats.json`: GEPA optimizer stats plus sparse baseline and holdout summaries.
 
 ## Candidate evaluation flow (per GEPA proposal)
@@ -63,7 +66,7 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 - Output must define **exactly one** `dense_reward` function.
 - Allowed operations: JAX primitives (`jnp.*`, `jax.lax.*`), `float`/`int` casts, and helper functions defined inside `dense_reward`; method calls are restricted to `.astype(...)` and `ctx.get(...)`.
 - `reward_components` must be a **dict literal** with constant string keys, and the return must be `(total_reward, reward_components)`.
-- `ctx` access must use `ctx.get(key, fallback)`. Direct `ctx[...]` access is rejected, and nested maps must also use `.get`.
+- `ctx` access must use `ctx.get(key, fallback)` at the top level. Direct `ctx[...]` access is rejected; for nested maps, retrieve the map via `ctx.get("object_positions", default_dict)` and then use bracket access on the returned dict (avoid nested `.get` on traced maps).
 - The sanitizer strips markdown fences and rejects non-JAX imports (only `import jax`, `import jax.numpy as jnp`, `import jax.lax` are tolerated) or additional top-level definitions.
 
 ## Environment wrapper behavior
@@ -73,11 +76,14 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 
 ## Artifacts and layout
 - `STATE_ROOT/gepa_runs/candidate-####-<job>`: per-candidate outputs, emitted reward code, metrics, W&B run dir.
+- `STATE_ROOT/gepa_runs/candidate-####-<job>/eval_trajectory.json`: compact eval trajectory (ruleset/reset keys + action sequence, plus `env_seed` and `env_text`) for deterministic replay and human-readable task context; if the main eval produces no trajectory, a single-episode fallback capture is run.
+- `STATE_ROOT/gepa_runs/candidate-####-<job>/training_curve_dense_vs_sparse.png`: dense return curve normalized to [-1, 1] alongside the ground-truth sparse return curve scaled by `eval_num_episodes` to a [0, 1] success rate over training.
 - `STATE_ROOT/gepa_runs/sparse_baseline/<job>`: sparse baseline outputs.
-- `STATE_ROOT/gepa_runs/holdout-dense/<job>`: holdout dense outputs.
-- `STATE_ROOT/gepa_runs/holdout_reward_functions.jsonl`: reward code emitted for holdouts.
-- `STATE_ROOT/gepa_runs/training_curve.png`: solve-rate time series across metric calls.
-- `STATE_ROOT/gepa_runs/holdout_solve_rates_by_env.png`, `STATE_ROOT/gepa_runs/holdout_solve_rate_aggregate.png`: holdout plots (optional).
+- `STATE_ROOT/gepa_runs/holdout-dense/<job>/try-##`: holdout dense outputs (one subdir per reward generation).
+- `STATE_ROOT/gepa_runs/holdout_reward_functions.jsonl`: per-try reward code and solve rates emitted for holdouts.
+- `STATE_ROOT/gepa_runs/training_curve.png`: solve-rate time series across GEPA iterations (only when `--plot-training-curves` is set).
+- `STATE_ROOT/gepa_runs/holdout_solve_rates_by_env.png`, `STATE_ROOT/gepa_runs/holdout_solve_rate_aggregate.png`: holdout plots with mean +/- std error bars and the try count (only when `--plot-training-curves` is set).
+- `STATE_ROOT/gepa_runs/last_stage.json`: heartbeat snapshot of the most recent GEPA stage/event.
 - `sparse_baseline.json`: cached sparse baseline summary (repo root).
 - `STATE_ROOT/active_prompt.json`: latest prompt state after GEPA completes.
 - `STATE_ROOT/<model_alias>.txt`: best prompt text for the selected LLM.
@@ -85,22 +91,32 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 
 ## Running the loop
 - Cluster: `sbatch sbatch/train_dense_batch.s` (sets caches, state root, syncs deps, runs `scripts/run_reward_batch.py`).
-- Local: `uv run scripts/run_reward_batch.py --state-root artifacts/gepa_state`
+- Local (Portkey): `uv run scripts/run_reward_batch.py --state-root artifacts/gepa_state`
+- Local (Gemini): `uv run scripts/run_reward_batch.py --state-root artifacts/gepa_state --llm-provider gemini --llm gemini-3-pro-preview`
 - Useful flags:
-  - `--max-metric-calls` (default 50)
-  - `--llm` (Portkey model alias)
-  - `--reward-llm-temp` (default 0.0)
+  - `--max-gepa-iterations` (default 50)
+  - `--llm` (Portkey model alias or Gemini model name)
+  - `--llm-provider` (`portkey` or `gemini`)
+  - `--reward-llm-temp` (default 0.1)
   - `--reflection-llm-temp` (default 0.5)
+  - `--plot-training-curves` (off by default; enable plot generation)
   - `--test-single-env` (single env overfit run)
   - `--deterministic-envs` (fixed rulesets for train/eval)
 
 Required env vars:
-- `PORTKEY_API_KEY` (loaded via `.env` if present). Without it, reward synthesis and reflection will error.
+- `PORTKEY_API_KEY` (loaded via `.env` if present). Required when `--llm-provider=portkey`.
+- `GEMINI_API_KEY` (loaded via `.env` if present). Required when `--llm-provider=gemini`.
 
 Optional env vars:
 - `WANDB_DISABLED=1` to skip W&B logging.
 - `WANDB_PROJECT` to set the W&B project name.
 - `XLAND_MINIGRID_DATA` to override the XLand data cache location.
+
+## Generate a training video
+- After a GEPA run finishes, use `scripts/generate_training_video.py` to replay the saved eval trajectory, render an enlarged map viewport, place dense-reward diagnostics in a right-side panel, and write an MP4.
+- Default: `uv run scripts/generate_training_video.py --state-root artifacts/gepa_state`
+- Specific run directory: `uv run scripts/generate_training_video.py --run-dir artifacts/gepa_state/gepa_runs/candidate-0001-job-0`
+- Outputs: `training_video.mp4` and `training_video_trace.json` in the run directory; the trace JSON mirrors the trajectory, includes `env_seed`/`env_text`, and records `replay_complete` plus `replay_error` so partial diagnostics are preserved even if replay fails.
 
 ## Behavioral notes
 - The GEPA score is scale-free; multiplying a bad dense reward by 100 cannot improve solve rate.
@@ -111,18 +127,20 @@ Optional env vars:
 - **Per-env budgets**: `configs/gepa_envs.yaml` `jobs` list (`total_timesteps`, `train_seed`, `eval_seed`, etc.) controls the training set, while `eval_jobs` controls the holdout evaluation set. Any value above the caps will be clamped in `clamp_job_budget`; lower values are respected.
 - **Global caps**: `MAX_TOTAL_TIMESTEPS` (170M), `MAX_NUM_ENVS`, `MAX_EVAL_ENVS`, `MAX_EVAL_EPISODES` near the top of `scripts/run_reward_batch.py`.
 - **RL training defaults**: `llm_desparsifier/rl/pipeline.py:TrainConfig` (policy sizes, PPO knobs, eval counts, seeds). Override by adding keys to a job entry in the env grid; GEPA passes them through to `TrainConfig(**config_override)`.
-- **GEPA search budget**: `--max-metric-calls` (default 50) when running `scripts/run_reward_batch.py`.
-- **LLM routing**: `llm_desparsifier/rewards/llm_client.py` (`base_url`, `model_alias`, `temperature`, `max_completion_tokens`).
+- **GEPA search budget**: `--max-gepa-iterations` (default 50); each iteration evaluates one prompt across the full training job list.
+- **LLM routing**: `llm_desparsifier/rewards/llm_client.py` (`configure_portkey_lm` vs `configure_gemini_lm`, plus `model_alias` or `model_name`).
+- **Holdout reward tries**: `HOLDOUT_REWARD_TRIES` in `scripts/run_reward_batch.py` controls how many reward generations are evaluated per holdout environment (used for mean +/- std plots).
 - **Reward generator retries**: `RewardGenerator(max_sanitize_attempts=5)` in `scripts/run_reward_batch.py`.
 - **Reward sanitizer**: `llm_desparsifier/rewards/sanitizer.py` (allowed ops and structure checks).
 
 ## Logging (minimal, high-signal)
 - `WANDB_DISABLED=1` skips W&B; otherwise project/name are set in `scripts/run_reward_batch.py`.
 - Each run logs:
-  - `gepa/solve_rate` per metric call.
-  - `gepa/sparse_baseline_solve_rate` per metric call (mean sparse baseline).
+  - `gepa/solve_rate` once per GEPA iteration (mean over the training jobs).
+  - `gepa/sparse_baseline_solve_rate` once per GEPA iteration (mean sparse baseline).
+  - `gepa/iteration` as the iteration index used for the W&B step.
   - `gepa/sparse_baseline_solve_rate` per-env at step 0 (logged alongside `gepa/example_id` and `gepa/env_id`).
   - `gepa/sparse_baseline_solve_rate_mean` at step 0 (overall baseline mean).
   - `gepa/rl_runs` table with columns: `rl_run_id`, `env_id`, `env_text`, `prompt_text`, `reward_code_sha16`, `reward_code`, `solve_rate`, `sparse_baseline`, `feedback`, `sanitizer_feedback`, `run_dir`.
   - `compare/*` metrics in `--test-single-env` mode.
-  - Artifacts under `STATE_ROOT/gepa_runs/` plus `active_prompt.json`, `gepa_stats.json`, `training_curve.png`, and the best prompt `.txt` file.
+  - Artifacts under `STATE_ROOT/gepa_runs/` plus `active_prompt.json`, `gepa_stats.json`, optional plot PNGs when `--plot-training-curves` is set, and the best prompt `.txt` file.

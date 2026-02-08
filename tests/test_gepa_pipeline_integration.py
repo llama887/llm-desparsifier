@@ -38,7 +38,13 @@ class _DummyGEPA:
     def compile(self, program, trainset=None, **_kwargs):
         for example in trainset or []:
             prediction = dspy.Prediction(prompt_text="dummy-prompt")
-            self.metric(example, prediction, trace=[("predictor", {}, {})], pred_name=None, pred_trace=None)
+            self.metric(
+                example,
+                prediction,
+                trace=[("predictor", {}, {})],
+                pred_name=None,
+                pred_trace=None,
+            )
             self.metric(
                 example,
                 prediction,
@@ -89,10 +95,22 @@ def test_gepa_pipeline_runs_with_mocked_training(tmp_path, monkeypatch):
         return ({job.name: {"solve_rate": 0.0} for job in jobs}, 0.0)
 
     monkeypatch.setattr(run_reward_batch, "RewardGenerator", _DummyRewardGenerator)
-    monkeypatch.setattr(run_reward_batch, "run_training_with_reward", _fake_run_training_with_reward)
-    monkeypatch.setattr(run_reward_batch, "ensure_sparse_baseline", _fake_sparse_baseline)
-    monkeypatch.setattr(run_reward_batch, "build_reward_reflection", lambda *_args, **_kwargs: "reflection")
-    monkeypatch.setattr(run_reward_batch, "create_reward_reflection_module", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        run_reward_batch, "run_training_with_reward", _fake_run_training_with_reward
+    )
+    monkeypatch.setattr(
+        run_reward_batch, "ensure_sparse_baseline", _fake_sparse_baseline
+    )
+    monkeypatch.setattr(
+        run_reward_batch,
+        "build_reward_reflection",
+        lambda *_args, **_kwargs: "reflection",
+    )
+    monkeypatch.setattr(
+        run_reward_batch,
+        "create_reward_reflection_module",
+        lambda *_args, **_kwargs: object(),
+    )
     monkeypatch.setattr(run_reward_batch.dspy, "GEPA", _DummyGEPA)
 
     argv = [
@@ -101,7 +119,7 @@ def test_gepa_pipeline_runs_with_mocked_training(tmp_path, monkeypatch):
         str(state_root),
         "--env-grid",
         str(env_grid),
-        "--max-metric-calls",
+        "--max-gepa-iterations",
         "1",
     ]
     monkeypatch.setattr(sys, "argv", argv)

@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "dspy>=3.0.3",
+    "imageio>=2.34.1",
+    "imageio-ffmpeg>=0.5.1",
     "jax[cuda12]>=0.7.2",
+    "Pillow>=10.3.0",
     "pytest>=8.4.2",
     "xminigrid[baselines]>=0.9.1",
     "pyyaml>=6.0.2",

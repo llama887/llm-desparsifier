@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import time
@@ -948,6 +950,275 @@ def extract_component_logs(
     return component_logs
 
 
+def _normalize_series_to_unit_range(series: Any) -> np.ndarray:
+    """Normalize a numeric series to the symmetric range [-1, 1].
+
+    This helper converts an input sequence (JAX/NumPy array or list) into a
+    NumPy array and rescales it by the maximum absolute finite value so the
+    result fits inside [-1, 1]. It is needed to make dense reward curves
+    comparable to sparse-return curves when we visualize reward alignment, since
+    dense rewards can otherwise have arbitrary scale. It differs from a standard
+    min-max normalization by preserving sign and zero-centered dynamics through
+    max-absolute scaling, which highlights whether dense rewards flip direction
+    relative to sparse returns. Any non-finite entries are replaced with 0.0 to
+    keep downstream plotting stable.
+    """
+
+    arr = np.asarray(series, dtype=float)
+    if arr.size == 0:
+        return arr
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros_like(arr)
+    max_abs = float(np.max(np.abs(finite)))
+    if max_abs <= 0.0:
+        return np.zeros_like(arr)
+    scaled = arr / max_abs
+    scaled = np.clip(scaled, -1.0, 1.0)
+    return np.where(np.isfinite(scaled), scaled, 0.0)
+
+
+def _emit_training_log(event: str, payload: Mapping[str, Any]) -> None:
+    """Emit a single-line JSON log for long-running training stages.
+
+    This helper standardizes stdout logs from the training pipeline so compile,
+    train, and evaluation hangs are easy to identify in W&B logs or cluster
+    output. It is needed because JAX compilation and PPO runs can take minutes
+    without other progress signals, and it differs from ad-hoc prints by
+    enforcing a consistent schema and flushing immediately for visibility.
+    """
+    base: dict[str, Any] = {
+        "event": event,
+        "component": "training_pipeline",
+        "timestamp": round(time.time(), 3),
+    }
+    base.update(dict(payload))
+    print(json.dumps(base, sort_keys=True, default=str), flush=True)
+
+
+def _scale_sparse_series(series: Any, sparse_num_episodes: int) -> np.ndarray:
+    """Scale sparse return series to [0, 1] by dividing by episode count.
+
+    This helper converts raw sparse return averages (aggregated across eval
+    envs) into a per-episode success rate in [0, 1]. It is needed because
+    `eval/ground_truth_returns_mean` represents the mean total return per
+    environment, not a rate, and we want to visualize it as a fraction of
+    successes. It differs from `_normalize_series_to_unit_range` by using a
+    fixed divisor (eval_num_episodes) rather than max-abs scaling, preserving
+    the interpretability of the y-axis as a solve rate. Non-finite entries
+    are replaced with 0.0 for plotting stability.
+
+    Args:
+        series: The sparse return series to scale.
+        sparse_num_episodes: Number of evaluation episodes used as the divisor.
+
+    Returns:
+        A NumPy array scaled to [0, 1] (clamped).
+    """
+    arr = np.asarray(series, dtype=float)
+    if arr.size == 0:
+        return arr
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros_like(arr)
+    if sparse_num_episodes <= 0:
+        return np.zeros_like(arr)
+    scaled = arr / float(sparse_num_episodes)
+    return np.clip(scaled, 0.0, 1.0)
+
+
+def write_dense_vs_sparse_curve_png(
+    output_dir: str,
+    dense_series: Any,
+    sparse_series: Any,
+    *,
+    sparse_num_episodes: int,
+    filename: str = "training_curve_dense_vs_sparse.png",
+) -> str:
+    """Plot dense reward (normalized) against sparse return (scaled by episodes).
+
+    This utility writes a single PNG that overlays the dense reward curve and
+    the sparse ground-truth return curve with distinct, independent scaling.
+    Dense rewards are normalized to [-1, 1] using max-absolute scaling so that
+    sign and zero-crossings remain visible. Sparse returns are scaled by
+    dividing by `sparse_num_episodes`, producing a per-episode success rate in
+    [0, 1]. This approach is needed because normalizing both series together
+    would hide the true relationship between dense shaping and sparse outcomes;
+    instead, each curve is scaled independently to its natural range. It differs
+    from the GEPA-level `write_training_curve_png` (in
+    `scripts/run_reward_batch.py`) by operating within a single RL run and by
+    directly comparing reward dynamics rather than solve-rate aggregates.
+
+    Args:
+        output_dir: Directory where the PNG will be written.
+        dense_series: Dense reward values (e.g., eval/returns_mean).
+        sparse_series: Sparse ground-truth return values (e.g.,
+            eval/ground_truth_returns_mean).
+        sparse_num_episodes: Number of evaluation episodes used to scale sparse
+            returns into a [0, 1] success rate.
+        filename: Name of the output PNG file.
+
+    Returns:
+        The file path when the plot is written; an empty string when plotting
+        is skipped (no data or matplotlib unavailable).
+    """
+
+    dense_arr = np.asarray(dense_series, dtype=float)
+    sparse_arr = np.asarray(sparse_series, dtype=float)
+    if dense_arr.size == 0 and sparse_arr.size == 0:
+        print("[dense-vs-sparse-curve] no series to plot; skipping")
+        return ""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - plotting optional
+        print(f"[dense-vs-sparse-curve] matplotlib unavailable; skipping plot ({exc})")
+        return ""
+
+    dense_norm = _normalize_series_to_unit_range(dense_arr)
+    sparse_scaled = _scale_sparse_series(sparse_arr, sparse_num_episodes)
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, filename)
+
+    plt.figure(figsize=(8, 4))
+    if dense_norm.size:
+        xs_dense = list(range(1, len(dense_norm) + 1))
+        plt.plot(
+            xs_dense,
+            dense_norm,
+            marker="o",
+            linewidth=2.0,
+            label="Dense reward (normalized to [-1, 1])",
+        )
+    if sparse_scaled.size:
+        xs_sparse = list(range(1, len(sparse_scaled) + 1))
+        plt.plot(
+            xs_sparse,
+            sparse_scaled,
+            marker="s",
+            linewidth=2.0,
+            label="Sparse return (per-episode rate)",
+        )
+    plt.xlabel("PPO iteration")
+    plt.ylabel("Return / Success Rate")
+    plt.title("Dense vs sparse reward over training")
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="best")
+
+    # Determine y-axis limits: allow dense in [-1, 1] and sparse in [0, 1]
+    # but also provide a little padding for visibility
+    all_values = []
+    if dense_norm.size:
+        all_values.extend(dense_norm.reshape(-1).tolist())
+    if sparse_scaled.size:
+        all_values.extend(sparse_scaled.reshape(-1).tolist())
+    if all_values:
+        finite_vals = [v for v in all_values if np.isfinite(v)]
+        if finite_vals:
+            min_val = float(np.min(finite_vals))
+            max_val = float(np.max(finite_vals))
+            if min_val == max_val:
+                pad = 0.1 if min_val == 0.0 else abs(min_val) * 0.1
+            else:
+                pad = 0.05 * (max_val - min_val)
+            plt.ylim(min_val - pad, max_val + pad)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[dense-vs-sparse-curve] wrote {out_path}")
+    return out_path
+
+
+def _ensure_eval_trajectory(
+    *,
+    output_dir: str,
+    train_state: Any,
+    eval_model: Any,
+    primary_eval_cfg: GroundTruthEvalConfig,
+    primary_eval_result: Any,
+) -> tuple[str, Optional[dict[str, Any]]]:
+    """Persist a replayable evaluation trajectory, falling back when needed.
+
+    This helper writes `eval_trajectory.json` for a training run so downstream
+    video tooling always has a compact action sequence to replay. It is needed
+    because the primary ground-truth evaluation can legitimately skip trajectory
+    capture (for example when `num_episodes` is zero or when a run returns no
+    episodes), and we still want every successful candidate run to emit a
+    replayable trace. It differs from the main evaluation call by running a
+    single-episode fallback rollout purely to capture a trajectory without
+    altering the metrics or returns that were already computed.
+
+    Args:
+        output_dir: Directory where the trajectory JSON should be written.
+        train_state: Trained policy parameters used for evaluation.
+        eval_model: Actor-critic model instance used during evaluation.
+        primary_eval_cfg: The configuration used for the main ground-truth eval.
+        primary_eval_result: The result object from the main ground-truth eval.
+
+    Returns:
+        A tuple of the saved trajectory path (or an empty string if none) and
+        the trajectory payload (or None if capture failed).
+    """
+    trajectory = getattr(primary_eval_result, "trajectory", None)
+    if trajectory is None:
+        _emit_training_log(
+            "ground_truth_trajectory_fallback_start",
+            {
+                "output_dir": output_dir,
+                "env_id": primary_eval_cfg.env_id,
+                "benchmark_id": primary_eval_cfg.benchmark_id,
+                "eval_seed": primary_eval_cfg.seed,
+                "primary_num_episodes": primary_eval_cfg.num_episodes,
+            },
+        )
+        fallback_cfg = GroundTruthEvalConfig(
+            env_id=primary_eval_cfg.env_id,
+            benchmark_id=primary_eval_cfg.benchmark_id,
+            num_episodes=1,
+            seed=primary_eval_cfg.seed,
+            img_obs=primary_eval_cfg.img_obs,
+            capture_video=False,
+            deterministic_rulesets=primary_eval_cfg.deterministic_rulesets,
+            capture_trajectory=True,
+            trajectory_episode_index=0,
+        )
+        fallback_result = run_ground_truth_eval(
+            train_state=train_state,
+            model=eval_model,
+            cfg=fallback_cfg,
+        )
+        trajectory = getattr(fallback_result, "trajectory", None)
+        _emit_training_log(
+            "ground_truth_trajectory_fallback_end",
+            {
+                "output_dir": output_dir,
+                "trajectory_captured": bool(trajectory),
+                "fallback_num_episodes": fallback_cfg.num_episodes,
+            },
+        )
+
+    if trajectory is None:
+        return "", None
+
+    os.makedirs(output_dir, exist_ok=True)
+    trajectory_path = os.path.join(output_dir, "eval_trajectory.json")
+    with open(trajectory_path, "w", encoding="utf-8") as file:
+        json.dump(trajectory, file, indent=2, sort_keys=True)
+    _emit_training_log(
+        "ground_truth_trajectory_saved",
+        {
+            "output_dir": output_dir,
+            "trajectory_path": trajectory_path,
+            "episode_index": trajectory.get("episode_index"),
+            "episode_length": trajectory.get("episode_length"),
+        },
+    )
+    return trajectory_path, trajectory
+
+
 def run_training_with_reward(
     reward_generator: RewardGeneratorProtocol,
     output_dir: str,
@@ -955,6 +1226,7 @@ def run_training_with_reward(
     ctx_fn: Optional[Callable[..., Mapping[str, Any]]] = None,
     config_override: Optional[Mapping[str, Any]] = None,
     progress_callback: Optional[Callable[[int, Mapping[str, float]], None]] = None,
+    plot_training_curves: bool = False,
     reward_mode: RewardMode = "dense",
 ) -> TrainingResult:
     """Run PPO training and evaluation with optional dense reward shaping.
@@ -966,7 +1238,15 @@ def run_training_with_reward(
     outer orchestration, artifacts, and evaluation harness rather than just
     returning a compiled training function. It also extracts per-component
     evaluation curves into `train_info["component_logs"]` so reward reflection
-    can reason about the magnitude of each reward term.
+    can reason about the magnitude of each reward term. When
+    `plot_training_curves` is enabled, it emits a per-run plot that overlays the
+    normalized dense reward curve against sparse returns to make reward
+    misalignment visible at a glance. It also emits structured stage logs
+    (setup, compile, train, eval) so long-running or stalled operations are
+    visible in stdout. Finally, it stores a compact evaluation trajectory
+    (action sequence plus RNG keys) for every successful run; if the primary
+    evaluation does not emit one, it performs a single-episode fallback rollout
+    to capture a replayable trace without affecting the evaluation metrics.
     """
 
     if reward_mode not in ("dense", "sparse"):
@@ -975,7 +1255,28 @@ def run_training_with_reward(
         )
 
     config_kwargs = dict(config_override or {})
+    _emit_training_log(
+        "training_pipeline_start",
+        {
+            "output_dir": output_dir,
+            "reward_mode": reward_mode,
+            "config_override_keys": sorted(config_kwargs.keys()),
+        },
+    )
     config = TrainConfig(**config_kwargs)
+    _emit_training_log(
+        "training_config_ready",
+        {
+            "env_id": config.env_id,
+            "benchmark_id": config.benchmark_id,
+            "num_envs": config.num_envs,
+            "total_timesteps": config.total_timesteps,
+            "eval_num_envs": config.eval_num_envs,
+            "eval_num_episodes": config.eval_num_episodes,
+            "deterministic_rulesets": config.deterministic_rulesets,
+            "num_devices": jax.local_device_count(),
+        },
+    )
 
     ctx_fn_to_use = ctx_fn
     if reward_mode == "dense":
@@ -984,6 +1285,14 @@ def run_training_with_reward(
     else:
         ctx_fn_to_use = None
 
+    make_states_start = time.time()
+    _emit_training_log(
+        "make_states_start",
+        {
+            "output_dir": output_dir,
+            "reward_mode": reward_mode,
+        },
+    )
     (
         rng,
         env,
@@ -1001,6 +1310,22 @@ def run_training_with_reward(
         ctx_fn=ctx_fn_to_use,
         reward_mode=reward_mode,
     )
+    reward_sha16 = (
+        hashlib.sha256(emitted_code.encode("utf-8")).hexdigest()[:16]
+        if emitted_code
+        else None
+    )
+    _emit_training_log(
+        "make_states_end",
+        {
+            "elapsed_sec": round(time.time() - make_states_start, 4),
+            "reward_sha16": reward_sha16,
+            "dense_reward_path": dense_path or None,
+            "ctx_fn": None
+            if ctx_fn_used is None
+            else f"{ctx_fn_used.__module__}.{ctx_fn_used.__name__}",
+        },
+    )
 
     # Replicate args across devices.
     rng_devices = jax.random.split(rng, num=jax.local_device_count())
@@ -1008,6 +1333,15 @@ def run_training_with_reward(
     init_hstate_devices = replicate(init_hstate, jax.local_devices())
 
     print("Compiling...")
+    compile_stage_start = time.time()
+    _emit_training_log(
+        "compile_start",
+        {
+            "output_dir": output_dir,
+            "num_envs": config.num_envs,
+            "num_steps_per_env": config.num_steps_per_env,
+        },
+    )
     compile_start = time.time()
     train_fn = make_train(env, env_params, benchmark, config)
     train_fn = train_fn.lower(
@@ -1015,14 +1349,35 @@ def run_training_with_reward(
     ).compile()
     compile_elapsed = time.time() - compile_start
     print(f"Done in {compile_elapsed:.2f}s.")
+    _emit_training_log(
+        "compile_end",
+        {
+            "elapsed_sec": round(time.time() - compile_stage_start, 4),
+            "num_meta_updates": config.num_meta_updates,
+        },
+    )
 
     print("Training...")
+    train_stage_start = time.time()
+    _emit_training_log(
+        "training_start",
+        {
+            "output_dir": output_dir,
+            "num_meta_updates": config.num_meta_updates,
+        },
+    )
     train_start = time.time()
     train_info = jax.block_until_ready(
         train_fn(rng_devices, train_state_devices, init_hstate_devices)
     )
     train_elapsed = time.time() - train_start
     print(f"Done in {train_elapsed / 60:.2f}min")
+    _emit_training_log(
+        "training_end",
+        {
+            "elapsed_sec": round(time.time() - train_stage_start, 4),
+        },
+    )
 
     # Bring results back to host.
     train_info = unreplicate(train_info)
@@ -1073,8 +1428,24 @@ def run_training_with_reward(
     gt_curve_path = ""
     dense_curve_path = ""
     combined_curve_path = ""
+    if reward_mode == "dense" and plot_training_curves:
+        combined_curve_path = write_dense_vs_sparse_curve_png(
+            output_dir,
+            dense_series,
+            gt_series,
+            sparse_num_episodes=config.eval_num_episodes,
+        )
 
     # ========== Evaluation via ground-truth harness ==========
+    _emit_training_log(
+        "ground_truth_eval_start",
+        {
+            "env_id": config.env_id,
+            "benchmark_id": config.benchmark_id,
+            "num_episodes": config.eval_num_episodes,
+            "eval_seed": config.eval_seed,
+        },
+    )
     eval_model = ActorCriticRNN(
         num_actions=env.num_actions(env_params),
         action_emb_dim=config.action_emb_dim,
@@ -1091,11 +1462,22 @@ def run_training_with_reward(
         img_obs=config.img_obs,
         capture_video=False,
         deterministic_rulesets=config.deterministic_rulesets,
+        capture_trajectory=True,
+        trajectory_episode_index=0,
     )
+    gt_eval_start = time.time()
     gt_eval_result = run_ground_truth_eval(
         train_state=train_info["state"],
         model=eval_model,
         cfg=eval_cfg,
+    )
+
+    trajectory_path, _ = _ensure_eval_trajectory(
+        output_dir=output_dir,
+        train_state=train_info["state"],
+        eval_model=eval_model,
+        primary_eval_cfg=eval_cfg,
+        primary_eval_result=gt_eval_result,
     )
 
     rollout_path = ""
@@ -1111,6 +1493,15 @@ def run_training_with_reward(
     successes = sum(1 for r in gt_eval_result.returns if r > 0.0)
     total_eps = len(gt_eval_result.returns)
     success_rate = float(successes) / float(total_eps) if total_eps else 0.0
+    _emit_training_log(
+        "ground_truth_eval_end",
+        {
+            "elapsed_sec": round(time.time() - gt_eval_start, 4),
+            "mean_return": gt_eval_result.mean_return,
+            "success_rate": success_rate,
+            "num_episodes": total_eps,
+        },
+    )
 
     ground_truth_eval = {
         "returns": gt_eval_result.returns,
@@ -1138,6 +1529,7 @@ def run_training_with_reward(
         "training_curve_dense": dense_curve_path,
         "training_curve_combined": combined_curve_path,
         "eval_rollout": rollout_path,
+        "eval_trajectory": trajectory_path,
         "ctx_fn": "None"
         if ctx_fn_used is None
         else f"{ctx_fn_used.__module__}.{ctx_fn_used.__name__}",
