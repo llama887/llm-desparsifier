@@ -23,7 +23,9 @@ EUREKA_GUIDANCE = (
     "temperature/shape, rewriting it, or discarding it. (3) If a component's magnitude "
     "dominates the rest, rescale it into a reasonable range. Reference specific component "
     "names and explain how to adjust each one before describing how to revise the overall "
-    "reward function, without writing any code."
+    "reward function, without writing any code. (4) Use the behavior summary to diagnose "
+    "policy pathologies such as unnecessary object manipulation, oscillatory turning, or "
+    "repetitive loops that are misaligned with the task objective."
 )
 
 
@@ -34,6 +36,7 @@ class RewardReflectionSignature(dspy.Signature):
     reward_code: str = dspy.InputField(desc="Current dense_reward implementation.")
     sparse_curve_summary: str = dspy.InputField(desc="Sparse reward checkpoints over training.")
     component_curve_summary: str = dspy.InputField(desc="Per-component reward snapshots.")
+    behavior_summary: str = dspy.InputField(desc="Compact trajectory behavior diagnostics.")
     metrics_summary: str = dspy.InputField(desc="Aggregate evaluation metrics and gaps.")
     guidance: str = dspy.InputField(desc="Instructions describing the desired reflection style.")
     reflection: str = dspy.OutputField(
@@ -66,6 +69,7 @@ def build_reward_reflection(
     sparse_summary = _format_sparse_curve(run_record.get("sparse_return_curve"))
     component_summary = _format_component_curves(run_record.get("component_curves"))
     component_stats_summary = _format_component_stats(run_record.get("component_curves"))
+    behavior_summary = _format_behavior_summary(run_record.get("behavior_summary"))
     metrics_summary = _format_metrics(run_record.get("final_metrics"))
 
     module = reflection_module or create_reward_reflection_module()
@@ -78,6 +82,7 @@ def build_reward_reflection(
             component_curve_summary="\n".join(
                 [text for text in [component_summary, component_stats_summary] if text]
             ),
+            behavior_summary=behavior_summary,
             metrics_summary=metrics_summary,
             guidance=guidance_text,
         )
@@ -90,6 +95,7 @@ def build_reward_reflection(
             env_summary=env_summary,
             sparse_summary=sparse_summary,
             component_summary=component_summary,
+            behavior_summary=behavior_summary,
             metrics_summary=metrics_summary,
             error_message=str(exc),
         )
@@ -155,6 +161,15 @@ def _format_metrics(metrics: Any) -> str:
     return "Metrics: " + ", ".join(parts)
 
 
+def _format_behavior_summary(summary: Any) -> str:
+    if not isinstance(summary, str):
+        return "Behavior summary unavailable."
+    text = summary.strip()
+    if not text:
+        return "Behavior summary unavailable."
+    return text
+
+
 def _sample_series(values: Any, num_points: int = 6) -> list[float]:
     if values is None:
         return []
@@ -172,6 +187,7 @@ def _compose_fallback_text(
     env_summary: str,
     sparse_summary: str,
     component_summary: str,
+    behavior_summary: str,
     metrics_summary: str,
     error_message: str,
 ) -> str:
@@ -184,6 +200,8 @@ def _compose_fallback_text(
         + sparse_summary
         + "\n"
         + component_summary
+        + "\n"
+        + behavior_summary
         + "\n"
         + metrics_summary
     )

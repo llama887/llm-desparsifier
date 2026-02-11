@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import textwrap
 from pathlib import Path
 from typing import Any, Iterable, cast
@@ -25,6 +26,52 @@ OVERLAY_LINE_SPACING = 2
 OVERLAY_MAP_PANEL_GAP = 10
 OVERLAY_PANEL_MIN_WIDTH = 320
 OVERLAY_GOAL_WRAP_CHARS = 58
+CPU_FALLBACK_REEXEC_FLAG = "LLM_DESPARSIFIER_VIDEO_CPU_FALLBACK_DONE"
+
+
+def _is_cuda_backend_init_error(exc: BaseException) -> bool:
+    """Return whether an exception represents JAX CUDA backend-init failure.
+
+    This helper classifies runtime failures that happen while JAX attempts to
+    initialize CUDA devices (including out-of-memory during StreamExecutor
+    creation). It is needed because replay can continue on CPU when GPU backend
+    initialization fails, and it differs from broad exception handling by
+    matching only known CUDA initialization signatures rather than masking
+    unrelated runtime errors.
+
+    Args:
+        exc: Raised exception from replay setup or execution.
+
+    Returns:
+        True when the error text indicates CUDA backend initialization failed;
+        False otherwise.
+    """
+    message = f"{exc.__class__.__name__}: {exc}".lower()
+    indicators = (
+        "unable to initialize backend 'cuda'",
+        "no supported devices found for platform cuda",
+        "cuda_error_out_of_memory",
+        "unable to create streamexecutor for cuda",
+        "failed call to cuinit",
+    )
+    return any(token in message for token in indicators)
+
+
+def _reexec_with_cpu_fallback() -> None:
+    """Re-exec this script with JAX forced to CPU exactly once.
+
+    This helper replaces the current process so all future imports happen in a
+    clean interpreter with CPU backend selection applied before JAX is touched.
+    It is needed because changing JAX platform selection after failed backend
+    initialization in-process is not reliable, and it differs from in-process
+    retries by guaranteeing a fresh startup path with deterministic environment
+    variables.
+    """
+    env = dict(os.environ)
+    env["JAX_PLATFORMS"] = "cpu"
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env[CPU_FALLBACK_REEXEC_FLAG] = "1"
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
 
 
 def _configure_replay_jax_runtime() -> None:
@@ -42,6 +89,10 @@ def _configure_replay_jax_runtime() -> None:
         "XLA_FLAGS",
         "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1",
     )
+    # Respect explicit user preference while keeping replay resilient by default:
+    # if a previous attempt failed CUDA init and re-exec'd, force CPU backend.
+    if os.environ.get(CPU_FALLBACK_REEXEC_FLAG) == "1":
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 
 def parse_args() -> argparse.Namespace:
@@ -656,6 +707,15 @@ def main() -> None:
                 if bool(timestep.last()):
                     break
     except Exception as exc:
+        if (
+            os.environ.get(CPU_FALLBACK_REEXEC_FLAG) != "1"
+            and _is_cuda_backend_init_error(exc)
+        ):
+            print(
+                "[generate_training_video] CUDA backend initialization failed; "
+                "retrying with JAX_PLATFORMS=cpu"
+            )
+            _reexec_with_cpu_fallback()
         replay_error = f"{exc.__class__.__name__}: {exc}"
         trace_payload = {
             "trajectory": trajectory,

@@ -37,6 +37,7 @@ def sample_run_record() -> Dict[str, Any]:
             "progress": [0.0, 0.3, 0.7, 0.9],
             "penalty": [0.0, -0.2, -0.4, -0.1],
         },
+        "behavior_summary": "Behavior summary: manipulation_rate=0.2",
         "final_metrics": {"ground_truth_return": 1.0, "dense_return": 0.8},
     }
 
@@ -51,6 +52,7 @@ def test_build_reward_reflection_uses_module_inputs():
     assert module.last_kwargs is not None
     assert "Sparse reward checkpoints" in module.last_kwargs["sparse_curve_summary"]
     assert "progress" in module.last_kwargs["component_curve_summary"]
+    assert "manipulation_rate=0.2" in module.last_kwargs["behavior_summary"]
 
 
 def test_build_reward_reflection_fallback_on_failure():

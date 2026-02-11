@@ -1,5 +1,6 @@
 """Reward generation modules."""
 
+from .behavior_summary import summarize_trajectory_behavior_from_path
 from .generator import RewardGenerator, RewardSynthesizer, create_reward_generator
 from .llm_client import (
     DEFAULT_GEMINI_MODEL,
@@ -19,6 +20,7 @@ __all__ = [
     "configure_portkey_lm",
     "build_reward_reflection",
     "create_reward_reflection_module",
+    "summarize_trajectory_behavior_from_path",
     "describe_ruleset",
     "CONSTRAINTS_TEXT",
     "sanitize_and_compile",

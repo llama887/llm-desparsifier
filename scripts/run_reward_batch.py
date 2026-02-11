@@ -38,6 +38,7 @@ from llm_desparsifier.rewards import (
     create_reward_reflection_module,
     configure_gemini_lm,
     configure_portkey_lm,
+    summarize_trajectory_behavior_from_path,
 )
 from llm_desparsifier.rewards.llm_client import (
     DEFAULT_GEMINI_MODEL,
@@ -69,11 +70,11 @@ MAX_EVAL_EPISODES = 20
 DEFAULT_REWARD_LLM_TEMP = 0.1
 DEFAULT_REFLECTION_LLM_TEMP = 0.5
 HOLDOUT_REWARD_TRIES = 5
-SINGLE_ENV_ID = "XLand-MiniGrid-R1-9x9"
+SINGLE_ENV_ID = "XLand-MiniGrid-R1-11x11"
 SINGLE_ENV_BENCHMARK = "trivial-1m"
 SINGLE_ENV_TOTAL_TIMESTEPS = 170_000_000
-SINGLE_ENV_TRAIN_SEED = 0
-SINGLE_ENV_EVAL_SEED = 1
+SINGLE_ENV_TRAIN_SEED = 1000
+SINGLE_ENV_EVAL_SEED = 1000
 HOLDOUT_ENVS = [
     "XLand-MiniGrid-R1-9x9",
     "XLand-MiniGrid-R1-17x17",
@@ -338,7 +339,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test-single-env",
         action="store_true",
-        help="Run GEPA on a single tiny environment with locked seeds for overfitting.",
+        help="Run GEPA on a single fixed environment with locked seeds for overfitting.",
     )
     parser.add_argument(
         "--deterministic-envs",
@@ -349,6 +350,16 @@ def parse_args() -> argparse.Namespace:
         "--plot-training-curves",
         action="store_true",
         help="Generate dense-vs-sparse and holdout plots (default: off).",
+    )
+    parser.add_argument(
+        "--room-count",
+        type=int,
+        action="append",
+        default=None,
+        help=(
+            "Restrict environments to specific room counts parsed from env_id "
+            "(repeatable, e.g. --room-count 1 --room-count 4)."
+        ),
     )
     return parser.parse_args()
 
@@ -401,6 +412,55 @@ def build_single_env_job() -> List[EnvJob]:
     ]
 
 
+def extract_room_count(env_id: str) -> int:
+    """Extract the XLand room-count token from an environment identifier.
+
+    This helper parses the canonical `-R<rooms>-` segment from an env id such
+    as `XLand-MiniGrid-R4-13x13` and returns the integer room count. It is
+    needed so room-based filtering is deterministic and centralized across both
+    training and holdout job sets, and it differs from ad-hoc string splitting
+    by validating the full token shape and failing loudly when the id does not
+    include a parseable room-count segment.
+    """
+    match = re.search(r"-R(\d+)-", env_id)
+    if match is None:
+        raise ValueError(
+            f"Could not parse room count from env_id '{env_id}'. "
+            "Expected token shape '-R<digits>-'."
+        )
+    return int(match.group(1))
+
+
+def filter_jobs_by_room_count(
+    jobs: List[EnvJob],
+    allowed_room_counts: List[int],
+    section_name: str,
+) -> List[EnvJob]:
+    """Filter EnvJob entries by allowed room counts parsed from `env_id`.
+
+    This helper applies a user-selected room-count allowlist to an `EnvJob`
+    collection and returns only matching entries. It is needed because GEPA
+    training and holdout evaluation should share identical room-count semantics,
+    and it differs from editing the YAML grid manually by working at runtime for
+    all sources of jobs (grid-defined and default holdout fallback). It prints a
+    concise before/after summary and raises a `ValueError` when no jobs remain,
+    which enforces fail-fast behavior for both train and holdout sections.
+    """
+    allowed = set(allowed_room_counts)
+    filtered = [job for job in jobs if extract_room_count(job.env_id) in allowed]
+    print(
+        "[run_reward_batch] room-count filter "
+        f"section={section_name} allowed={sorted(allowed)} "
+        f"before={len(jobs)} after={len(filtered)}"
+    )
+    if not filtered:
+        raise ValueError(
+            f"--room-count filter removed all jobs from {section_name}. "
+            f"allowed_room_counts={sorted(allowed)}"
+        )
+    return filtered
+
+
 def load_prompt_payload(
     state_root: Path,
 ) -> tuple[str, Optional[Dict[str, Any]], Dict[str, Any]]:
@@ -438,7 +498,18 @@ def build_dataset_row(
     candidate_prompt: Optional[str] = None,
     sanitizer_feedback: Optional[str] = None,
     budget_cfg: Optional[Mapping[str, Any]] = None,
+    behavior_summary: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Assemble a single run record used by reflection and diagnostics.
+
+    This helper normalizes metrics and curves from `TrainingResult` into a
+    stable row shape consumed by the reflection module and optional logging
+    sinks. It is needed because GEPA metric evaluation constructs this payload
+    in multiple branches (success and error paths), and it differs from direct
+    `TrainingResult` usage by flattening nested arrays into JSON-friendly
+    Python values while attaching run-specific metadata such as sanitizer and
+    trajectory behavior summaries.
+    """
     loss_info = (
         result.train_info.get("loss_info", {})
         if isinstance(result.train_info, Mapping)
@@ -468,6 +539,7 @@ def build_dataset_row(
         "candidate_prompt": candidate_prompt,
         "sanitizer_feedback": sanitizer_feedback,
         "budget_cfg": dict(budget_cfg) if budget_cfg else None,
+        "behavior_summary": behavior_summary,
     }
 
 
@@ -1175,9 +1247,11 @@ def run_batch() -> None:
 
     This is the orchestration entrypoint that wires CLI flags into prompt
     loading, LLM configuration, sparse baseline caching, GEPA optimization,
-    holdout evaluation, and artifact persistence. It is needed to keep the
-    experiment flow in one place and differs from lower-level training helpers
-    by coordinating multiple runs and stateful outputs.
+    room-count based environment filtering, holdout evaluation, and artifact
+    persistence. It is needed to keep the experiment flow in one place and
+    differs from lower-level training helpers by coordinating multiple runs and
+    stateful outputs while enforcing top-level fail-fast validation (including
+    empty job sets after optional room filtering).
     """
     args = parse_args()
     state_root = args.state_root.expanduser().resolve()
@@ -1190,6 +1264,9 @@ def run_batch() -> None:
         model_name = DEFAULT_GEMINI_MODEL
 
     env_grid_path = args.env_grid.expanduser().resolve()
+    selected_room_counts = (
+        sorted(set(args.room_count)) if args.room_count is not None else None
+    )
     if args.test_single_env:
         jobs = build_single_env_job()
         eval_jobs: List[EnvJob] = []
@@ -1200,6 +1277,12 @@ def run_batch() -> None:
     else:
         jobs, eval_jobs = load_env_grid(env_grid_path)
         # Use all jobs from the grid; users can edit the YAML to reduce set.
+    if selected_room_counts is not None:
+        jobs = filter_jobs_by_room_count(
+            jobs,
+            selected_room_counts,
+            section_name="training jobs",
+        )
 
     constraints_text, prompt_state, prompt_meta = load_prompt_payload(state_root)
     if args.llm_provider == "portkey":
@@ -1262,6 +1345,7 @@ def run_batch() -> None:
                     "reward_llm_temp": args.reward_llm_temp,
                     "reflection_llm_temp": args.reflection_llm_temp,
                     "plot_training_curves": bool(args.plot_training_curves),
+                    "room_count": selected_room_counts,
                 },
             )
             rl_runs_table = wandb.Table(
@@ -1597,6 +1681,7 @@ def run_batch() -> None:
 
         env_description = getattr(example, "env_description", None)
         sanitizer_feedback = None
+        behavior_summary = "Behavior summary unavailable (run did not produce trajectory diagnostics)."
         start = time.time()
         train_start = time.time()
         train_status = "pending"
@@ -1644,6 +1729,10 @@ def run_batch() -> None:
                     )
                 except Exception:
                     sanitizer_feedback = None
+            trajectory_path = None
+            if isinstance(result.artifacts, Mapping):
+                trajectory_path = result.artifacts.get("eval_trajectory")
+            behavior_summary = summarize_trajectory_behavior_from_path(trajectory_path)
 
             row = build_dataset_row(
                 EnvJob.from_mapping(run_id, {**train_cfg, "name": example_id}),
@@ -1652,6 +1741,7 @@ def run_batch() -> None:
                 candidate_prompt=candidate_prompt,
                 sanitizer_feedback=sanitizer_feedback,
                 budget_cfg=train_cfg,
+                behavior_summary=behavior_summary,
             )
             row["job_name"] = example_id
 
@@ -1869,6 +1959,7 @@ def run_batch() -> None:
     stats_payload["reward_llm_temp"] = args.reward_llm_temp
     stats_payload["reflection_llm_temp"] = args.reflection_llm_temp
     stats_payload["plot_training_curves"] = bool(args.plot_training_curves)
+    stats_payload["room_count"] = selected_room_counts
     if args.test_single_env:
         stats_payload["single_env_job"] = {
             "env_id": SINGLE_ENV_ID,
@@ -1891,6 +1982,12 @@ def run_batch() -> None:
                 "[run_reward_batch] no eval_jobs in env grid; using default holdout list"
             )
             holdout_jobs = build_holdout_jobs()
+        if selected_room_counts is not None:
+            holdout_jobs = filter_jobs_by_room_count(
+                holdout_jobs,
+                selected_room_counts,
+                section_name="holdout jobs",
+            )
         holdout_sparse, holdout_sparse_mean = ensure_holdout_sparse_baselines(
             holdout_jobs,
             logs_root=logs_root,

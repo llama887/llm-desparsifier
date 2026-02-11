@@ -35,7 +35,7 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 
 ## Candidate evaluation flow (per GEPA proposal)
 - **Budget clamp**: `clamp_job_budget()` caps per-candidate cost (`total_timesteps <= 170M`, `num_envs <= 2048`, `eval_num_envs <= 128`, `eval_num_episodes <= 20`) and records any reductions in `budget_notes`. Missing keys are defaulted to the caps.
-- **Seeds**: by default the env grid provides `train_seed` and `eval_seed`. If missing, seeds are derived deterministically from `job.name` + `prompt_text` (train seed) and `train_seed + 1` (eval seed). `--test-single-env` uses fixed seeds (0/1). Reward-code hashes/logs are derived from the emitted code used in training.
+- **Seeds**: by default the env grid provides `train_seed` and `eval_seed`. If missing, seeds are derived deterministically from `job.name` + `prompt_text` (train seed) and `train_seed + 1` (eval seed). `--test-single-env` uses a fixed single-env configuration (`XLand-MiniGrid-R1-11x11`) with locked train/eval seeds (`1000/1000`). Reward-code hashes/logs are derived from the emitted code used in training.
 - **Reward synthesis**: `RewardGenerator.generate()` builds the env description via `describe_ruleset`, calls the DSPy reward LLM using the GEPA-optimized `prompt_text`, sanitizes/compiles with `sanitize_and_compile`, and retries with sanitizer feedback (plus sanitizer source on retries). In `run_reward_batch.py` the max sanitize attempts is set to 5.
 - **Training**: `run_training_with_reward()` launches PPO with an RNN policy (`TrainConfig` defaults) and installs the dense reward via `DesparsifyRewardWrapper`. Dense rewards are used only for training; evaluation uses sparse rewards.
 - **Ground-truth evaluation**: `run_ground_truth_eval()` executes `eval_num_episodes` sparse episodes with the trained policy and returns per-episode returns/lengths. Success counts are computed in `run_training_with_reward()`.
@@ -53,6 +53,7 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
   - **Reward code**: sanitized `dense_reward` source string.
   - **Sparse curve**: 6 checkpoints sampled from `eval/ground_truth_returns_mean` (the final point is the last sample).
   - **Per-component curves + stats**: checkpoints for each `reward_components` series plus min/mean/max for each component.
+  - **Trajectory behavior summary**: compact action diagnostics from `eval_trajectory.json` (action histogram, manipulation/churn rates, turn oscillation, repeat loops, and short suspicious event sketches). This is additive and does not replace existing sparse/component/metric feedback.
   - **Final metrics**: sorted dump of `TrainingResult.final_metrics` (includes `solve_rate`, `eval_successes`, etc.).
   - **Guidance**: `EUREKA_GUIDANCE` plus a reminder to give environment-aware but non-hard-coded advice.
 - Failure path: on training/sanitization errors, feedback becomes `Training failed: <error>` plus sanitizer retry history (if available), and `score = 0.0`.
@@ -93,12 +94,15 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 - Cluster: `sbatch sbatch/train_dense_batch.s` (sets caches, state root, syncs deps, runs `scripts/run_reward_batch.py`).
 - Local (Portkey): `uv run scripts/run_reward_batch.py --state-root artifacts/gepa_state`
 - Local (Gemini): `uv run scripts/run_reward_batch.py --state-root artifacts/gepa_state --llm-provider gemini --llm gemini-3-pro-preview`
+- Room-filtered train+holdout (R1 only): `uv run scripts/run_reward_batch.py --state-root artifacts/gepa_state --room-count 1`
+- Room-filtered train+holdout (R1 and R4): `uv run scripts/run_reward_batch.py --state-root artifacts/gepa_state --room-count 1 --room-count 4`
 - Useful flags:
   - `--max-gepa-iterations` (default 50)
   - `--llm` (Portkey model alias or Gemini model name)
   - `--llm-provider` (`portkey` or `gemini`)
   - `--reward-llm-temp` (default 0.1)
   - `--reflection-llm-temp` (default 0.5)
+  - `--room-count` (repeatable; filter both training and holdout envs by room count parsed from `env_id`, e.g. `--room-count 1 --room-count 4`; runner fails fast if filtering empties either set)
   - `--plot-training-curves` (off by default; enable plot generation)
   - `--test-single-env` (single env overfit run)
   - `--deterministic-envs` (fixed rulesets for train/eval)
@@ -116,6 +120,7 @@ Optional env vars:
 - After a GEPA run finishes, use `scripts/generate_training_video.py` to replay the saved eval trajectory, render an enlarged map viewport, place dense-reward diagnostics in a right-side panel, and write an MP4.
 - Default: `uv run scripts/generate_training_video.py --state-root artifacts/gepa_state`
 - Specific run directory: `uv run scripts/generate_training_video.py --run-dir artifacts/gepa_state/gepa_runs/candidate-0001-job-0`
+- If CUDA backend initialization fails (for example GPU OOM), the script automatically retries once on CPU by re-executing with `JAX_PLATFORMS=cpu`.
 - Outputs: `training_video.mp4` and `training_video_trace.json` in the run directory; the trace JSON mirrors the trajectory, includes `env_seed`/`env_text`, and records `replay_complete` plus `replay_error` so partial diagnostics are preserved even if replay fails.
 
 ## Behavioral notes

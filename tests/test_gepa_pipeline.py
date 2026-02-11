@@ -123,3 +123,69 @@ def test_load_prompt_payload_prefers_active_prompt(tmp_path):
     assert text == "from-active"
     assert prompt_state == {"a": 1}
     assert meta["source"] == "active_prompt"
+
+
+def test_extract_room_count_parses_valid_env_ids():
+    run_reward_batch = _load_run_reward_batch()
+    assert run_reward_batch.extract_room_count("XLand-MiniGrid-R1-9x9") == 1
+    assert run_reward_batch.extract_room_count("XLand-MiniGrid-R4-13x13") == 4
+    assert run_reward_batch.extract_room_count("XLand-MiniGrid-R9-25x25") == 9
+
+
+def test_extract_room_count_rejects_invalid_env_id():
+    run_reward_batch = _load_run_reward_batch()
+    with pytest.raises(ValueError, match="Could not parse room count"):
+        run_reward_batch.extract_room_count("XLand-MiniGrid-9x9")
+
+
+def test_filter_jobs_by_room_count_keeps_matching_jobs():
+    run_reward_batch = _load_run_reward_batch()
+    jobs = [
+        run_reward_batch.EnvJob(
+            name="job-r1",
+            env_id="XLand-MiniGrid-R1-9x9",
+            benchmark_id="trivial-1m",
+            total_timesteps=1,
+            train_seed=1,
+            eval_seed=2,
+        ),
+        run_reward_batch.EnvJob(
+            name="job-r4",
+            env_id="XLand-MiniGrid-R4-9x9",
+            benchmark_id="trivial-1m",
+            total_timesteps=1,
+            train_seed=3,
+            eval_seed=4,
+        ),
+    ]
+    filtered = run_reward_batch.filter_jobs_by_room_count(
+        jobs,
+        [1],
+        section_name="training jobs",
+    )
+    assert [job.name for job in filtered] == ["job-r1"]
+    assert filtered[0].train_seed == 1
+    assert filtered[0].eval_seed == 2
+
+
+def test_filter_jobs_by_room_count_raises_when_empty():
+    run_reward_batch = _load_run_reward_batch()
+    jobs = [
+        run_reward_batch.EnvJob(
+            name="job-r2",
+            env_id="XLand-MiniGrid-R2-9x9",
+            benchmark_id="trivial-1m",
+            total_timesteps=1,
+            train_seed=1,
+            eval_seed=2,
+        )
+    ]
+    with pytest.raises(
+        ValueError,
+        match=r"--room-count filter removed all jobs from training jobs",
+    ):
+        run_reward_batch.filter_jobs_by_room_count(
+            jobs,
+            [1],
+            section_name="training jobs",
+        )
