@@ -64,7 +64,7 @@ def _is_reset(ts) -> bool:
         except Exception:
             pass
     try:
-        return int(value) == 0
+        return int(value) == 0  # type: ignore[arg-type]
     except Exception:
         return False
 
@@ -100,6 +100,17 @@ _OBJECT_TILE_IDS = {
 
 
 def _extract_object_positions(tile_layer, color_layer):
+    """Build a deterministic object-position lookup from tile/color planes.
+
+    This helper converts symbolic grid channels into a dictionary keyed by
+    object identity (for example, ``"yellow_square"``) so dense rewards can
+    query positions without scanning the entire tensor each time. It is needed
+    because LLM-generated reward code is easier to sanitize and reason about
+    when object lookups are dictionary reads rather than repeated mask logic.
+    It differs from observation-level access because it works for any symbolic
+    plane pair (full state grid or egocentric observation window), and returns
+    a complete table with ``[-1, -1]`` sentinels for absent objects.
+    """
     positions = {}
     for tile_id, tile_name in _TILE_ID_TO_NAME.items():
         if tile_id not in _OBJECT_TILE_IDS:
@@ -116,10 +127,35 @@ def _extract_object_positions(tile_layer, color_layer):
 
 
 def _extract_state_snapshot(ts):
-    """Return a dictionary of spatial features for the given timestep."""
+    """Extract dense-reward features from one timestep snapshot.
+
+    The returned mapping intentionally mixes global-state features (agent pose,
+    inventory status, full-grid object coordinates) with egocentric-observation
+    features (raw symbolic observation and visible-object coordinates). This is
+    needed so synthesized rewards can shape both goal progress (global context)
+    and attention/visibility behavior (what the agent can currently see) using
+    a single, stable `ctx` contract. It differs from directly exposing only
+    ``ts.observation`` by also providing symbolic helper dictionaries such as
+    ``object_positions`` and ``visible_object_positions`` that avoid repetitive
+    tensor indexing in generated reward code.
+    """
     grid = ts.state.grid
     tile_layer = grid[..., 0]
     color_layer = grid[..., 1]
+
+    observation = jnp.asarray(getattr(ts, "observation"), dtype=jnp.int32)
+    if observation.ndim >= 3 and observation.shape[-1] >= 2:
+        obs_tile_layer = observation[..., 0]
+        obs_color_layer = observation[..., 1]
+        visible_object_positions = freeze(
+            _extract_object_positions(obs_tile_layer, obs_color_layer)
+        )
+        observation_tile_ids = obs_tile_layer
+        observation_color_ids = obs_color_layer
+    else:
+        visible_object_positions = freeze({})
+        observation_tile_ids = jnp.asarray([], dtype=jnp.int32)
+        observation_color_ids = jnp.asarray([], dtype=jnp.int32)
 
     yellow_square_mask = jnp.logical_and(
         tile_layer == Tiles.SQUARE,
@@ -141,7 +177,7 @@ def _extract_state_snapshot(ts):
     empty_pocket = jnp.array([Tiles.EMPTY, Colors.EMPTY], dtype=jnp.int32)
     is_carrying = jnp.logical_not(jnp.all(pocket == empty_pocket))
 
-    snapshot = {
+    snapshot: dict[str, object] = {
         "yellow_square_pos": yellow_square_pos,
         "green_ball_pos": green_ball_pos,
         "agent_pos": agent_pos,
@@ -149,13 +185,29 @@ def _extract_state_snapshot(ts):
         "step_num": step_num,
         "is_carrying": is_carrying,
         "carried_item": pocket,
+        "observation": observation,
+        "observation_tile_ids": observation_tile_ids,
+        "observation_color_ids": observation_color_ids,
+        "visible_object_positions": visible_object_positions,
     }
-    snapshot["object_positions"] = freeze(_extract_object_positions(tile_layer, color_layer))
+    snapshot["object_positions"] = freeze(
+        _extract_object_positions(tile_layer, color_layer)
+    )
     return snapshot
 
 
 def extract_xland_ctx(env_params, ts_prev, ts_next):
-    """Build a dense-reward context dictionary from consecutive timesteps."""
+    """Build the XLand dense-reward context for current and previous timesteps.
+
+    This function emits a dictionary where unsuffixed keys describe the current
+    timestep (``ts_next``) and ``*_prev`` keys describe the previous timestep
+    (``ts_prev``). It is needed because dense rewards typically depend on
+    deltas—distance improvements, newly visible objects, inventory transitions,
+    and progress over time—rather than absolute state alone. It differs from a
+    minimal context extractor by including both global and egocentric symbolic
+    observation interfaces so reward code can safely shape "look at the right
+    thing" behavior without brittle raw-tensor assumptions.
+    """
     del env_params
 
     ts_prev_unwrapped = _unwrap_timestep(ts_prev)

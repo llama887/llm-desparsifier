@@ -12,11 +12,15 @@ from xminigrid.wrappers import GymAutoResetWrapper
 from llm_desparsifier.utils.context import extract_xland_ctx, _extract_state_snapshot
 
 
-def _freeze_to_dict(value):
+def _freeze_to_dict(value) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
     try:
         return dict(value)
-    except TypeError:
-        return value
+    except TypeError as exc:  # pragma: no cover - defensive for unexpected extras types
+        raise AssertionError(
+            f"expected mapping-like value, got {type(value)!r}"
+        ) from exc
 
 
 def _to_numpy(value):
@@ -42,6 +46,9 @@ def test_extract_xland_ctx_includes_previous_snapshot_after_initial_step():
         "step_num",
         "is_carrying",
         "carried_item",
+        "observation",
+        "observation_tile_ids",
+        "observation_color_ids",
     )
 
     prev_snapshot = _extract_state_snapshot(ts_prev)
@@ -68,6 +75,26 @@ def test_extract_xland_ctx_includes_previous_snapshot_after_initial_step():
         _to_numpy(next_snapshot["yellow_square_pos"]),
     )
 
+    visible_object_positions = _freeze_to_dict(ctx["visible_object_positions"])
+    next_visible_object_positions = _freeze_to_dict(
+        next_snapshot["visible_object_positions"]
+    )
+    assert "yellow_square" in visible_object_positions
+    assert "green_ball" in visible_object_positions
+    npt.assert_array_equal(
+        _to_numpy(visible_object_positions["yellow_square"]),
+        _to_numpy(next_visible_object_positions["yellow_square"]),
+    )
+
+    npt.assert_array_equal(
+        _to_numpy(ctx["observation_tile_ids"]),
+        _to_numpy(ctx["observation"])[..., 0],
+    )
+    npt.assert_array_equal(
+        _to_numpy(ctx["observation_color_ids"]),
+        _to_numpy(ctx["observation"])[..., 1],
+    )
+
 
 def test_extract_xland_ctx_clones_snapshot_on_reset():
     env, env_params = xminigrid.make("XLand-MiniGrid-R1-9x9")
@@ -87,8 +114,19 @@ def test_extract_xland_ctx_clones_snapshot_on_reset():
         "step_num",
         "is_carrying",
         "carried_item",
+        "observation",
+        "observation_tile_ids",
+        "observation_color_ids",
     )
 
     for key in base_keys:
         prev_key = f"{key}_prev"
         npt.assert_array_equal(_to_numpy(ctx[key]), _to_numpy(ctx[prev_key]))
+
+    visible_now = _freeze_to_dict(ctx["visible_object_positions"])
+    visible_prev = _freeze_to_dict(ctx["visible_object_positions_prev"])
+    assert visible_now.keys() == visible_prev.keys()
+    for key in ("yellow_square", "green_ball"):
+        npt.assert_array_equal(
+            _to_numpy(visible_now[key]), _to_numpy(visible_prev[key])
+        )

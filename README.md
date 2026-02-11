@@ -58,7 +58,7 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 - Failure path: on training/sanitization errors, feedback becomes `Training failed: <error>` plus sanitizer retry history (if available), and `score = 0.0`.
 
 ## What the synthesis LLM sees
-- `describe_ruleset(env, env_params)` assembles the environment prompt: layout hint, size/view/max_steps, action set, goal sentences, initial objects summary, and a reminder about partial observability. It does not include a RULES list; if a ruleset summary can be printed, it is used only to extract goal/object names.
+- `describe_ruleset(env, env_params)` assembles the environment prompt: layout hint, size/view/max_steps, action set, goal sentences, initial objects summary, and an explicit observation interface. The prompt now documents both symbolic-first visibility lookups (`ctx.get("visible_object_positions", {})`) and raw observation fallback (`ctx.get("observation", ts_next.observation)` with `obs[..., 0]=tile_id`, `obs[..., 1]=color_id`). It does not include a RULES list; if a ruleset summary can be printed, it is used only to extract goal/object names.
 - Reward synthesis uses a **deterministic** ruleset snapshot (`benchmark.get_ruleset(42)`) so the LLM sees a stable task description; when `--deterministic-envs` is set, both PPO evaluation and the ground-truth eval harness use the same ruleset index so solve rates reflect the same task.
 - The full constraints block provided to the LLM comes from `constraints_text` (loaded from `active_prompt.json`, then `base_reward_prompt.txt`, then `CONSTRAINTS_TEXT`). GEPA rewrites this full block; there is no immutable suffix automatically appended after rewrite.
 
@@ -66,7 +66,7 @@ This project runs DSPy GEPA end-to-end on-policy to synthesize dense rewards for
 - Output must define **exactly one** `dense_reward` function.
 - Allowed operations: JAX primitives (`jnp.*`, `jax.lax.*`), `float`/`int` casts, and helper functions defined inside `dense_reward`; method calls are restricted to `.astype(...)` and `ctx.get(...)`.
 - `reward_components` must be a **dict literal** with constant string keys, and the return must be `(total_reward, reward_components)`.
-- `ctx` access must use `ctx.get(key, fallback)` at the top level. Direct `ctx[...]` access is rejected; for nested maps, retrieve the map via `ctx.get("object_positions", default_dict)` and then use bracket access on the returned dict (avoid nested `.get` on traced maps).
+- `ctx` access must use `ctx.get(key, fallback)` at the top level. Direct `ctx[...]` access is rejected; for nested maps, retrieve the map via `ctx.get("object_positions", default_dict)` / `ctx.get("visible_object_positions", default_dict)` and then use bracket or `.get(...)` access on the returned dict.
 - The sanitizer strips markdown fences and rejects non-JAX imports (only `import jax`, `import jax.numpy as jnp`, `import jax.lax` are tolerated) or additional top-level definitions.
 
 ## Environment wrapper behavior

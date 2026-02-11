@@ -188,7 +188,17 @@ def _goal_sentences(
 
 
 def describe_ruleset(env, env_params) -> str:
-    """Produce an LLM-friendly description of the current task."""
+    """Produce the environment text shown to the reward-synthesis LLM.
+
+    This function builds a compact but concrete task description that combines
+    layout metadata, action semantics, object initialization hints, and explicit
+    code-level access patterns for both global context and egocentric
+    observations. It is needed because reward synthesis quality depends heavily
+    on the model understanding *how* to access task state in sanitized code, not
+    just *what* the task goal is. It differs from raw ruleset dumps by
+    translating goal predicates into plain language and by embedding stable
+    `ctx.get(...)` snippets that match the sanitizer and wrapper contracts.
+    """
     height = _safe_getattr(env_params, "height", "?")
     width = _safe_getattr(env_params, "width", "?")
     view = _safe_getattr(env_params, "view_size", "?")
@@ -204,9 +214,10 @@ def describe_ruleset(env, env_params) -> str:
     init_lines: List[str] = []
     if _print_ruleset is not None:
         try:
+            ruleset = env_params.ruleset
             buf = io.StringIO()
             with redirect_stdout(buf):
-                _print_ruleset(getattr(env_params, "ruleset", None))
+                _print_ruleset(ruleset)
             summary = buf.getvalue().strip()
             if summary:
                 goal_line, rule_lines, init_lines = _parse_ruleset_text(summary)
@@ -237,6 +248,27 @@ def describe_ruleset(env, env_params) -> str:
         f"This level uses layout {grid_type}: {layout_hint}. The map is {height}x{width}, and you have up to {max_steps} steps.",
         f"The agent sees an egocentric {view}x{view} symbolic window (partially observable, not pixels).",
         (f"The agent position comes from {agent_pos_example}."),
+        (
+            "Observation interface (symbolic-first): use "
+            f'{ctx_prefix}.get("visible_object_positions", {{}}) for currently visible objects and '
+            f'{ctx_prefix}.get("visible_object_positions_prev", {{}}) for the previous step. '
+            "Each lookup returns local [row, col] view coordinates, and [-1, -1] means not visible."
+        ),
+        (
+            "Example visible-object lookup: "
+            f'{ctx_prefix}.get("visible_object_positions", {{}}).get("{example_obj_key}", jnp.array([-1, -1], dtype=jnp.int32)).'
+        ),
+        (
+            "Raw symbolic observation fallback: "
+            f'obs = {ctx_prefix}.get("observation", ts_next.observation).astype(jnp.int32) and '
+            f'obs_prev = {ctx_prefix}.get("observation_prev", ts_prev.observation).astype(jnp.int32). '
+            "obs[..., 0] is tile id and obs[..., 1] is color id."
+        ),
+        (
+            "Useful ids for observation-based checks: "
+            "tiles FLOOR=1, WALL=2, BALL=3, SQUARE=4, PYRAMID=5, GOAL=6, KEY=7, HEX=11, STAR=12; "
+            "colors RED=1, GREEN=2, BLUE=3, PURPLE=4, YELLOW=5, GREY=6, BLACK=7."
+        ),
         (
             "Available actions are move_forward, turn_left, turn_right, pick_up, put_down, and toggle; "
             "the agent can carry only one object at a time "
@@ -288,7 +320,14 @@ Context:
 - The function will be installed as `dense_fn` inside `DesparsifyRewardWrapper` (see snippet below) and invoked either with three args `(ts_prev, action, ts_next)` or the five-arg signature shown above. Always implement the five-arg form; the wrapper detects it via `inspect.signature`.
 - `ctx` is produced (when configured) by a pure `ctx_fn(env_params, ts_prev, ts_next)` that runs right after `env.step`. It returns a dictionary mapping strings to JAX arrays (you may only access fields of ctx by using ctx.get(...) instead of ctx[...]). Each entry is derived from the `xminigrid.types.TimeStep` objects:
     - Base scalar/pose keys per timestep: `agent_pos`, `agent_direction`, `step_num`, `is_carrying`, `carried_item`, `yellow_square_pos`, `green_ball_pos`, plus `_prev` copies.
-    - Nested `object_positions`: a dict-like map whose keys follow `"{color}_{tile}"` snake_case (e.g., `"yellow_square"`, `"green_ball"`). Each entry is a `[row, col]` array or `[-1, -1]` if the object is absent. Always read it via `obj_pos = ctx.get("object_positions", {})` and `obj_pos.get("yellow_square", jnp.array([-1, -1], dtype=jnp.int32))`.
+    - Observation keys per timestep: `observation`, `observation_tile_ids`, `observation_color_ids`, and `visible_object_positions`, plus `_prev` copies.
+    - Nested maps:
+        - `object_positions`: full-grid object coordinates keyed by `"{color}_{tile}"` snake_case (for example, `"yellow_square"`, `"green_ball"`).
+        - `visible_object_positions`: egocentric-view object coordinates keyed by the same naming scheme. Coordinates are local `[row, col]` in the current view; `[-1, -1]` means not currently visible.
+      Always guard parent and child lookups, for example:
+      `obj_pos = ctx.get("object_positions", {})` then `obj_pos.get("yellow_square", jnp.array([-1, -1], dtype=jnp.int32))`.
+      `visible_pos = ctx.get("visible_object_positions", {})` then `visible_pos.get("yellow_square", jnp.array([-1, -1], dtype=jnp.int32))`.
+    - Raw observation channel contract: `obs = ctx.get("observation", ts_next.observation).astype(jnp.int32)` has shape `(view_size, view_size, 2)` where `obs[..., 0]` is tile id and `obs[..., 1]` is color id.
     - Additional helpers (distances, flags, etc.) may appear for specific ctx functions, but you must guard them with `ctx.get` because they are optional.
 - When the wrapper runs, it replaces the environment's sparse reward with your dense value: `ts_next = env.step(...)`, `dense_reward` executes, and the wrapper expects a tuple `(total_reward, reward_components)`.
 - `reward_components` MUST be a Python dict literal whose keys are descriptive strings (`"progress"`, `"penalty"`, `"shaping"`, etc.) and whose values are scalar jnp arrays produced in the same function. These components will be logged individually for EUREKA reward reflection.

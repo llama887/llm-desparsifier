@@ -37,11 +37,17 @@ def _goal_object_keys(goal_line: str) -> list[str]:
 
     match = parser_mod._GOAL_TILE_NEAR_DIR_RE.search(goal_line)
     if match:
-        return [_underscore(match.group(2).strip()), _underscore(match.group(3).strip())]
+        return [
+            _underscore(match.group(2).strip()),
+            _underscore(match.group(3).strip()),
+        ]
 
     match = parser_mod._GOAL_TILE_NEAR_RE.search(goal_line)
     if match:
-        return [_underscore(match.group(1).strip()), _underscore(match.group(2).strip())]
+        return [
+            _underscore(match.group(1).strip()),
+            _underscore(match.group(2).strip()),
+        ]
 
     return []
 
@@ -61,13 +67,22 @@ def test_env_text_inline_examples_match_ruleset():
 
     assert 'ctx.get("agent_pos", jnp.array([-1, -1], dtype=jnp.int32))' in env_text
     assert 'ctx.get("object_positions", {})' in env_text
+    assert 'ctx.get("visible_object_positions", {})' in env_text
+    assert 'ctx.get("visible_object_positions_prev", {})' in env_text
+    assert 'ctx.get("observation", ts_next.observation).astype(jnp.int32)' in env_text
+    assert (
+        'ctx.get("observation_prev", ts_prev.observation).astype(jnp.int32)' in env_text
+    )
+    assert "obs[..., 0] is tile id and obs[..., 1] is color id" in env_text
 
     if init_lines:
         init_keys = [_underscore(obj) for obj in init_lines]
         example_key = init_keys[0]
-        assert f'.get("{example_key}", jnp.array([-1, -1], dtype=jnp.int32))' in env_text
+        assert (
+            f'.get("{example_key}", jnp.array([-1, -1], dtype=jnp.int32))' in env_text
+        )
         for key in init_keys[1:]:
-            assert f"\"{key}\"" in env_text
+            assert f'"{key}"' in env_text
 
     if goal_line:
         goal_keys = _goal_object_keys(goal_line)

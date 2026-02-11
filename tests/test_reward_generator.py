@@ -104,6 +104,7 @@ def test_reward_generator_retries_until_success():
     assert "use ctx.get" in retry_prompt
     assert dense_fn(None, None, None, None, {})[0] == 7.0
 
+
 def test_reward_generator_raises_after_max_attempts():
     synth = _RetrySynth()
 
@@ -171,3 +172,5 @@ def test_reward_generator_preserves_env_text_in_retry_loop():
     env_text = synth.env_descriptions[0]
     assert "XLand MiniGrid world" in env_text
     assert 'ctx.get("object_positions", {})' in env_text
+    assert 'ctx.get("visible_object_positions", {})' in env_text
+    assert 'ctx.get("observation", ts_next.observation).astype(jnp.int32)' in env_text

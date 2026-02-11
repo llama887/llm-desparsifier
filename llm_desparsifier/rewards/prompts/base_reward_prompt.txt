@@ -24,7 +24,15 @@ Context:
 - The function will be installed as `dense_fn` inside `DesparsifyRewardWrapper` (see snippet below) and invoked either with three args `(ts_prev, action, ts_next)` or the five-arg signature shown above. Always implement the five-arg form; the wrapper detects it via `inspect.signature`.
 - `ctx` is produced (when configured) by a pure `ctx_fn(env_params, ts_prev, ts_next)` that runs right after `env.step`. It returns a dictionary mapping strings to JAX arrays (you may only access fields of ctx by using ctx.get(...) instead of ctx[...]). Each entry is derived from the `xminigrid.types.TimeStep` objects:
     - Base scalar/pose keys per timestep: `agent_pos`, `agent_direction`, `step_num`, `is_carrying`, `carried_item`, `yellow_square_pos`, `green_ball_pos`, plus `_prev` copies.
-    - Nested `object_positions`: a dict-like map whose keys follow `"{color}_{tile}"` snake_case (e.g., `"yellow_square"`, `"green_ball"`). Each entry is a `[row, col]` array or `[-1, -1]` if the object is absent. Always read it via `obj_pos = ctx.get("object_positions", {})` and `obj_pos.get("yellow_square", jnp.array([-1, -1], dtype=jnp.int32))`.
+    - Observation keys per timestep: `observation`, `observation_tile_ids`, `observation_color_ids`, and `visible_object_positions`, plus `_prev` copies.
+    - Nested maps:
+        - `object_positions`: full-grid object coordinates keyed by `"{color}_{tile}"` snake_case (for example, `"yellow_square"`, `"green_ball"`).
+        - `visible_object_positions`: egocentric-view object coordinates keyed by the same naming scheme. Coordinates are local `[row, col]` in the current view; `[-1, -1]` means not currently visible.
+      Always guard parent and child lookups, for example:
+      `obj_pos = ctx.get("object_positions", {})` then `obj_pos.get("yellow_square", jnp.array([-1, -1], dtype=jnp.int32))`.
+      `visible_pos = ctx.get("visible_object_positions", {})` then `visible_pos.get("yellow_square", jnp.array([-1, -1], dtype=jnp.int32))`.
+    - Raw observation channel contract: `obs = ctx.get("observation", ts_next.observation).astype(jnp.int32)` has shape `(view_size, view_size, 2)` where `obs[..., 0]` is tile id and `obs[..., 1]` is color id.
+      Useful ids: tiles FLOOR=1, WALL=2, BALL=3, SQUARE=4, PYRAMID=5, GOAL=6, KEY=7, HEX=11, STAR=12; colors RED=1, GREEN=2, BLUE=3, PURPLE=4, YELLOW=5, GREY=6, BLACK=7.
     - Additional helpers (distances, flags, etc.) may appear for specific ctx functions, but you must guard them with `ctx.get` because they are optional.
 - When the wrapper runs, it replaces the environment's sparse reward with your dense value: `ts_next = env.step(...)`, `dense_reward` executes, and the wrapper expects a tuple `(total_reward, reward_components)`.
 - `reward_components` MUST be a Python dict literal whose keys are descriptive strings (`"progress"`, `"penalty"`, `"shaping"`, etc.) and whose values are scalar jnp arrays produced in the same function.
