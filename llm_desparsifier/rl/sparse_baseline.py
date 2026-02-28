@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 
@@ -81,7 +81,7 @@ def log_sparse_baseline(
 
 
 def run_sparse_baseline(
-    jobs: List[JobLike],
+    jobs: Sequence[JobLike],
     logs_root: Path,
     log_wandb: Callable[..., None],
     config_clamper: Optional[Callable[[Mapping[str, Any]], Tuple[Dict[str, Any], List[str]]]] = None,
@@ -133,7 +133,7 @@ def run_sparse_baseline(
 
 
 def ensure_sparse_baseline(
-    jobs: List[JobLike],
+    jobs: Sequence[JobLike],
     *,
     logs_root: Path,
     baseline_json_path: Path,

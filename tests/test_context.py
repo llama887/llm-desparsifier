@@ -9,7 +9,7 @@ jnp = pytest.importorskip("jax.numpy")
 xminigrid = pytest.importorskip("xminigrid")
 from xminigrid.wrappers import GymAutoResetWrapper
 
-from llm_desparsifier.utils.context import extract_xland_ctx, _extract_state_snapshot
+from llm_desparsifier.utils.context import _extract_state_snapshot, extract_xland_ctx
 
 
 def _freeze_to_dict(value) -> dict[str, object]:

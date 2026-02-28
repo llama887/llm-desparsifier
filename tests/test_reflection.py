@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-import pytest
-
 from llm_desparsifier.rewards.reflection import build_reward_reflection
 
 
@@ -39,6 +37,11 @@ def sample_run_record() -> Dict[str, Any]:
         },
         "behavior_summary": "Behavior summary: manipulation_rate=0.2",
         "final_metrics": {"ground_truth_return": 1.0, "dense_return": 0.8},
+        "reward_object_key_diagnostics": {
+            "referenced_object_keys": ["red_key", "blue_square"],
+            "task_object_keys": ["blue_square", "green_pyramid"],
+            "missing_from_task": ["red_key"],
+        },
     }
 
 
@@ -53,6 +56,13 @@ def test_build_reward_reflection_uses_module_inputs():
     assert "Sparse reward checkpoints" in module.last_kwargs["sparse_curve_summary"]
     assert "progress" in module.last_kwargs["component_curve_summary"]
     assert "manipulation_rate=0.2" in module.last_kwargs["behavior_summary"]
+    assert (
+        "Reward object-key alignment diagnostics:"
+        in module.last_kwargs["component_curve_summary"]
+    )
+    assert "Missing from task description: red_key" in module.last_kwargs[
+        "component_curve_summary"
+    ]
 
 
 def test_build_reward_reflection_fallback_on_failure():
@@ -63,3 +73,29 @@ def test_build_reward_reflection_fallback_on_failure():
 
     assert "Fallback reward reflection" in text
     assert "failed to contact LLM" in text
+
+
+def test_build_reward_reflection_reports_unavailable_key_diagnostics() -> None:
+    """Report diagnostics-unavailable note when run record carries an error.
+
+    This test verifies that reflection input always includes a human-readable
+    diagnostics status even when reward-key analysis fails upstream. It is
+    needed so GEPA feedback remains explicit instead of silently dropping this
+    signal path.
+    """
+
+    module = StubReflectionModule("reflection")
+    record = sample_run_record()
+    record["reward_object_key_diagnostics"] = {
+        "referenced_object_keys": [],
+        "task_object_keys": [],
+        "missing_from_task": [],
+        "diagnostics_error": "ast parse failed",
+    }
+
+    _ = build_reward_reflection(record, reflection_module=module)
+
+    assert module.last_kwargs is not None
+    assert "diagnostics unavailable: ast parse failed" in module.last_kwargs[
+        "component_curve_summary"
+    ]

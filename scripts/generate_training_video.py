@@ -26,6 +26,10 @@ OVERLAY_LINE_SPACING = 2
 OVERLAY_MAP_PANEL_GAP = 10
 OVERLAY_PANEL_MIN_WIDTH = 320
 OVERLAY_GOAL_WRAP_CHARS = 58
+OVERLAY_PLOT_HEIGHT = 180
+OVERLAY_PLOT_MARGIN = 8
+OVERLAY_PLOT_LINE_WIDTH = 2
+OVERLAY_PLOT_LABEL_PAD = 4
 CPU_FALLBACK_REEXEC_FLAG = "LLM_DESPARSIFIER_VIDEO_CPU_FALLBACK_DONE"
 
 
@@ -267,9 +271,14 @@ def _resolve_ruleset(trajectory: dict, benchmark: Any) -> Any:
     sample rulesets, and it differs from training-time selection by consuming
     stored ruleset keys or indices instead of sampling fresh randomness.
     """
+    import jax
+
     from llm_desparsifier.rl.eval import DEFAULT_RULESET_INDEX
 
     if trajectory.get("deterministic_rulesets"):
+        fixed_ruleset_seed = trajectory.get("fixed_ruleset_seed")
+        if fixed_ruleset_seed is not None:
+            return benchmark.sample_ruleset(jax.random.key(int(fixed_ruleset_seed)))
         index = trajectory.get("ruleset_index")
         if index is None:
             index = int(DEFAULT_RULESET_INDEX)
@@ -400,15 +409,157 @@ def _summarize_env_text(env_text: Any) -> str | None:
     return normalized
 
 
-def _draw_overlay(frame: Any, lines: list[str]) -> np.ndarray:
-    """Compose a larger map viewport with a side diagnostics panel.
+def _draw_component_plot(
+    draw: ImageDraw.ImageDraw,
+    *,
+    panel_width: int,
+    y_top: int,
+    component_series: dict[str, list[float]],
+    component_order: Iterable[str],
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> int:
+    """Render a multi-line instantaneous component-reward chart in the panel.
 
-    This helper renders replay diagnostics in a dedicated panel to the right of
-    the game viewport rather than on top of it. It is needed because frame-space
-    overlays can hide the agent path and map entities when many reward components
-    are present. It differs from the previous in-frame upper-left rectangle by
-    (1) upscaling the map viewport for easier viewing and (2) placing the black
-    diagnostics box outside the map so no environment pixels are occluded.
+    This helper draws an XY line chart where the x-axis is replay timestep and
+    each line corresponds to one reward component's instantaneous reward at each
+    step. It is needed because tabular text alone makes temporal behavior hard
+    to spot during fast video playback, and it differs from cumulative totals by
+    explicitly visualizing per-step fluctuations and sign changes over time.
+
+    Args:
+        draw: Mutable PIL drawing context bound to the diagnostics panel.
+        panel_width: Total width in pixels of the diagnostics panel.
+        y_top: Top pixel row where the plot area should begin.
+        component_series: Mapping from component name to per-step instantaneous
+            reward history aligned by timestep index.
+        component_order: Stable ordered component names used for rendering.
+        font: Font object used for axis labels and component legends.
+
+    Returns:
+        The vertical pixel position immediately after the plotted region so
+        callers can continue rendering any additional content below the chart.
+    """
+    names = [name for name in component_order if component_series.get(name)]
+    if not names:
+        return y_top
+
+    x0 = OVERLAY_PANEL_PADDING
+    y0 = y_top
+    x1 = panel_width - OVERLAY_PANEL_PADDING
+    y1 = y0 + OVERLAY_PLOT_HEIGHT
+    if x1 - x0 < 40:
+        return y_top
+
+    draw.rectangle([(x0, y0), (x1, y1)], outline=(80, 80, 80), fill=(12, 12, 12))
+
+    all_values = [value for name in names for value in component_series.get(name, [])]
+    y_min = min(all_values) if all_values else -1.0
+    y_max = max(all_values) if all_values else 1.0
+    if abs(y_max - y_min) < 1e-6:
+        span_pad = max(abs(y_max), 1.0) * 0.25
+        y_min -= span_pad
+        y_max += span_pad
+
+    max_len = max(len(component_series.get(name, [])) for name in names)
+    if max_len < 1:
+        return y1 + OVERLAY_PLOT_MARGIN
+
+    inner_left = x0 + OVERLAY_PLOT_MARGIN
+    inner_right = x1 - OVERLAY_PLOT_MARGIN
+    inner_top = y0 + OVERLAY_PLOT_MARGIN
+    inner_bottom = y1 - OVERLAY_PLOT_MARGIN
+    if inner_right <= inner_left or inner_bottom <= inner_top:
+        return y1 + OVERLAY_PLOT_MARGIN
+
+    def x_at(index: int) -> float:
+        if max_len == 1:
+            return float(inner_left)
+        return inner_left + (inner_right - inner_left) * (index / (max_len - 1))
+
+    def y_at(value: float) -> float:
+        ratio = (value - y_min) / (y_max - y_min)
+        return inner_bottom - ratio * (inner_bottom - inner_top)
+
+    if y_min <= 0.0 <= y_max:
+        y_zero = y_at(0.0)
+        draw.line([(inner_left, y_zero), (inner_right, y_zero)], fill=(110, 110, 110))
+
+    palette = (
+        (255, 99, 71),  # tomato
+        (80, 180, 255),  # bright blue
+        (255, 206, 86),  # yellow
+        (99, 255, 132),  # green
+        (255, 127, 214),  # pink
+        (192, 164, 255),  # lavender
+        (255, 165, 64),  # orange
+        (118, 255, 245),  # cyan
+    )
+    for color_idx, name in enumerate(names):
+        series = component_series.get(name, [])
+        if not series:
+            continue
+        color = palette[color_idx % len(palette)]
+        if len(series) == 1:
+            cx = x_at(0)
+            cy = y_at(series[0])
+            draw.ellipse([(cx - 2, cy - 2), (cx + 2, cy + 2)], fill=color)
+        else:
+            points = [(x_at(idx), y_at(value)) for idx, value in enumerate(series)]
+            draw.line(points, fill=color, width=OVERLAY_PLOT_LINE_WIDTH)
+
+    y_min_label = f"{y_min:+.2f}"
+    y_max_label = f"{y_max:+.2f}"
+    x_end_label = f"t={max_len - 1}"
+    draw.text((inner_left, inner_top), y_max_label, fill=(200, 200, 200), font=font)
+    draw.text(
+        (inner_left, inner_bottom - 10),
+        y_min_label,
+        fill=(200, 200, 200),
+        font=font,
+    )
+    x_end_bbox = draw.textbbox((0, 0), x_end_label, font=font)
+    x_end_width = x_end_bbox[2] - x_end_bbox[0]
+    draw.text(
+        (inner_right - x_end_width, inner_bottom - 10),
+        x_end_label,
+        fill=(200, 200, 200),
+        font=font,
+    )
+
+    legend_y = y1 + OVERLAY_PLOT_LABEL_PAD
+    for color_idx, name in enumerate(names):
+        color = palette[color_idx % len(palette)]
+        label = str(name)
+        label_bbox = draw.textbbox((0, 0), label, font=font)
+        swatch_right = x0 + 10
+        swatch_left = x0 + 2
+        draw.rectangle(
+            [(swatch_left, legend_y + 2), (swatch_right, legend_y + 9)],
+            fill=color,
+        )
+        draw.text((x0 + 14, legend_y), label, fill=(230, 230, 230), font=font)
+        legend_y += int(max(10, label_bbox[3] - label_bbox[1]) + OVERLAY_PLOT_LABEL_PAD)
+        if legend_y > y1 + OVERLAY_PLOT_HEIGHT:
+            break
+
+    return legend_y
+
+
+def _draw_overlay(
+    frame: Any,
+    lines: list[str],
+    *,
+    component_series: dict[str, list[float]] | None = None,
+    component_order: Iterable[str] = (),
+) -> np.ndarray:
+    """Compose an enlarged map frame plus diagnostics panel with a trend chart.
+
+    This helper renders textual replay diagnostics and a per-component
+    instantaneous-reward line plot in a dedicated panel to the right of the map
+    viewport. It is needed because dense reward debugging depends on both exact
+    numeric values and temporal context, and it differs from the prior text-only
+    overlay by appending an inline chart that shows each component's reward
+    fluctuations over timestep index while preserving full map visibility.
     """
     base = Image.fromarray(_normalize_frame(frame))
     if DEFAULT_VIEWPORT_SCALE > 1:
@@ -430,15 +581,43 @@ def _draw_overlay(frame: Any, lines: list[str]) -> np.ndarray:
         heights.append(bbox[3] - bbox[1])
     max_width = max(widths) if widths else 0
     line_height = max(heights) if heights else 0
-    panel_width = max(OVERLAY_PANEL_MIN_WIDTH, max_width + padding * 2)
-    panel_height = (line_height * len(lines)) + spacing * (len(lines) - 1) + padding * 2
+    panel_width = int(max(OVERLAY_PANEL_MIN_WIDTH, max_width + padding * 2))
+    text_block_height = (line_height * len(lines)) + spacing * (len(lines) - 1)
+    panel_height = int(text_block_height + padding * 2)
+    component_series = component_series or {}
+    names_with_history = [
+        name for name in component_order if component_series.get(name) is not None
+    ]
+    if names_with_history:
+        legend_rows = len(names_with_history)
+        reserved_plot_height = (
+            OVERLAY_PLOT_MARGIN
+            + OVERLAY_PLOT_HEIGHT
+            + OVERLAY_PLOT_LABEL_PAD
+            + legend_rows * (10 + OVERLAY_PLOT_LABEL_PAD)
+            + OVERLAY_PANEL_PADDING
+        )
+        panel_height = int(
+            max(panel_height, padding + text_block_height + reserved_plot_height)
+        )
 
     panel = Image.new("RGB", (panel_width, panel_height), color=(0, 0, 0))
     draw = ImageDraw.Draw(panel)
-    y = padding
+    y = int(padding)
     for line in lines:
         draw.text((padding, y), line, fill=(255, 255, 255), font=font)
-        y += line_height + spacing
+        y += int(line_height + spacing)
+
+    if names_with_history:
+        plot_start_y = int(y + OVERLAY_PLOT_MARGIN)
+        _draw_component_plot(
+            draw,
+            panel_width=panel_width,
+            y_top=plot_start_y,
+            component_series=component_series,
+            component_order=component_order,
+            font=font,
+        )
 
     canvas_width = base.width + OVERLAY_MAP_PANEL_GAP + panel.width
     canvas_height = max(base.height, panel.height)
@@ -581,6 +760,50 @@ def _write_trace_payload(trace_output: Path, payload: dict[str, Any]) -> None:
     )
 
 
+def _build_replay_reward_key_diagnostics(run_dir: Path, trajectory: dict) -> dict[str, Any]:
+    """Compare reward object lookups against the captured replay task text.
+
+    This helper runs the same reward/object-key alignment analysis used by the
+    GEPA reflection pipeline, but anchors it to the replay trajectory's saved
+    `env_text`. It is needed because video debugging often happens long after a
+    run finishes, and seeing `reward_components` stay at zero is hard to
+    interpret without an explicit explanation of whether the reward is querying
+    objects that do not exist in that replayed task. It differs from the
+    training-time diagnostics path by reading the cached reward source directly
+    from the run directory and by returning a JSON-ready payload for inclusion
+    in `training_video_trace.json`.
+
+    Args:
+        run_dir: Candidate run directory containing the synthesized reward code.
+        trajectory: Parsed `eval_trajectory.json` payload for the replayed run.
+
+    Returns:
+        A JSON-serializable diagnostics dictionary containing referenced object
+        keys, task-described object keys, and any missing keys. On failure, the
+        payload contains `diagnostics_error` so replay can proceed.
+    """
+    from llm_desparsifier.rewards import build_reward_object_key_diagnostics
+
+    try:
+        reward_code = (run_dir / DENSE_REWARD_FILENAME).read_text(encoding="utf-8")
+        diagnostics = build_reward_object_key_diagnostics(
+            reward_code=reward_code,
+            env_description=trajectory.get("env_text"),
+        )
+        return {
+            "referenced_object_keys": list(diagnostics.referenced_object_keys),
+            "task_object_keys": list(diagnostics.task_object_keys),
+            "missing_from_task": list(diagnostics.missing_from_task),
+        }
+    except Exception as exc:
+        return {
+            "referenced_object_keys": [],
+            "task_object_keys": [],
+            "missing_from_task": [],
+            "diagnostics_error": f"{exc.__class__.__name__}: {exc}",
+        }
+
+
 def main() -> None:
     """Replay a saved trajectory and emit a diagnostic training video.
 
@@ -596,9 +819,18 @@ def main() -> None:
     run_dir = _resolve_run_dir(state_root, args.run_dir)
     trajectory_path = run_dir / TRAJECTORY_FILENAME
     trajectory = _load_json(trajectory_path)
+    reward_object_key_diagnostics = _build_replay_reward_key_diagnostics(
+        run_dir, trajectory
+    )
     env_text = trajectory.get("env_text")
     env_seed = trajectory.get("env_seed", trajectory.get("eval_seed"))
     env_summary = _summarize_env_text(env_text)
+    missing_keys = reward_object_key_diagnostics.get("missing_from_task") or []
+    if isinstance(missing_keys, list) and missing_keys:
+        print(
+            "[generate_training_video] reward/task object-key mismatch detected: "
+            f"missing_from_task={missing_keys}"
+        )
 
     actions = trajectory.get("actions", [])
     if not actions:
@@ -615,6 +847,7 @@ def main() -> None:
     sparse_total = 0.0
     component_order: tuple[str, ...] = ()
     component_totals: dict[str, float] = {}
+    component_series: dict[str, list[float]] = {}
     trace_steps: list[dict[str, Any]] = []
 
     replay_error: str | None = None
@@ -634,6 +867,7 @@ def main() -> None:
                 getattr(dense_reward_fn, "__reward_component_keys__", ())
             )
             component_totals = {name: 0.0 for name in component_order}
+            component_series = {name: [] for name in component_order}
 
             env, env_params, benchmark = _build_env(trajectory)
             ruleset = _resolve_ruleset(trajectory, benchmark)
@@ -666,12 +900,16 @@ def main() -> None:
                 if not component_order and reward_components:
                     component_order = tuple(sorted(reward_components.keys()))
                     component_totals = {name: 0.0 for name in component_order}
+                    component_series = {
+                        name: [0.0] * step_idx for name in component_order
+                    }
 
                 component_values = _normalize_component_map(
                     reward_components, component_order
                 )
                 for name, value in component_values.items():
                     component_totals[name] = component_totals.get(name, 0.0) + value
+                    component_series.setdefault(name, []).append(value)
 
                 lines = _format_overlay_lines(
                     env_summary=env_summary,
@@ -689,7 +927,14 @@ def main() -> None:
                 frame = env.render(env_params, timestep)
                 if frame is None:
                     raise RuntimeError("Environment render returned None")
-                writer.append_data(_draw_overlay(frame, lines))
+                writer.append_data(
+                    _draw_overlay(
+                        frame,
+                        lines,
+                        component_series=component_series,
+                        component_order=component_order,
+                    )
+                )
 
                 trace_steps.append(
                     {
@@ -726,6 +971,7 @@ def main() -> None:
             "dense_reward_path": str(run_dir / DENSE_REWARD_FILENAME),
             "video_path": str(output_path),
             "steps": trace_steps,
+            "reward_object_key_diagnostics": reward_object_key_diagnostics,
             "replay_error": replay_error,
             "replay_complete": False,
         }
@@ -742,6 +988,7 @@ def main() -> None:
         "dense_reward_path": str(run_dir / DENSE_REWARD_FILENAME),
         "video_path": str(output_path),
         "steps": trace_steps,
+        "reward_object_key_diagnostics": reward_object_key_diagnostics,
         "replay_error": replay_error,
         "replay_complete": True,
     }

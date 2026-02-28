@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 from argparse import Namespace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -23,12 +23,8 @@ def _load_video_module():
     script file location.
     """
 
-    script_path = (
-        Path(__file__).resolve().parents[1] / "scripts" / "generate_training_video.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "generate_training_video_module", script_path
-    )
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "generate_training_video.py"
+    spec = importlib.util.spec_from_file_location("generate_training_video_module", script_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load module spec from {script_path}")
     module = importlib.util.module_from_spec(spec)
@@ -53,9 +49,7 @@ def test_configure_replay_jax_runtime_sets_safe_default(
 
     monkeypatch.delenv("XLA_FLAGS", raising=False)
     video_mod._configure_replay_jax_runtime()
-    assert "intra_op_parallelism_threads=1" in str(
-        video_mod.os.environ.get("XLA_FLAGS")
-    )
+    assert "intra_op_parallelism_threads=1" in str(video_mod.os.environ.get("XLA_FLAGS"))
 
 
 def test_coerce_key_round_trip_uses_stored_key_data() -> None:
@@ -100,7 +94,7 @@ def test_main_writes_trace_even_when_replay_fails(
             """Initialize with default zero reward and empty extras map."""
 
             self.reward = jnp.asarray(0.0)
-            self.extras = {}
+            self.extras: dict[str, Any] = {}
 
         def last(self) -> jax.Array:
             """Always report non-terminal state for this failure test."""
@@ -133,7 +127,7 @@ def test_main_writes_trace_even_when_replay_fails(
 
             return self
 
-        def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> bool:
+        def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> Literal[False]:
             """Do not suppress exceptions from replay execution."""
 
             return False
@@ -190,9 +184,7 @@ def test_main_writes_trace_even_when_replay_fails(
         "_wrap_env_with_dense_reward",
         lambda env, trajectory_payload, dense_fn: env,
     )
-    monkeypatch.setattr(
-        video_mod.imageio, "get_writer", lambda *_a, **_k: DummyWriter()
-    )
+    monkeypatch.setattr(video_mod.imageio, "get_writer", lambda *_a, **_k: DummyWriter())
 
     with pytest.raises(RuntimeError, match="step failed intentionally"):
         video_mod.main()
@@ -235,6 +227,31 @@ def test_format_overlay_lines_wraps_long_goal_summary() -> None:
     goal_lines = lines[:step_line_index]
     assert len(goal_lines) >= 2
     assert goal_lines[0].startswith("goal ")
+
+
+def test_format_overlay_lines_never_includes_human_control_legend() -> None:
+    """Ensure policy-rollout overlays exclude human-play control hints.
+
+    This test guards the separation between manual-play UX and policy replay
+    rendering. It is needed because human-only controls guidance should not
+    appear in generated rollout videos, and it differs from wrapping tests by
+    asserting the absence of `CONTROLS` text in the shared rollout formatter.
+    """
+
+    lines = video_mod._format_overlay_lines(
+        env_summary="Place the blue key below the red star.",
+        step_index=2,
+        total_steps=10,
+        dense_reward=0.1,
+        dense_total=0.4,
+        sparse_reward=0.0,
+        sparse_total=0.0,
+        component_values={},
+        component_totals={},
+        component_order=(),
+    )
+
+    assert all("controls" not in line.lower() for line in lines)
 
 
 def test_summarize_env_text_keeps_full_text_without_truncation() -> None:
@@ -294,3 +311,43 @@ def test_draw_overlay_keeps_map_uncovered_and_scales_viewport() -> None:
         rendered[: expected_map.shape[0], : expected_map.shape[1]],
         expected_map,
     )
+
+
+def test_draw_overlay_adds_component_reward_line_plot() -> None:
+    """Ensure the overlay can render per-component instantaneous reward trends.
+
+    This test validates that `_draw_overlay` draws chart primitives in the
+    diagnostics panel when component histories are provided. It is needed because
+    replay videos now visualize per-step component rewards over time, and it
+    differs from map-preservation tests by asserting that chart pixels are
+    present in the panel region even when no text lines are supplied.
+    """
+
+    frame = np.zeros((8, 10, 3), dtype=np.uint8)
+    component_order = ("pickup_bonus", "goal_progress")
+    component_series = {
+        "pickup_bonus": [0.0, 0.1, -0.2, 0.3],
+        "goal_progress": [0.0, 0.05, 0.2, 0.4],
+    }
+
+    rendered = video_mod._draw_overlay(
+        frame,
+        [],
+        component_series=component_series,
+        component_order=component_order,
+    )
+
+    expected_map = np.asarray(
+        Image.fromarray(video_mod._normalize_frame(frame)).resize(
+            (
+                frame.shape[1] * video_mod.DEFAULT_VIEWPORT_SCALE,
+                frame.shape[0] * video_mod.DEFAULT_VIEWPORT_SCALE,
+            ),
+            Image.Resampling.NEAREST,
+        )
+    )
+    panel_start = expected_map.shape[1] + video_mod.OVERLAY_MAP_PANEL_GAP
+    panel_pixels = rendered[:, panel_start:, :]
+
+    assert panel_pixels.size > 0
+    assert np.any(panel_pixels != 0)

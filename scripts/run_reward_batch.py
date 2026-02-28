@@ -27,25 +27,21 @@ import numpy as np
 import yaml
 from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 
-try:
-    import wandb
-except ImportError:  # pragma: no cover - wandb optional
-    wandb = None
-
 from llm_desparsifier.rewards import (
     RewardGenerator,
+    build_reward_object_key_diagnostics,
     build_reward_reflection,
-    create_reward_reflection_module,
     configure_gemini_lm,
     configure_portkey_lm,
+    create_reward_reflection_module,
     summarize_trajectory_behavior_from_path,
 )
 from llm_desparsifier.rewards.llm_client import (
     DEFAULT_GEMINI_MODEL,
     DEFAULT_MODEL_ALIAS,
 )
-from llm_desparsifier.rewards.reflection import EUREKA_GUIDANCE
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT
+from llm_desparsifier.rewards.reflection import EUREKA_GUIDANCE
 from llm_desparsifier.rl.pipeline import TrainingResult, run_training_with_reward
 from llm_desparsifier.rl.sparse_baseline import (
     DEFAULT_BASELINE_JSON,
@@ -59,6 +55,14 @@ from llm_desparsifier.utils import (
     get_active_prompt_path,
     write_active_prompt,
 )
+
+_wandb: Any
+try:
+    import wandb as _wandb
+except ImportError:  # pragma: no cover - wandb optional
+    _wandb = None
+
+wandb: Any = _wandb
 
 DEFAULT_ENV_GRID = Path("configs/gepa_envs.yaml")
 BASE_PROMPT_PATH = Path("llm_desparsifier/rewards/prompts/base_reward_prompt.txt")
@@ -344,12 +348,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--deterministic-envs",
         action="store_true",
-        help="Use a fixed benchmark ruleset instead of sampling new ones.",
-    )
-    parser.add_argument(
-        "--plot-training-curves",
-        action="store_true",
-        help="Generate dense-vs-sparse and holdout plots (default: off).",
+        help=(
+            "Use a fixed benchmark ruleset instead of sampling new ones. "
+            "By default GEPA candidates use one sampled ruleset per env/job and "
+            "reuse it within each metric call for task alignment."
+        ),
     )
     parser.add_argument(
         "--room-count",
@@ -499,6 +502,7 @@ def build_dataset_row(
     sanitizer_feedback: Optional[str] = None,
     budget_cfg: Optional[Mapping[str, Any]] = None,
     behavior_summary: Optional[str] = None,
+    reward_object_key_diagnostics: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble a single run record used by reflection and diagnostics.
 
@@ -507,8 +511,9 @@ def build_dataset_row(
     sinks. It is needed because GEPA metric evaluation constructs this payload
     in multiple branches (success and error paths), and it differs from direct
     `TrainingResult` usage by flattening nested arrays into JSON-friendly
-    Python values while attaching run-specific metadata such as sanitizer and
-    trajectory behavior summaries.
+    Python values while attaching run-specific metadata such as sanitizer
+    feedback, trajectory behavior summaries, and reward object-key alignment
+    diagnostics.
     """
     loss_info = (
         result.train_info.get("loss_info", {})
@@ -540,6 +545,9 @@ def build_dataset_row(
         "sanitizer_feedback": sanitizer_feedback,
         "budget_cfg": dict(budget_cfg) if budget_cfg else None,
         "behavior_summary": behavior_summary,
+        "reward_object_key_diagnostics": dict(reward_object_key_diagnostics)
+        if isinstance(reward_object_key_diagnostics, Mapping)
+        else reward_object_key_diagnostics,
     }
 
 
@@ -585,6 +593,75 @@ def derive_seed(example_id: str, candidate_fp: str) -> int:
         f"{example_id}:{candidate_fp}".encode("utf-8"), digest_size=8
     ).digest()
     return int.from_bytes(digest, "big") % 2_147_483_647
+
+
+def derive_ruleset_seed(example_id: str, candidate_fp: str) -> int:
+    """Derive a deterministic benchmark-ruleset seed for one candidate/job pair.
+
+    This helper generates a stable integer seed used to sample exactly one
+    benchmark ruleset for a specific `(candidate_prompt, job)` metric call. It
+    is needed to reintroduce task randomization across GEPA candidates while
+    preserving strict task alignment within a single metric evaluation
+    (reward-generation prompt, PPO training, sparse eval, and replay all use
+    the same sampled ruleset). It differs from `derive_seed` only in semantic
+    role: `derive_seed` controls rollout RNGs, while this seed controls the
+    benchmark task instance itself.
+    """
+    return derive_seed(example_id, f"{candidate_fp}:ruleset")
+
+
+def sha16_text(value: Any) -> Optional[str]:
+    """Return a short hash fingerprint for optional text values.
+
+    This helper computes a stable 16-hex-character hash for strings so large
+    environment descriptions can be tracked in logs/W&B tables without storing
+    the full text repeatedly. It is needed because candidate-scoped ruleset
+    randomization changes the task text shown to reward synthesis and we need a
+    compact way to monitor whether score changes correlate with task changes. It
+    differs from direct hashing at call sites by handling non-string inputs and
+    returning `None` when no valid text is available.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def extract_goal_signature(env_text: Any) -> Optional[str]:
+    """Extract a compact task signature from an environment description string.
+
+    This helper parses the human-readable `env_text` saved in replay trajectories
+    and returns a compact signature derived from the `Your task is ...` clause
+    (with a fallback to `Success when ...`). It is needed so GEPA logs can show
+    whether score variance is dominated by changes in sampled task semantics
+    rather than prompt quality. It differs from hashing the full `env_text` by
+    producing a human-legible summary that is easier to scan in tables and logs.
+    """
+    if not isinstance(env_text, str):
+        return None
+    normalized = " ".join(env_text.split())
+    if not normalized:
+        return None
+    task_match = re.search(
+        r"(Your task is .*?)(?:[.!?](?:\s|$)|$)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    success_match = re.search(
+        r"(Success when .*?)(?:[.!?](?:\s|$)|$)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    candidate = None
+    if task_match is not None:
+        candidate = task_match.group(1)
+    elif success_match is not None:
+        candidate = success_match.group(1)
+    if candidate is None:
+        return None
+    return " ".join(candidate.split()).strip()[:200]
 
 
 def build_holdout_jobs() -> List[EnvJob]:
@@ -678,6 +755,74 @@ def write_training_curve_png(
     plt.savefig(path, dpi=150)
     plt.close()
     print(f"[training-curve] wrote {path}")
+
+
+def write_training_noise_curve_png(
+    path: Path,
+    gepa_solve_rates: List[float],
+    *,
+    window: int = 5,
+) -> None:
+    """Plot GEPA score trend with a rolling noise band.
+
+    This helper writes a GEPA-level diagnostics plot showing the raw per-
+    iteration solve-rate series together with a rolling mean and rolling
+    standard-deviation band. It is needed when candidate-scoped ruleset
+    randomization is enabled because the optimizer can otherwise appear to
+    improve or regress due to task-sample variance alone. It differs from
+    `write_training_curve_png` by explicitly visualizing score volatility
+    instead of only the raw solve-rate trajectory.
+    """
+    if not gepa_solve_rates:
+        print(
+            "[training-noise-curve] no GEPA solve rates to plot; skipping "
+            "training_curve_noise.png"
+        )
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[training-noise-curve] matplotlib unavailable; skipping plot ({exc})")
+        return
+
+    values = np.asarray(gepa_solve_rates, dtype=float)
+    xs = np.arange(1, values.size + 1)
+    rolling_mean = np.zeros_like(values)
+    rolling_std = np.zeros_like(values)
+    effective_window = max(1, int(window))
+    for idx in range(values.size):
+        start = max(0, idx - effective_window + 1)
+        window_vals = values[start : idx + 1]
+        rolling_mean[idx] = float(np.mean(window_vals))
+        rolling_std[idx] = (
+            float(np.std(window_vals, ddof=1))
+            if window_vals.size > 1
+            else 0.0
+        )
+
+    plt.figure(figsize=(9, 4.5))
+    plt.plot(xs, values, marker="o", linewidth=1.5, alpha=0.55, label="Raw solve rate")
+    plt.plot(xs, rolling_mean, linewidth=2.5, label=f"Rolling mean (w={effective_window})")
+    plt.fill_between(
+        xs,
+        rolling_mean - rolling_std,
+        rolling_mean + rolling_std,
+        alpha=0.2,
+        label="Rolling ±1 std",
+    )
+    plt.xlabel("GEPA iteration")
+    plt.ylabel("Solve rate")
+    plt.title("GEPA Solve Rate With Noise Band")
+    plt.ylim(-0.05, 1.05)
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"[training-noise-curve] wrote {path}")
 
 
 def job_from_example(example: dspy.Example) -> EnvJob:
@@ -910,7 +1055,18 @@ def evaluate_dense_on_jobs(
             reward_hash = ""
             emitted_code = ""
             artifacts: Dict[str, str] = {}
+            ruleset_seed: Optional[int] = None
+            if not bool(budgeted_cfg.get("deterministic_rulesets", False)):
+                ruleset_seed = derive_ruleset_seed(
+                    job.name, f"{prompt_text}:try:{try_idx}"
+                )
             try:
+                dense_cfg = {k: v for k, v in budgeted_cfg.items() if k != "name"}
+                dense_cfg["deterministic_rulesets"] = True
+                if ruleset_seed is None:
+                    dense_cfg.pop("fixed_ruleset_seed", None)
+                else:
+                    dense_cfg["fixed_ruleset_seed"] = ruleset_seed
                 reward_generator = RewardGenerator(
                     constraints_text=prompt_text,
                     lm=base_lm,
@@ -919,9 +1075,7 @@ def evaluate_dense_on_jobs(
                 result = run_training_with_reward(
                     reward_generator,
                     output_dir=str(run_dir),
-                    config_override={
-                        k: v for k, v in budgeted_cfg.items() if k != "name"
-                    },
+                    config_override=dense_cfg,
                     plot_training_curves=plot_training_curves,
                     reward_mode="dense",
                 )
@@ -956,6 +1110,7 @@ def evaluate_dense_on_jobs(
                         "try_idx": try_idx,
                         "train_seed": budgeted_cfg.get("train_seed"),
                         "eval_seed": budgeted_cfg.get("eval_seed"),
+                        "ruleset_seed": ruleset_seed,
                         "reward_hash": reward_hash,
                         "reward_code": emitted_code,
                         "reward_code_path": artifacts.get("dense_reward_path"),
@@ -975,6 +1130,7 @@ def evaluate_dense_on_jobs(
                         "try_idx": try_idx,
                         "train_seed": budgeted_cfg.get("train_seed"),
                         "eval_seed": budgeted_cfg.get("eval_seed"),
+                        "ruleset_seed": ruleset_seed,
                         "solve_rate": solve_rate,
                         "error": str(exc),
                     }
@@ -1093,11 +1249,20 @@ def evaluate_single_env_dense(
         lm=base_lm,
         max_sanitize_attempts=5,
     )
+    ruleset_seed: Optional[int] = None
+    if not bool(budgeted_cfg.get("deterministic_rulesets", False)):
+        ruleset_seed = derive_ruleset_seed(job.name, prompt_text)
     start = time.time()
+    dense_cfg = {k: v for k, v in budgeted_cfg.items() if k != "name"}
+    dense_cfg["deterministic_rulesets"] = True
+    if ruleset_seed is None:
+        dense_cfg.pop("fixed_ruleset_seed", None)
+    else:
+        dense_cfg["fixed_ruleset_seed"] = ruleset_seed
     result = run_training_with_reward(
         reward_generator,
         output_dir=str(run_dir),
-        config_override={k: v for k, v in budgeted_cfg.items() if k != "name"},
+        config_override=dense_cfg,
         plot_training_curves=plot_training_curves,
         reward_mode="dense",
     )
@@ -1115,6 +1280,7 @@ def evaluate_single_env_dense(
         "benchmark_id": job.benchmark_id,
         "train_seed": job.train_seed,
         "eval_seed": job.eval_seed,
+        "ruleset_seed": ruleset_seed,
         "prompt_sha16": prompt_hash,
         "reward_sha16": reward_hash,
         "solve_rate": solve_rate,
@@ -1254,6 +1420,9 @@ def run_batch() -> None:
     empty job sets after optional room filtering).
     """
     args = parse_args()
+    # Plot generation is always enabled so GEPA and per-run diagnostics are
+    # consistently available for debugging without relying on a CLI toggle.
+    setattr(args, "plot_training_curves", True)
     state_root = args.state_root.expanduser().resolve()
     state_root.mkdir(parents=True, exist_ok=True)
     logs_root = state_root / "gepa_runs"
@@ -1344,7 +1513,7 @@ def run_batch() -> None:
                     "deterministic_envs": bool(args.deterministic_envs),
                     "reward_llm_temp": args.reward_llm_temp,
                     "reflection_llm_temp": args.reflection_llm_temp,
-                    "plot_training_curves": bool(args.plot_training_curves),
+                    "plot_training_curves": True,
                     "room_count": selected_room_counts,
                 },
             )
@@ -1358,6 +1527,11 @@ def run_batch() -> None:
                     "reward_code",
                     "solve_rate",
                     "sparse_baseline",
+                    "ruleset_seed",
+                    "env_text_sha16",
+                    "goal_signature",
+                    "reward_task_mismatch",
+                    "reward_missing_keys",
                     "feedback",
                     "sanitizer_feedback",
                     "run_dir",
@@ -1518,7 +1692,11 @@ def run_batch() -> None:
     metric_call_idx = 0
     gepa_iteration_idx = 0
     gepa_iteration_solve_rates: List[float] = []
+    gepa_iteration_score_stds: List[float] = []
+    gepa_iteration_mismatch_rates: List[float] = []
     iteration_scores_by_prompt: Dict[str, List[float]] = {}
+    iteration_ruleset_seeds_by_prompt: Dict[str, List[Optional[int]]] = {}
+    iteration_mismatch_flags_by_prompt: Dict[str, List[int]] = {}
     iteration_step_by_prompt: Dict[str, int] = {}
     metric_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
     score_by_prediction_id: Dict[int, float] = {}
@@ -1651,6 +1829,13 @@ def run_batch() -> None:
         np.random.seed(seed % (2**32 - 1))
 
         train_cfg = {k: v for k, v in budgeted_cfg.items() if k != "name"}
+        train_cfg["deterministic_rulesets"] = True
+        ruleset_seed: Optional[int] = None
+        if args.deterministic_envs:
+            train_cfg.pop("fixed_ruleset_seed", None)
+        else:
+            ruleset_seed = derive_ruleset_seed(example_id, candidate_prompt)
+            train_cfg["fixed_ruleset_seed"] = ruleset_seed
         run_id = run_counter
         run_counter += 1
         run_dir = logs_root / f"candidate-{run_id:04d}-{example_id}"
@@ -1681,7 +1866,12 @@ def run_batch() -> None:
 
         env_description = getattr(example, "env_description", None)
         sanitizer_feedback = None
+        reward_object_key_diagnostics: Optional[Mapping[str, Any]] = None
         behavior_summary = "Behavior summary unavailable (run did not produce trajectory diagnostics)."
+        trajectory_env_text_sha16: Optional[str] = None
+        trajectory_goal_signature: Optional[str] = None
+        missing_keys: list[str] = []
+        reward_task_mismatch = False
         start = time.time()
         train_start = time.time()
         train_status = "pending"
@@ -1702,6 +1892,7 @@ def run_batch() -> None:
                     "eval_num_envs": train_cfg.get("eval_num_envs"),
                     "eval_num_episodes": train_cfg.get("eval_num_episodes"),
                     "deterministic_rulesets": train_cfg.get("deterministic_rulesets"),
+                    "fixed_ruleset_seed": train_cfg.get("fixed_ruleset_seed"),
                 },
             },
         )
@@ -1730,8 +1921,25 @@ def run_batch() -> None:
                 except Exception:
                     sanitizer_feedback = None
             trajectory_path = None
+            trajectory_env_text = None
+            trajectory_env_text_sha16 = None
+            trajectory_goal_signature = None
             if isinstance(result.artifacts, Mapping):
                 trajectory_path = result.artifacts.get("eval_trajectory")
+            if trajectory_path:
+                try:
+                    trajectory_payload = json.loads(
+                        Path(str(trajectory_path)).read_text(encoding="utf-8")
+                    )
+                    raw_trajectory_env_text = trajectory_payload.get("env_text")
+                    if isinstance(raw_trajectory_env_text, str):
+                        trajectory_env_text = raw_trajectory_env_text
+                        trajectory_env_text_sha16 = sha16_text(raw_trajectory_env_text)
+                        trajectory_goal_signature = extract_goal_signature(
+                            raw_trajectory_env_text
+                        )
+                except Exception:
+                    trajectory_env_text = None
             behavior_summary = summarize_trajectory_behavior_from_path(trajectory_path)
 
             row = build_dataset_row(
@@ -1742,8 +1950,44 @@ def run_batch() -> None:
                 sanitizer_feedback=sanitizer_feedback,
                 budget_cfg=train_cfg,
                 behavior_summary=behavior_summary,
+                reward_object_key_diagnostics=reward_object_key_diagnostics,
             )
             row["job_name"] = example_id
+            try:
+                diagnostics_env_description = trajectory_env_text or env_description
+                diagnostics = build_reward_object_key_diagnostics(
+                    reward_code=str(row.get("reward_code", "")),
+                    env_description=diagnostics_env_description,
+                )
+                reward_object_key_diagnostics = {
+                    "referenced_object_keys": list(diagnostics.referenced_object_keys),
+                    "task_object_keys": list(diagnostics.task_object_keys),
+                    "missing_from_task": list(diagnostics.missing_from_task),
+                    "env_description_source": (
+                        "eval_trajectory"
+                        if trajectory_env_text is not None
+                        else "reward_generation"
+                    ),
+                }
+            except Exception as exc:
+                reward_object_key_diagnostics = {
+                    "referenced_object_keys": [],
+                    "task_object_keys": [],
+                    "missing_from_task": [],
+                    "diagnostics_error": str(exc),
+                    "env_description_source": (
+                        "eval_trajectory"
+                        if trajectory_env_text is not None
+                        else "reward_generation"
+                    ),
+                }
+            row["reward_object_key_diagnostics"] = reward_object_key_diagnostics
+            row["ruleset_seed"] = ruleset_seed
+            row["trajectory_env_text_sha16"] = trajectory_env_text_sha16
+            row["trajectory_goal_signature"] = trajectory_goal_signature
+            missing_keys = reward_object_key_diagnostics.get("missing_from_task", [])
+            reward_task_mismatch = bool(missing_keys)
+            row["reward_task_mismatch"] = reward_task_mismatch
 
             reflection_start = time.time()
             log_event(
@@ -1832,6 +2076,8 @@ def run_batch() -> None:
                 "error": train_error,
                 "reward_sha16": reward_hash,
                 "solve_rate": solve_rate,
+                "ruleset_seed": ruleset_seed,
+                "reward_task_mismatch": reward_task_mismatch,
             },
         )
         feedback_text = format_feedback(reflection, pred_name, pred_trace)
@@ -1844,6 +2090,14 @@ def run_batch() -> None:
 
         iteration_scores = iteration_scores_by_prompt.setdefault(candidate_prompt, [])
         iteration_scores.append(solve_rate)
+        iteration_ruleset_seeds = iteration_ruleset_seeds_by_prompt.setdefault(
+            candidate_prompt, []
+        )
+        iteration_ruleset_seeds.append(ruleset_seed)
+        iteration_mismatch_flags = iteration_mismatch_flags_by_prompt.setdefault(
+            candidate_prompt, []
+        )
+        iteration_mismatch_flags.append(1 if reward_task_mismatch else 0)
         iteration_step = iteration_step_by_prompt.setdefault(
             candidate_prompt, gepa_iteration_idx + 1
         )
@@ -1867,6 +2121,11 @@ def run_batch() -> None:
                 emitted_code,
                 solve_rate,
                 baseline_solve_rate,
+                ruleset_seed,
+                trajectory_env_text_sha16,
+                trajectory_goal_signature,
+                reward_task_mismatch,
+                ",".join(str(v) for v in (missing_keys or [])),
                 feedback_text,
                 sanitizer_feedback,
                 str(run_dir),
@@ -1889,21 +2148,44 @@ def run_batch() -> None:
             iteration_mean = (
                 float(np.mean(iteration_scores)) if iteration_scores else 0.0
             )
+            iteration_std = (
+                float(np.std(iteration_scores, ddof=1))
+                if len(iteration_scores) > 1
+                else 0.0
+            )
+            mismatch_rate = (
+                float(np.mean(iteration_mismatch_flags))
+                if iteration_mismatch_flags
+                else 0.0
+            )
             gepa_iteration_idx = max(gepa_iteration_idx, iteration_step)
             gepa_iteration_solve_rates.append(iteration_mean)
+            gepa_iteration_score_stds.append(iteration_std)
+            gepa_iteration_mismatch_rates.append(mismatch_rate)
             baseline_line = sparse_baseline_mean if sparse_baselines else None
             if args.plot_training_curves:
                 write_training_curve_png(
                     training_curve_path, gepa_iteration_solve_rates, baseline_line
                 )
+                write_training_noise_curve_png(
+                    logs_root / "training_curve_noise.png",
+                    gepa_iteration_solve_rates,
+                )
             payload = {
                 "gepa/solve_rate": iteration_mean,
                 "gepa/iteration": gepa_iteration_idx,
+                "gepa/score_std": iteration_std,
+                "gepa/reward_task_mismatch_rate": mismatch_rate,
+                "gepa/ruleset_seed_unique_count": len(
+                    {seed for seed in iteration_ruleset_seeds if seed is not None}
+                ),
             }
             if baseline_solve_rate_mean is not None:
                 payload["gepa/sparse_baseline_solve_rate"] = baseline_solve_rate_mean
             log_wandb(payload, step=gepa_iteration_idx)
             iteration_scores_by_prompt.pop(candidate_prompt, None)
+            iteration_ruleset_seeds_by_prompt.pop(candidate_prompt, None)
+            iteration_mismatch_flags_by_prompt.pop(candidate_prompt, None)
             iteration_step_by_prompt.pop(candidate_prompt, None)
 
         print(
@@ -1950,6 +2232,8 @@ def run_batch() -> None:
     stats_payload["sparse_baselines"] = sparse_baselines
     stats_payload["sparse_baseline_mean"] = sparse_baseline_mean
     stats_payload["gepa_solve_rate_series"] = gepa_iteration_solve_rates
+    stats_payload["gepa_solve_rate_std_series"] = gepa_iteration_score_stds
+    stats_payload["gepa_reward_task_mismatch_rate_series"] = gepa_iteration_mismatch_rates
     stats_payload["baseline_budget_signature"] = baseline_budget_signature
     stats_payload["max_gepa_iterations"] = args.max_gepa_iterations
     stats_payload["test_single_env"] = bool(args.test_single_env)
@@ -1958,7 +2242,7 @@ def run_batch() -> None:
     stats_payload["llm_model"] = model_name
     stats_payload["reward_llm_temp"] = args.reward_llm_temp
     stats_payload["reflection_llm_temp"] = args.reflection_llm_temp
-    stats_payload["plot_training_curves"] = bool(args.plot_training_curves)
+    stats_payload["plot_training_curves"] = True
     stats_payload["room_count"] = selected_room_counts
     if args.test_single_env:
         stats_payload["single_env_job"] = {
@@ -2075,10 +2359,14 @@ def run_batch() -> None:
     print(f"[run_reward_batch] Best prompt saved to {best_prompt_path}")
 
     training_curve_path = logs_root / "training_curve.png"
+    training_noise_curve_path = logs_root / "training_curve_noise.png"
     baseline_line = sparse_baseline_mean if sparse_baselines else None
     if args.plot_training_curves:
         write_training_curve_png(
             training_curve_path, gepa_iteration_solve_rates, baseline_line
+        )
+        write_training_noise_curve_png(
+            training_noise_curve_path, gepa_iteration_solve_rates
         )
 
     if wandb_run is not None:
@@ -2094,9 +2382,26 @@ def run_batch() -> None:
             art.add_file(str(best_prompt_path), name=best_prompt_path.name)
         if training_curve_path.exists():
             art.add_file(str(training_curve_path), name="training_curve.png")
+        if training_noise_curve_path.exists():
+            art.add_file(str(training_noise_curve_path), name="training_curve_noise.png")
         for p in holdout_plot_paths:
             if p.exists():
                 art.add_file(str(p), name=p.name)
+        if wandb_run is not None:
+            try:
+                image_payload: Dict[str, Any] = {}
+                if training_curve_path.exists():
+                    image_payload["gepa/training_curve_plot"] = wandb.Image(
+                        str(training_curve_path)
+                    )
+                if training_noise_curve_path.exists():
+                    image_payload["gepa/training_curve_noise"] = wandb.Image(
+                        str(training_noise_curve_path)
+                    )
+                if image_payload:
+                    log_wandb(image_payload)
+            except Exception:
+                pass
         safe_wandb_log_artifact(wandb_run, art)
         safe_wandb_finish(wandb_run)
 

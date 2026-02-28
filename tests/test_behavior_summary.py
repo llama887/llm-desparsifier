@@ -52,6 +52,26 @@ def test_behavior_summary_navigation_trace_reports_low_manipulation() -> None:
     assert "forward_turn_balance=" in text
 
 
+def test_behavior_summary_uses_correct_turn_labels_for_action_ids() -> None:
+    """Ensure action ids 1/2 are labeled right/left with correct semantics.
+
+    This test verifies that trajectory summaries map action id 1 to
+    `turn_right` and action id 2 to `turn_left`, matching XMiniGrid's action
+    implementation. It is needed because an inverted mapping corrupts reflection
+    diagnostics and can mislead prompt updates, and it differs from generic
+    summary tests by asserting turn-direction label correctness.
+    """
+
+    trajectory = {
+        "actions": [1, 2, 1, 2],
+    }
+
+    text = summarize_trajectory_behavior(trajectory)
+
+    assert "turn_right:2 (50.0%)" in text
+    assert "turn_left:2 (50.0%)" in text
+
+
 def test_behavior_summary_from_path_handles_missing_or_malformed_payload(
     tmp_path: Path,
 ) -> None:

@@ -9,6 +9,10 @@ from .llm_client import (
 )
 from .parser import CONSTRAINTS_TEXT, describe_ruleset
 from .reflection import build_reward_reflection, create_reward_reflection_module
+from .reward_key_diagnostics import (
+    RewardObjectKeyDiagnostics,
+    build_reward_object_key_diagnostics,
+)
 from .sanitizer import sanitize_and_compile
 
 __all__ = [
@@ -20,6 +24,8 @@ __all__ = [
     "configure_portkey_lm",
     "build_reward_reflection",
     "create_reward_reflection_module",
+    "RewardObjectKeyDiagnostics",
+    "build_reward_object_key_diagnostics",
     "summarize_trajectory_behavior_from_path",
     "describe_ruleset",
     "CONSTRAINTS_TEXT",

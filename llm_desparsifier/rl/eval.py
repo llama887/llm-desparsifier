@@ -7,11 +7,10 @@ from typing import List, Optional
 
 import jax
 import jax.numpy as jnp
-from flax.training import checkpoints
-
 import xminigrid
+from flax.training import checkpoints
 from xminigrid.benchmarks import Benchmark
-from xminigrid.environment import EnvParams, Environment
+from xminigrid.environment import Environment, EnvParams
 from xminigrid.wrappers import GymAutoResetWrapper
 
 from llm_desparsifier.rewards.parser import describe_ruleset
@@ -39,6 +38,7 @@ class GroundTruthEvalConfig:
     capture_video: bool = False
     video_episode_index: int = 0
     deterministic_rulesets: bool = False
+    fixed_ruleset_seed: Optional[int] = None
     capture_trajectory: bool = True
     trajectory_episode_index: int = 0
 
@@ -154,10 +154,17 @@ def run_ground_truth_eval(
     trajectory_episode_length: Optional[int] = None
     trajectory_env_text: Optional[str] = None
 
+    fixed_ruleset = None
+    if cfg.deterministic_rulesets:
+        if cfg.fixed_ruleset_seed is None:
+            fixed_ruleset = benchmark.get_ruleset(DEFAULT_RULESET_INDEX)
+        else:
+            fixed_ruleset = benchmark.sample_ruleset(jax.random.key(cfg.fixed_ruleset_seed))
+
     for episode_idx in range(cfg.num_episodes):
         rng, ruleset_key, reset_key = jax.random.split(rng, 3)
         if cfg.deterministic_rulesets:
-            ruleset = benchmark.get_ruleset(DEFAULT_RULESET_INDEX)
+            ruleset = fixed_ruleset
         else:
             ruleset = benchmark.sample_ruleset(ruleset_key)
         episode_params = env_params.replace(ruleset=ruleset)
@@ -169,8 +176,12 @@ def run_ground_truth_eval(
             trajectory_actions = []
             trajectory_reset_key = _key_to_list(reset_key)
             if cfg.deterministic_rulesets:
-                trajectory_ruleset_index = int(DEFAULT_RULESET_INDEX)
-                trajectory_ruleset_key = None
+                if cfg.fixed_ruleset_seed is None:
+                    trajectory_ruleset_index = int(DEFAULT_RULESET_INDEX)
+                    trajectory_ruleset_key = None
+                else:
+                    trajectory_ruleset_key = None
+                    trajectory_ruleset_index = None
             else:
                 trajectory_ruleset_key = _key_to_list(ruleset_key)
                 trajectory_ruleset_index = None
@@ -240,6 +251,7 @@ def run_ground_truth_eval(
             "env_id": cfg.env_id,
             "benchmark_id": cfg.benchmark_id,
             "deterministic_rulesets": bool(cfg.deterministic_rulesets),
+            "fixed_ruleset_seed": cfg.fixed_ruleset_seed,
             "ruleset_index": trajectory_ruleset_index,
             "ruleset_key": trajectory_ruleset_key,
             "reset_key": trajectory_reset_key,

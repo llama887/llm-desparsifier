@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import jax.numpy as jnp
 import pytest
 
 from llm_desparsifier.rewards.generator import RewardGenerator

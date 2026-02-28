@@ -1,6 +1,6 @@
 """Top-level package namespace for llm_desparsifier."""
 
-from . import rl, rewards, utils
+from . import rewards, rl, utils
 from .rewards import RewardGenerator, create_reward_generator
 from .rl.pipeline import (
     RewardGeneratorProtocol,

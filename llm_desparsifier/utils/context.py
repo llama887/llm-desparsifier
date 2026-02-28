@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-
 from flax.core.frozen_dict import freeze
 from xminigrid.core.constants import Colors, Tiles
 

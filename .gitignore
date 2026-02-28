@@ -236,3 +236,5 @@ wandb_exports
 AGENTS.md
 .opencode
 .codex
+.dspy_cache
+.axon

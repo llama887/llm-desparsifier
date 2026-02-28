@@ -14,8 +14,8 @@ from typing import Any, Iterable, Mapping, Optional
 
 ACTION_NAMES = {
     0: "move_forward",
-    1: "turn_left",
-    2: "turn_right",
+    1: "turn_right",
+    2: "turn_left",
     3: "pick_up",
     4: "put_down",
     5: "toggle",
@@ -124,9 +124,7 @@ def summarize_trajectory_behavior(
         f"- forward_turn_balance={forward_turn_balance:.3f} (forward/turn)",
         "- first_sparse_reward_step="
         + (
-            str(first_sparse_reward_step)
-            if first_sparse_reward_step is not None
-            else "unavailable"
+            str(first_sparse_reward_step) if first_sparse_reward_step is not None else "unavailable"
         ),
     ]
 
@@ -171,8 +169,7 @@ def summarize_trajectory_behavior_from_path(
     """
     if trajectory_path is None:
         return (
-            "Behavior summary: eval trajectory artifact unavailable "
-            "(no trajectory path provided)."
+            "Behavior summary: eval trajectory artifact unavailable (no trajectory path provided)."
         )
 
     path = Path(str(trajectory_path))
@@ -182,15 +179,11 @@ def summarize_trajectory_behavior_from_path(
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        return (
-            "Behavior summary: failed to parse eval trajectory artifact "
-            f"at {path}: {exc}"
-        )
+        return f"Behavior summary: failed to parse eval trajectory artifact at {path}: {exc}"
 
     if not isinstance(payload, Mapping):
         return (
-            "Behavior summary: invalid eval trajectory payload type "
-            f"at {path}; expected mapping."
+            f"Behavior summary: invalid eval trajectory payload type at {path}; expected mapping."
         )
 
     return summarize_trajectory_behavior(

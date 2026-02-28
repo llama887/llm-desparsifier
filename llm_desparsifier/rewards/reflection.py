@@ -69,6 +69,9 @@ def build_reward_reflection(
     sparse_summary = _format_sparse_curve(run_record.get("sparse_return_curve"))
     component_summary = _format_component_curves(run_record.get("component_curves"))
     component_stats_summary = _format_component_stats(run_record.get("component_curves"))
+    key_alignment_summary = _format_reward_object_key_diagnostics(
+        run_record.get("reward_object_key_diagnostics")
+    )
     behavior_summary = _format_behavior_summary(run_record.get("behavior_summary"))
     metrics_summary = _format_metrics(run_record.get("final_metrics"))
 
@@ -80,7 +83,15 @@ def build_reward_reflection(
             reward_code=reward_code,
             sparse_curve_summary=sparse_summary,
             component_curve_summary="\n".join(
-                [text for text in [component_summary, component_stats_summary] if text]
+                [
+                    text
+                    for text in [
+                        component_summary,
+                        component_stats_summary,
+                        key_alignment_summary,
+                    ]
+                    if text
+                ]
             ),
             behavior_summary=behavior_summary,
             metrics_summary=metrics_summary,
@@ -95,6 +106,7 @@ def build_reward_reflection(
             env_summary=env_summary,
             sparse_summary=sparse_summary,
             component_summary=component_summary,
+            key_alignment_summary=key_alignment_summary,
             behavior_summary=behavior_summary,
             metrics_summary=metrics_summary,
             error_message=str(exc),
@@ -170,6 +182,64 @@ def _format_behavior_summary(summary: Any) -> str:
     return text
 
 
+def _format_reward_object_key_diagnostics(payload: Any) -> str:
+    """Format object-key alignment diagnostics for reflection prompts.
+
+    This helper renders deterministic, high-signal guidance about whether the
+    reward code references object keys that are absent from the task description.
+    It is needed because semantic key mismatches can leave shaping components at
+    zero while the code still appears structurally valid, and it differs from
+    generic metrics summaries by producing explicit corrective guidance tied to
+    object-key alignment.
+    """
+    if not isinstance(payload, Mapping):
+        return "Reward object-key alignment diagnostics unavailable."
+
+    diagnostics_error = payload.get("diagnostics_error")
+    if diagnostics_error:
+        return (
+            "Reward object-key alignment diagnostics unavailable: "
+            f"{diagnostics_error}"
+        )
+
+    referenced = _sorted_string_list(payload.get("referenced_object_keys"))
+    task_keys = _sorted_string_list(payload.get("task_object_keys"))
+    missing = _sorted_string_list(payload.get("missing_from_task"))
+
+    lines = ["Reward object-key alignment diagnostics:"]
+    lines.append(
+        "Referenced object keys: "
+        + (", ".join(referenced) if referenced else "(none)")
+    )
+    lines.append(
+        "Task-described object keys: "
+        + (", ".join(task_keys) if task_keys else "(none)")
+    )
+    if missing:
+        lines.append(
+            "Missing from task description: " + ", ".join(missing)
+        )
+        lines.append(
+            "These mismatches can force shaping components to remain near zero "
+            "because lookups resolve to sentinel coordinates. Revise reward terms "
+            "to use only task-described object keys."
+        )
+    else:
+        lines.append("Missing from task description: (none)")
+    return "\n".join(lines)
+
+
+def _sorted_string_list(value: Any) -> list[str]:
+    """Normalize heterogeneous list-like inputs into sorted unique strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return sorted({str(item) for item in value})
+
+
 def _sample_series(values: Any, num_points: int = 6) -> list[float]:
     if values is None:
         return []
@@ -187,6 +257,7 @@ def _compose_fallback_text(
     env_summary: str,
     sparse_summary: str,
     component_summary: str,
+    key_alignment_summary: str,
     behavior_summary: str,
     metrics_summary: str,
     error_message: str,
@@ -200,6 +271,8 @@ def _compose_fallback_text(
         + sparse_summary
         + "\n"
         + component_summary
+        + "\n"
+        + key_alignment_summary
         + "\n"
         + behavior_summary
         + "\n"

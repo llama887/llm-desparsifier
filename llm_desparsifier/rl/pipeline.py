@@ -7,9 +7,9 @@ import os
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Mapping, Optional, Protocol, TypedDict
-from typing import Literal
+from typing import Any, Callable, Literal, Mapping, Optional, Protocol, TypedDict
 
+import distrax
 import flax
 import flax.linen as nn
 import jax
@@ -17,22 +17,20 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
 import optax
-import distrax
+import xminigrid
 from flax.jax_utils import replicate, unreplicate
 from flax.linen.initializers import glorot_normal, orthogonal, zeros_init
 from flax.training.train_state import TrainState
-
-import xminigrid
 from xminigrid.benchmarks import Benchmark
-from xminigrid.environment import EnvParams, Environment
+from xminigrid.environment import Environment, EnvParams
 from xminigrid.wrappers import GymAutoResetWrapper
 
 from llm_desparsifier.rl.eval import GroundTruthEvalConfig, run_ground_truth_eval
 from llm_desparsifier.rl.structures import RolloutStats, Transition
-
-DEFAULT_RULESET_INDEX = 42
 from llm_desparsifier.rl.wrappers import DesparsifyRewardWrapper
 from llm_desparsifier.utils import extract_xland_ctx
+
+DEFAULT_RULESET_INDEX = 42
 
 
 class RewardGeneratorProtocol(Protocol):
@@ -74,7 +72,7 @@ class GRU(nn.Module):
 
     @nn.compact
     def __call__(self, xs, init_state):
-        seq_len, input_dim = xs.shape
+        _seq_len, input_dim = xs.shape
         # this init might not be optimal, for example bias for reset gate should be -1 (for now ok)
         Wi = self.param(
             "Wi", glorot_normal(in_axis=1, out_axis=0), (self.hidden_dim * 3, input_dim)
@@ -379,7 +377,7 @@ def rollout(
     component_template = jnp.zeros((len(component_keys),), dtype=jnp.float32)
 
     def _cond_fn(carry):
-        rng, stats, timestep, prev_action, prev_reward, hstate = carry
+        _, stats, _, _, _, _ = carry
         return jnp.less(stats.episodes, num_consecutive_episodes)
 
     def _body_fn(carry):
@@ -468,6 +466,7 @@ class TrainConfig:
     train_seed: int = 42
     gt_success_threshold: Optional[float] = None
     deterministic_rulesets: bool = False
+    fixed_ruleset_seed: Optional[int] = None
 
     def __post_init__(self):
         num_devices = jax.local_device_count()
@@ -519,8 +518,11 @@ def make_states(
     os.makedirs(data_root, exist_ok=True)
 
     benchmark = xminigrid.load_benchmark(config.benchmark_id)
-    # Use a deterministic ruleset example so the LLM sees a concrete task description.
-    example_ruleset = benchmark.get_ruleset(DEFAULT_RULESET_INDEX)
+    # Use a fixed concrete ruleset so the LLM sees the same task the metric will score.
+    if config.deterministic_rulesets and config.fixed_ruleset_seed is not None:
+        example_ruleset = benchmark.sample_ruleset(jax.random.key(config.fixed_ruleset_seed))
+    else:
+        example_ruleset = benchmark.get_ruleset(DEFAULT_RULESET_INDEX)
     env_params = env_params.replace(ruleset=example_ruleset)
 
     emitted_code = ""
@@ -629,7 +631,10 @@ def make_train(
     fixed_train_rulesets = None
     fixed_eval_rulesets = None
     if config.deterministic_rulesets:
-        fixed_ruleset = benchmark.get_ruleset(DEFAULT_RULESET_INDEX)
+        if config.fixed_ruleset_seed is None:
+            fixed_ruleset = benchmark.get_ruleset(DEFAULT_RULESET_INDEX)
+        else:
+            fixed_ruleset = benchmark.sample_ruleset(jax.random.key(config.fixed_ruleset_seed))
         fixed_train_rulesets = _broadcast_ruleset(
             fixed_ruleset, config.num_envs_per_device
         )
@@ -1182,6 +1187,7 @@ def _ensure_eval_trajectory(
             img_obs=primary_eval_cfg.img_obs,
             capture_video=False,
             deterministic_rulesets=primary_eval_cfg.deterministic_rulesets,
+            fixed_ruleset_seed=primary_eval_cfg.fixed_ruleset_seed,
             capture_trajectory=True,
             trajectory_episode_index=0,
         )
@@ -1274,6 +1280,7 @@ def run_training_with_reward(
             "eval_num_envs": config.eval_num_envs,
             "eval_num_episodes": config.eval_num_episodes,
             "deterministic_rulesets": config.deterministic_rulesets,
+            "fixed_ruleset_seed": config.fixed_ruleset_seed,
             "num_devices": jax.local_device_count(),
         },
     )
@@ -1396,6 +1403,8 @@ def run_training_with_reward(
     else:
         print("Final sparse (ground-truth) return:", final_gt_return)
 
+    steps_per_meta = config.num_envs * config.num_steps_per_env
+    total_meta_updates = int(config.num_meta_updates)
     if progress_callback is not None:
         steps = loss_info["eval/returns_mean"].shape[0]
         for idx in range(steps):
@@ -1416,14 +1425,8 @@ def run_training_with_reward(
             step_metrics["wall_time_sec"] = wall_time_sec
             progress_callback(idx, step_metrics)
 
-    meta_updates = jnp.arange(config.num_meta_updates)
     dense_series = loss_info["eval/returns_mean"]
     gt_series = loss_info["eval/ground_truth_returns_mean"]
-    gt_std_series = loss_info.get("eval/ground_truth_returns_std")
-
-    steps_per_meta = config.num_envs * config.num_steps_per_env
-    total_meta_updates = int(meta_updates.shape[0]) if meta_updates.size else 0
-    run_id = os.path.basename(os.path.normpath(output_dir)) or "run"
     # Simplified: skip plotting and CSV dumps to reduce overhead.
     gt_curve_path = ""
     dense_curve_path = ""
@@ -1462,6 +1465,7 @@ def run_training_with_reward(
         img_obs=config.img_obs,
         capture_video=False,
         deterministic_rulesets=config.deterministic_rulesets,
+        fixed_ruleset_seed=config.fixed_ruleset_seed,
         capture_trajectory=True,
         trajectory_episode_index=0,
     )

@@ -15,6 +15,11 @@ dependencies = [
     "pyyaml>=6.0.2",
     "wandb>=0.22.1",
     "weave>=0.52.22",
+    "mypy>=1.19.1",
+    "pylint>=4.0.4",
+    "ruff>=0.15.1",
+    "pygame>=2.6.1",
+    "axoniq>=0.2.3",
 ]
 
 [build-system]
@@ -24,3 +29,69 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["llm_desparsifier*"]
+
+[tool.ruff]
+line-length = 100
+exclude = [
+    ".dspy_cache",
+    "artifacts",
+    "tests/fixtures/candidate_0077_trivial_r1_15x15_seed2/dense_reward_synthesized.py",
+]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["E402"]
+"tests/debug_ctx.py" = ["E402"]
+
+[tool.mypy]
+ignore_missing_imports = true
+disable_error_code = ["import-untyped"]
+exclude = [
+    "artifacts/",
+    "env_list.py",
+    "tests/debug_ctx.py",
+    "tests/fixtures/",
+]
+
+[tool.pylint.main]
+ignore-paths = [
+    "^artifacts/.*$",
+    "^\\.dspy_cache/.*$",
+]
+persistent = false
+
+[tool.pylint.messages_control]
+disable = [
+    "missing-module-docstring",
+    "missing-class-docstring",
+    "missing-function-docstring",
+    "line-too-long",
+    "too-many-lines",
+    "too-many-locals",
+    "too-many-arguments",
+    "too-many-positional-arguments",
+    "too-many-instance-attributes",
+    "too-many-branches",
+    "too-many-statements",
+    "too-few-public-methods",
+    "too-many-return-statements",
+    "wrong-import-position",
+    "import-outside-toplevel",
+    "broad-exception-caught",
+    "duplicate-code",
+    "protected-access",
+    "invalid-name",
+    "abstract-method",
+    "arguments-differ",
+    "fixme",
+    "exec-used",
+    "consider-using-f-string",
+    "unnecessary-lambda",
+    "consider-merging-isinstance",
+    "unused-argument",
+    "unspecified-encoding",
+    "attribute-defined-outside-init",
+    "too-many-boolean-expressions",
+]

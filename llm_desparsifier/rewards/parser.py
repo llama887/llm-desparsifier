@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import re
 from contextlib import redirect_stdout
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 try:
     from xminigrid.rendering.text_render import print_ruleset as _print_ruleset
@@ -23,7 +23,11 @@ _LAYOUT_HINTS = {
     "R9": "nine rooms in a 3×3 arrangement with interior doors",
 }
 
-_ACTIONS_LINE = "Actions: move_forward, turn_left, turn_right, pick_up, put_down, toggle (one object carried at a time)."
+_ACTIONS_LINE = (
+    "Actions (ids): 0=move_forward, 1=turn_right (clockwise), "
+    "2=turn_left (counterclockwise), 3=pick_up, 4=put_down, 5=toggle "
+    "(one object carried at a time)."
+)
 
 _GOAL_AGENT_HOLD_RE = re.compile(r"AgentHold\s*\(\s*([^)]+)\s*\)", re.IGNORECASE)
 _GOAL_AGENT_NEAR_RE = re.compile(r"AgentNear\s*\(\s*([^)]+)\s*\)", re.IGNORECASE)
@@ -39,6 +43,13 @@ _GOAL_TILE_NEAR_DIR_RE = re.compile(
     r"TileNear(Up|Right|Down|Left)Goal\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)",
     re.IGNORECASE,
 )
+
+_OPPOSITE_DIRECTION = {
+    "up": "down",
+    "right": "left",
+    "down": "up",
+    "left": "right",
+}
 
 
 def _safe_getattr(obj, name: str, default: str) -> str:
@@ -85,12 +96,85 @@ def _format_object_name(name: str) -> str:
     return cleaned.lower()
 
 
+def _subject_relation_direction(goal_direction: str) -> str:
+    """Map XMiniGrid directional-goal token to subject-relative world direction.
+
+    XMiniGrid directional goal identifiers encode direction from the perspective
+    of the *second operand* (or target tile) rather than from the subject phrase
+    used in this project's natural-language objective text. For example,
+    ``TileNearLeftGoal(tile_a, tile_b)`` is satisfied when ``tile_a`` is one cell
+    to the right of ``tile_b``. This helper is needed to prevent left/right and
+    up/down inversions in generated goal descriptions, and it differs from a
+    plain lowercase normalizer by applying the semantics-preserving opposite
+    mapping required by XMiniGrid's goal-check implementation.
+
+    Args:
+        goal_direction: Direction token extracted from goal names such as
+            ``Up``, ``Right``, ``Down``, or ``Left``.
+
+    Returns:
+        Lowercase world-relative direction describing where the subject should be
+        relative to the referenced object.
+    """
+    normalized = goal_direction.lower().strip()
+    return _OPPOSITE_DIRECTION.get(normalized, normalized)
+
+
+def _relation_alignment_text(direction: str) -> str:
+    """Return an explicit coordinate relation phrase for a direction word.
+
+    This helper emits deterministic coordinate-language constraints that can be
+    copied into reward shaping logic (for example, equal-row plus +/-1 column).
+    It is needed because concise words like "left" can still be interpreted
+    ambiguously by language models, and it differs from generic alignment labels
+    by encoding exact row/column offset expectations.
+
+    Args:
+        direction: Lowercase relation direction of the subject relative to target.
+
+    Returns:
+        Human-readable clause describing exact grid-coordinate constraints.
+    """
+    if direction == "left":
+        return "same row, and the first column is exactly one less than the second"
+    if direction == "right":
+        return "same row, and the first column is exactly one greater than the second"
+    if direction == "up":
+        return "same column, and the first row is exactly one less than the second"
+    if direction == "down":
+        return "same column, and the first row is exactly one greater than the second"
+    return "adjacent in the expected direction"
+
+
 def _goal_sentences(
     goal_line: Optional[str],
     *,
     agent_pos_example: str,
     obj_positions_example: str,
 ) -> List[str]:
+    """Translate one ruleset goal line into two plain-language objective clauses.
+
+    This helper converts the symbolic goal expression emitted by
+    ``xminigrid.rendering.text_render.print_ruleset`` into a concise pair of
+    sentences: a task instruction and a success criterion. It is needed because
+    reward-synthesis prompts must expose goal semantics in natural language while
+    still naming concrete ``ctx.get(...)`` lookup patterns for implementation.
+    It differs from raw ruleset text by resolving parser-specific naming quirks
+    (including directional inversion semantics in directional goal variants) and
+    by producing model-friendly phrasing that can be copied into dense reward
+    logic.
+
+    Args:
+        goal_line: Optional raw goal line such as
+            ``TileNearLeftGoal(blue key, red star)``.
+        agent_pos_example: Ready-to-paste code snippet for retrieving agent
+            position from context.
+        obj_positions_example: Ready-to-paste code snippet for retrieving object
+            positions map from context.
+
+    Returns:
+        Two-element list containing task and success sentences.
+    """
     if not goal_line:
         return [
             "Your task is to satisfy the level goal condition.",
@@ -119,12 +203,14 @@ def _goal_sentences(
 
     match = _GOAL_AGENT_NEAR_DIR_RE.search(goal_line)
     if match:
-        direction = match.group(1).lower()
+        direction = _subject_relation_direction(match.group(1))
         obj = _format_object_name(match.group(2))
+        relation = _relation_alignment_text(direction)
         return [
             f"Your task is to move the agent immediately {direction} of the {obj}.",
             (
                 f"Success when the agent is exactly one cell {direction} of the {obj}; "
+                f"that means {relation}; "
                 f"use {agent_pos_example} for the agent and "
                 f'{obj_positions_example}.get("{obj.replace(" ", "_")}", jnp.array([-1, -1], dtype=jnp.int32)) '
                 "for the object."
@@ -146,14 +232,10 @@ def _goal_sentences(
 
     match = _GOAL_TILE_NEAR_DIR_RE.search(goal_line)
     if match:
-        direction = match.group(1).lower()
+        direction = _subject_relation_direction(match.group(1))
         first_obj = _format_object_name(match.group(2))
         second_obj = _format_object_name(match.group(3))
-        alignment = (
-            "same row, adjacent columns"
-            if direction in {"left", "right"}
-            else "same column, adjacent rows"
-        )
+        alignment = _relation_alignment_text(direction)
         return [
             f"Your task is to place the {first_obj} immediately {direction} of the {second_obj}.",
             (
@@ -210,7 +292,6 @@ def describe_ruleset(env, env_params) -> str:
     )
 
     goal_line = None
-    rule_lines: List[str] = []
     init_lines: List[str] = []
     if _print_ruleset is not None:
         try:
@@ -220,13 +301,11 @@ def describe_ruleset(env, env_params) -> str:
                 _print_ruleset(ruleset)
             summary = buf.getvalue().strip()
             if summary:
-                goal_line, rule_lines, init_lines = _parse_ruleset_text(summary)
+                goal_line, _, init_lines = _parse_ruleset_text(summary)
         except Exception:
             pass
 
-    init_obj_list = (
-        ", ".join(init_lines[:10]) if init_lines else "unknown (randomized at reset)"
-    )
+    init_obj_list = ", ".join(init_lines[:10]) if init_lines else "unknown (randomized at reset)"
     if init_lines and len(init_lines) > 10:
         init_obj_list += f", ... (+{len(init_lines) - 10} more)"
     init_obj_keys = [obj.lower().replace(" ", "_") for obj in init_lines]
@@ -234,9 +313,7 @@ def describe_ruleset(env, env_params) -> str:
     swap_obj_keys = init_obj_keys[1:] if len(init_obj_keys) > 1 else []
 
     ctx_prefix = "ctx"
-    agent_pos_example = (
-        f'{ctx_prefix}.get("agent_pos", jnp.array([-1, -1], dtype=jnp.int32))'
-    )
+    agent_pos_example = f'{ctx_prefix}.get("agent_pos", jnp.array([-1, -1], dtype=jnp.int32))'
     obj_positions_example = f'{ctx_prefix}.get("object_positions", {{}})'
     goal_sentences = _goal_sentences(
         goal_line,
@@ -270,7 +347,8 @@ def describe_ruleset(env, env_params) -> str:
             "colors RED=1, GREEN=2, BLUE=3, PURPLE=4, YELLOW=5, GREY=6, BLACK=7."
         ),
         (
-            "Available actions are move_forward, turn_left, turn_right, pick_up, put_down, and toggle; "
+            "Available actions are 0=move_forward, 1=turn_right (clockwise), "
+            "2=turn_left (counterclockwise), 3=pick_up, 4=put_down, and 5=toggle; "
             "the agent can carry only one object at a time "
             '(check ctx.get("is_carrying", jnp.array(False)) and '
             'ctx.get("carried_item", jnp.array([-1, -1], dtype=jnp.int32))).'

@@ -8,13 +8,7 @@ from dataclasses import replace as _py_replace
 
 import jax.numpy as jnp
 from flax import struct
-
-try:
-    from flax.core.frozen_dict import freeze
-except ImportError:  # pragma: no cover - flax always available during training
-
-    def freeze(value):
-        return value
+from flax.core.frozen_dict import freeze as flax_freeze
 
 
 @struct.dataclass
@@ -48,7 +42,7 @@ class DesparsifyRewardWrapper:
         self._dense_nargs = len(inspect.signature(dense_fn).parameters)
         self._component_keys = tuple(getattr(dense_fn, "__reward_component_keys__", ()))
         self._component_template = (
-            freeze({name: jnp.float32(0.0) for name in self._component_keys})
+            flax_freeze({name: jnp.float32(0.0) for name in self._component_keys})
             if self._component_keys
             else None
         )
@@ -80,7 +74,7 @@ class DesparsifyRewardWrapper:
             and "reward_components" not in extras_out
         ):
             extras_out["reward_components"] = self._component_template
-        return freeze(extras_out)
+        return flax_freeze(extras_out)
 
     def _wrap_timestep(self, ts, original_reward, dense_reward, reward_components=None):
         original_reward = jnp.asarray(original_reward)
@@ -135,7 +129,7 @@ class DesparsifyRewardWrapper:
     def _normalize_reward_components(self, reward_components):
         if reward_components is None:
             return None
-        frozen = freeze(reward_components)
+        frozen = flax_freeze(reward_components)
         if not self._component_keys:
             return frozen
         actual_keys = tuple(frozen.keys())
@@ -148,7 +142,7 @@ class DesparsifyRewardWrapper:
                 f"missing={sorted(missing)}, extra={sorted(extra)}"
             )
         ordered = {name: frozen[name] for name in self._component_keys}
-        return freeze(ordered)
+        return flax_freeze(ordered)
 
     def num_actions(self, env_params):
         return self.env.num_actions(env_params)

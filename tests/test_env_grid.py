@@ -2,7 +2,6 @@ from pathlib import Path
 
 import yaml
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_GRID_PATH = REPO_ROOT / "configs" / "gepa_envs.yaml"
 

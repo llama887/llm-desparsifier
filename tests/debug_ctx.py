@@ -30,7 +30,6 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 import jax
 import jax.numpy as jnp
-
 import xminigrid
 from xminigrid.wrappers import GymAutoResetWrapper
 
