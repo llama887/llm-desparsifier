@@ -574,3 +574,114 @@ def test_gepa_metric_reports_no_missing_object_keys_when_reward_matches_task(
     diagnostics = row.get("reward_object_key_diagnostics")
     assert isinstance(diagnostics, dict)
     assert diagnostics.get("missing_from_task") == []
+
+
+def test_gepa_metric_reuses_one_ruleset_but_keeps_yaml_training_and_eval_seeds(
+    tmp_path, monkeypatch
+):
+    """Verify GEPA candidates lock task semantics but keep YAML rollout seeds.
+
+    This integration test captures the exact `config_override` passed from the
+    on-policy GEPA metric into `run_training_with_reward`. It is needed because
+    the repository's intended contract is subtle: one candidate prompt should
+    generate a reward from a single task description and then train/evaluate on
+    that same task instance. The current implementation also logs derived
+    prompt-dependent seeds inside the metric, but the actual training call keeps
+    the YAML `train_seed` and `eval_seed` because those fields are already
+    present in the job config. It differs from broader pipeline smoke tests by
+    asserting the precise deterministic-ruleset and seed-plumbing fields that
+    govern the behavior that actually occurs today.
+    """
+
+    run_reward_batch = _load_run_reward_batch()
+
+    env_grid = tmp_path / "envs.yaml"
+    env_grid.write_text(
+        "- name: job-1\n"
+        "  env_id: XLand-MiniGrid-R1-9x9\n"
+        "  benchmark_id: trivial-1m\n"
+        "  total_timesteps: 10\n"
+        "  train_seed: 123\n"
+        "  eval_seed: 456\n",
+        encoding="utf-8",
+    )
+
+    state_root = tmp_path / "state"
+    os.environ["WANDB_DISABLED"] = "1"
+    captured: dict[str, object] = {"config_overrides": []}
+
+    def _fake_run_training_with_reward(_reward_generator, output_dir=None, **kwargs):
+        config_overrides = captured["config_overrides"]
+        assert isinstance(config_overrides, list)
+        config_overrides.append(dict(kwargs.get("config_override", {})))
+        return _dummy_training_result("XLand-MiniGrid-R1-9x9", "trivial-1m")
+
+    def _fake_sparse_baseline(jobs, **_kwargs):
+        return ({job.name: {"solve_rate": 0.0} for job in jobs}, 0.0)
+
+    monkeypatch.setattr(run_reward_batch, "RewardGenerator", _DummyRewardGenerator)
+    monkeypatch.setattr(
+        run_reward_batch, "run_training_with_reward", _fake_run_training_with_reward
+    )
+    monkeypatch.setattr(
+        run_reward_batch, "ensure_sparse_baseline", _fake_sparse_baseline
+    )
+    monkeypatch.setattr(
+        run_reward_batch,
+        "ensure_holdout_sparse_baselines",
+        lambda holdout_jobs, **_kwargs: (
+            {job.name: {"solve_rate": 0.0} for job in holdout_jobs},
+            0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        run_reward_batch,
+        "evaluate_dense_on_jobs",
+        lambda jobs, **_kwargs: (
+            {
+                job.name: {
+                    "solve_rate_mean": 0.0,
+                    "solve_rate_std": 0.0,
+                    "solve_rates": [0.0],
+                }
+                for job in jobs
+            },
+            0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        run_reward_batch,
+        "build_reward_reflection",
+        lambda *_args, **_kwargs: "reflection",
+    )
+    monkeypatch.setattr(
+        run_reward_batch,
+        "create_reward_reflection_module",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(run_reward_batch.dspy, "GEPA", _DummyGEPA)
+
+    argv = [
+        "run_reward_batch.py",
+        "--state-root",
+        str(state_root),
+        "--env-grid",
+        str(env_grid),
+        "--max-gepa-iterations",
+        "1",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    run_reward_batch.run_batch()
+
+    config_overrides = captured.get("config_overrides")
+    assert isinstance(config_overrides, list)
+    assert config_overrides
+    config_override = config_overrides[0]
+    assert isinstance(config_override, dict)
+    assert config_override["env_id"] == "XLand-MiniGrid-R1-9x9"
+    assert config_override["benchmark_id"] == "trivial-1m"
+    assert config_override["deterministic_rulesets"] is True
+    assert isinstance(config_override.get("fixed_ruleset_seed"), int)
+    assert config_override["train_seed"] == 123
+    assert config_override["eval_seed"] == 456
