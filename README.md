@@ -119,11 +119,29 @@ Optional env vars:
 - `XLAND_MINIGRID_DATA` to override the XLand data cache location.
 
 ## Generate a training video
-- After a GEPA run finishes, use `scripts/generate_training_video.py` to replay the saved eval trajectory, render an enlarged map viewport, place dense-reward diagnostics in a right-side panel, add a per-component instantaneous-reward line plot over timesteps, and write an MP4.
+- After a GEPA run finishes, use `scripts/generate_training_video.py` to render three rollout videos from the same deterministic saved initial state: (1) trajectory replay from `eval_trajectory.json` actions, (2) A* with no heuristic (Dijkstra baseline), and (3) A* with a dense-reward-derived heuristic.
 - Default: `uv run scripts/generate_training_video.py --state-root artifacts/gepa_state`
 - Specific run directory: `uv run scripts/generate_training_video.py --run-dir artifacts/gepa_state/gepa_runs/candidate-0001-job-0`
+- Recent batch mode: `uv run scripts/generate_training_video.py --state-root artifacts/gepa_state --latest-candidates 10`
+- Disable A* outputs: `uv run scripts/generate_training_video.py --run-dir <run_dir> --no-astar-video`
+- Override A* paths:
+  - Heuristic mode: `--astar-heuristic-output <path>` and `--astar-heuristic-trace-output <path>`
+  - No-heuristic mode: `--astar-no-heuristic-output <path>` and `--astar-no-heuristic-trace-output <path>`
+- Batch mode notes:
+  - `--latest-candidates N` selects the `N` most recently modified `candidate-*` run directories that contain both `eval_trajectory.json` and `dense_reward_synthesized.py`.
+  - Explicit output-path overrides are single-run only; batch mode writes the standard filenames into each selected run directory.
+  - After batch processing, the CLI prints how many candidate environments had heuristic A* converge faster than no-heuristic A*.
+- Bound planner work: `--astar-max-nodes <int>` and `--astar-max-expansions <int>`
 - If CUDA backend initialization fails (for example GPU OOM), the script automatically retries once on CPU by re-executing with `JAX_PLATFORMS=cpu`.
-- Outputs: `training_video.mp4` and `training_video_trace.json` in the run directory; the trace JSON mirrors the trajectory, includes `env_seed`/`env_text`, records `reward_object_key_diagnostics` (to flag reward/task object mismatches), and records `replay_complete` plus `replay_error` so partial diagnostics are preserved even if replay fails.
+- Outputs by default:
+  - Replay rollout: `training_video.mp4` and `training_video_trace.json`
+  - A* no-heuristic rollout: `training_video_astar_no_heuristic.mp4` and `training_video_astar_no_heuristic_trace.json`
+  - A* heuristic rollout: `training_video_astar_heuristic.mp4` and `training_video_astar_heuristic_trace.json`
+- Trace JSONs include `rollout_mode`, mirror trajectory metadata (`env_seed`/`env_text`), record `reward_object_key_diagnostics` (to flag reward/task object mismatches), and record `replay_complete` plus `replay_error` so partial diagnostics are preserved even if one rollout fails.
+- A* traces additionally include:
+  - `search_stats` with generated/expanded state counts, solve status, termination reason, solution length/cost, and planner budget caps.
+  - `heuristic_comparison` (written after both A* runs complete) with baseline-vs-heuristic generated-state deltas, reduction percentage, and a `heuristic_converged_faster` flag for the per-environment comparison.
+- A* video overlays now include planner completion status, the searched-state count on solved runs, and generated/expanded state counts.
 - Replay metadata also records deterministic task provenance (`fixed_ruleset_seed` when candidate-scoped randomization is used) so the exact sampled benchmark task can be reconstructed.
 
 ## Play a level manually for reward debugging
