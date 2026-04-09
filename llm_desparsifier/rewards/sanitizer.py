@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import ast
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
 
-__all__ = ["sanitize_and_compile"]
+__all__ = ["SanitizedRewardResult", "sanitize_and_compile", "sanitize_reward_code"]
 
 _ALLOWED_FUNCS = {
     "jnp": {
@@ -88,6 +89,24 @@ def _strip_markdown_fences(code: str) -> str:
     if len(lines) >= 2 and lines[-1].strip() == "```":
         return "\n".join(lines[1:-1]).strip()
     return code
+
+
+@dataclass(frozen=True)
+class SanitizedRewardResult:
+    """Canonical sanitized reward payload returned by AST validation.
+
+    This record packages the compiled dense reward callable together with the
+    exact sanitized Python source and the stable reward-component key set
+    extracted during validation. It is needed because downstream callers now
+    persist canonical reward artifacts and validation metadata in addition to
+    executing the compiled function, and it differs from the legacy
+    `sanitize_and_compile` API by exposing the post-sanitization source text
+    rather than only the callable.
+    """
+
+    dense_reward: Callable[..., Any]
+    sanitized_code: str
+    component_keys: tuple[str, ...]
 
 
 def _decompose_attribute(node: ast.AST) -> tuple[ast.AST, list[str]]:
@@ -274,10 +293,19 @@ def _validate_reward_structure(func_node: ast.FunctionDef) -> list[str]:
     return visitor.component_keys
 
 
-def sanitize_and_compile(code: str):
-    """Validate the generated code and return the compiled dense reward function."""
-    code = _strip_markdown_fences(code)
-    tree = ast.parse(code)
+def sanitize_reward_code(code: str) -> SanitizedRewardResult:
+    """Validate reward code and return its canonical sanitized representation.
+
+    This helper strips top-level Markdown fences, validates the AST against the
+    repo's restricted reward contract, compiles the resulting function, and
+    returns all canonicalized outputs needed by artifact writers. It is needed
+    because the pipeline now distinguishes between raw LM text and the exact
+    executable source that passed sanitizer checks, and it differs from
+    `sanitize_and_compile` by preserving the sanitized source and component-key
+    metadata for downstream persistence and validation.
+    """
+    sanitized_code = _strip_markdown_fences(code).strip()
+    tree = ast.parse(sanitized_code)
     fdefs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
     if len(fdefs) != 1 or fdefs[0].name != "dense_reward":
         raise ValueError(
@@ -295,4 +323,20 @@ def sanitize_and_compile(code: str):
         raise ValueError("dense_reward not found after exec")
     if component_keys:
         setattr(dense_reward, "__reward_component_keys__", tuple(component_keys))
-    return dense_reward
+    return SanitizedRewardResult(
+        dense_reward=dense_reward,
+        sanitized_code=sanitized_code,
+        component_keys=tuple(component_keys),
+    )
+
+
+def sanitize_and_compile(code: str):
+    """Validate the generated code and return the compiled dense reward function.
+
+    This compatibility wrapper keeps the historical sanitizer API available for
+    callers and tests that only need an executable function. It is needed so
+    the new canonical artifact workflow can be adopted incrementally, and it
+    differs from `sanitize_reward_code` by discarding the sanitized source and
+    component metadata after validation.
+    """
+    return sanitize_reward_code(code).dense_reward

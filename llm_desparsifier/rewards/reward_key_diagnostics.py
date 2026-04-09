@@ -18,6 +18,19 @@ _TRACKED_CTX_MAP_KEYS = frozenset(
     {"object_positions", "visible_object_positions", "visible_object_positions_prev"}
 )
 _TASK_OBJECT_TOKEN_RE = re.compile(r'"([a-z]+(?:_[a-z]+)+)"')
+_TASK_PATTERNS = (
+    re.compile(r"pick up and hold the ([a-z ]+?)\.", re.IGNORECASE),
+    re.compile(r"move next to the ([a-z ]+?)\.", re.IGNORECASE),
+    re.compile(
+        r"move the agent immediately (?:up|right|down|left) of the ([a-z ]+?)\.",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"place the ([a-z ]+?) immediately (?:up|right|down|left) of the ([a-z ]+?)\.",
+        re.IGNORECASE,
+    ),
+    re.compile(r"bring the ([a-z ]+?) next to the ([a-z ]+?)\.", re.IGNORECASE),
+)
 
 
 @dataclass(frozen=True)
@@ -153,16 +166,28 @@ def _extract_ctx_map_key_from_expr(expr: ast.AST) -> str | None:
 
 
 def _extract_task_object_keys(env_description: Any) -> tuple[str, ...]:
-    """Extract quoted snake_case tokens from environment description text.
+    """Extract task-relevant object keys from environment description text.
 
-    This uses the same style as existing task-context tests so diagnostics align
-    with the prompt text contract used during reward synthesis.
+    This parser combines the historical quoted-token extraction with natural-
+    language goal parsing for the standardized task sentences emitted by the
+    repo's environment-description builder. It is needed because the full
+    environment description lists many non-goal objects that should not satisfy
+    reward/task alignment checks, and it differs from the previous
+    quoted-token-only implementation by focusing diagnostics on the actual goal
+    objects named in `Your task is ...` / `Success when ...` text.
     """
     if not isinstance(env_description, str):
         return ()
     tokens = {
         token for token in _TASK_OBJECT_TOKEN_RE.findall(env_description) if "_" in token
     }
+    for pattern in _TASK_PATTERNS:
+        for match in pattern.findall(env_description):
+            phrases = (match,) if isinstance(match, str) else tuple(match)
+            for phrase in phrases:
+                normalized = "_".join(str(phrase).strip().lower().split())
+                if normalized:
+                    tokens.add(normalized)
     return tuple(sorted(tokens))
 
 

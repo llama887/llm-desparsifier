@@ -1,7 +1,7 @@
 [project]
 name = "llm-desparsifier"
 version = "0.1.0"
-description = "Add your description here"
+description = "GEPA-driven heuristic synthesis for XLand-MiniGrid A* search"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -95,3 +95,7 @@ disable = [
     "attribute-defined-outside-init",
     "too-many-boolean-expressions",
 ]
+
+[tool.llm_desparsifier.jaxtar]
+git_url = "https://github.com/tinker495/JAxtar.git"
+commit = "0e9190be2ff74f65814ad40bf4595935b9cda89a"

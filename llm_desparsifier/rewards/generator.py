@@ -8,13 +8,20 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Mapping, Optional
 
 import dspy
 
-from llm_desparsifier.rewards.llm_client import configure_portkey_lm
+from llm_desparsifier.rewards.llm_client import configure_gemini_lm
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT, describe_ruleset
-from llm_desparsifier.rewards.sanitizer import sanitize_and_compile
+from llm_desparsifier.rewards.reward_key_diagnostics import (
+    RewardObjectKeyDiagnostics,
+    build_reward_object_key_diagnostics,
+)
+from llm_desparsifier.rewards.sanitizer import (
+    SanitizedRewardResult,
+    sanitize_reward_code,
+)
 
 
 @dataclass
@@ -22,6 +29,63 @@ class _AttemptRecord:
     code: str
     error_text: str
     timestamp: str
+
+
+@dataclass(frozen=True)
+class GeneratedRewardValidation:
+    """Structured validation summary for one generated dense reward.
+
+    This payload records the canonical source hashes, component-key contract,
+    and semantic key-alignment diagnostics for a generated reward. It is needed
+    because downstream evaluators now persist reward-validation artifacts and
+    hard-fail semantically invalid candidates before expensive training, and it
+    differs from sanitizer-only results by including task-alignment status in
+    addition to syntax/AST validation.
+    """
+
+    status: str
+    failure_reason: Optional[str]
+    raw_code_sha16: str
+    sanitized_code_sha16: str
+    component_keys: tuple[str, ...]
+    diagnostics: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable validation payload for artifact writing.
+
+        This helper centralizes the persisted validation schema so both the RL
+        and A* evaluators can emit the same `reward_validation.json` contract.
+        It is needed because the validation payload mixes tuples, strings, and
+        nested mappings, and it differs from callers manually constructing dicts
+        by keeping the artifact fields aligned with the dataclass.
+        """
+
+        return {
+            "status": self.status,
+            "failure_reason": self.failure_reason,
+            "raw_code_sha16": self.raw_code_sha16,
+            "sanitized_code_sha16": self.sanitized_code_sha16,
+            "component_keys": list(self.component_keys),
+            "diagnostics": dict(self.diagnostics),
+        }
+
+
+@dataclass(frozen=True)
+class GeneratedReward:
+    """Canonical generated dense reward payload consumed by evaluators.
+
+    This record packages the compiled dense reward callable, raw LM response,
+    canonical sanitized source, and structured validation metadata for one
+    generation attempt. It is needed because artifact writers, GEPA gating, and
+    reflection now need more than the callable alone, and it differs from the
+    legacy tuple return by making the reward-generation contract explicit.
+    """
+
+    dense_fn: Callable[..., Any]
+    raw_code: str
+    sanitized_code: str
+    component_keys: tuple[str, ...]
+    validation: GeneratedRewardValidation
 
 
 class RewardSynthesis(dspy.Signature):
@@ -50,10 +114,10 @@ class RewardSynthesizer(dspy.Module):
 class RewardGenerator:
     """Generate dense rewards by prompting an LLM and sanitizing the output."""
 
-    synthesizer: RewardSynthesizer = field(default_factory=RewardSynthesizer)
+    synthesizer: Callable[[str, str], str] = field(default_factory=RewardSynthesizer)
     constraints_text: str = CONSTRAINTS_TEXT
     describe_fn: Callable[[object, object], str] = describe_ruleset
-    sanitize_fn: Callable[[str], Callable] = sanitize_and_compile
+    sanitize_fn: Callable[[str], SanitizedRewardResult] = sanitize_reward_code
     lm: Optional[dspy.LM] = None
     max_sanitize_attempts: int = 10
     include_sanitizer_code_on_retry: bool = True
@@ -62,10 +126,13 @@ class RewardGenerator:
     # Sticky cache of the most recent environment description sent to the LLM.
     # Used downstream for reflections so the feedback LM knows the goal/ruleset.
     last_env_description: Optional[str] = field(default=None, init=False)
+    # Sticky cache of the most recent successfully parsed reward payload so
+    # downstream evaluators can reuse validation details when runs fail early.
+    last_generated_reward: Optional[GeneratedReward] = field(default=None, init=False)
 
     def __post_init__(self):
         if self.lm is None:
-            self.lm = configure_portkey_lm()
+            self.lm = configure_gemini_lm()
             # Configure DSPy only when we own the LM; avoids thread ownership errors
             # when a caller supplies an already-configured LM from another thread.
             dspy.configure(lm=self.lm)
@@ -92,21 +159,23 @@ class RewardGenerator:
         payload.update(fields)
         print(json.dumps(payload, sort_keys=True, default=str), flush=True)
 
-    def generate(self, env, env_params) -> Tuple[Callable, str]:
-        """Generate a dense reward function and its source code for an environment.
+    def generate(self, env, env_params) -> GeneratedReward:
+        """Generate one canonical dense reward payload for an environment.
 
         This routine builds an environment description, queries the reward LLM,
-        sanitizes and compiles the returned code, and retries with sanitizer
-        feedback when validation fails. It is needed because downstream PPO
-        training requires a callable reward function while GEPA needs the
-        emitted source for logging and reflection. It differs from lower-level
-        sanitizer utilities by orchestrating LLM calls, retry history, and
-        metadata capture in one place.
+        sanitizes and compiles the returned code, performs immediate
+        reward/task-alignment validation, and retries with sanitizer feedback
+        when structural validation fails. It is needed because downstream PPO
+        and A* evaluators now need a compiled function plus canonical artifact
+        metadata, and it differs from lower-level sanitizer utilities by
+        orchestrating LM calls, retry history, and validation payload assembly
+        in one place.
         """
         env_text = self.describe_fn(env, env_params)
         self.last_env_description = env_text
         attempt_history: List[_AttemptRecord] = []
         self.last_attempt_history = []
+        self.last_generated_reward = None
         total_start = time.time()
         self._log_event(
             "reward_generate_start",
@@ -157,7 +226,7 @@ class RewardGenerator:
             sanitize_start = time.time()
             self._log_event("sanitize_start", attempt_idx=attempt_idx)
             try:
-                dense_fn = self.sanitize_fn(code)
+                sanitized_reward = self.sanitize_fn(code)
             except (ValueError, SyntaxError) as exc:
                 sanitize_elapsed = time.time() - sanitize_start
                 error_text = f"{exc.__class__.__name__}: {exc}"
@@ -190,13 +259,20 @@ class RewardGenerator:
                 elapsed_sec=round(sanitize_elapsed, 4),
             )
             self.last_attempt_history = attempt_history
+            generated_reward = self._build_generated_reward(
+                raw_code=code,
+                sanitized_reward=sanitized_reward,
+                env_description=env_text,
+            )
+            self.last_generated_reward = generated_reward
             self._log_event(
                 "reward_generate_end",
                 attempt_idx=attempt_idx,
                 total_elapsed_sec=round(time.time() - total_start, 4),
                 code_sha16=code_sha16,
+                validation_status=generated_reward.validation.status,
             )
-            return dense_fn, code
+            return generated_reward
 
         # This line is unreachable, but satisfies type checkers.
         raise RuntimeError("Reward generation loop exited unexpectedly")
@@ -249,10 +325,145 @@ class RewardGenerator:
             lines.append(f"  Attempt {idx}: {record.error_text}")
         return "\n".join(lines)
 
+    def _build_generated_reward(
+        self,
+        *,
+        raw_code: str,
+        sanitized_reward: SanitizedRewardResult,
+        env_description: str,
+    ) -> GeneratedReward:
+        """Assemble the canonical generated reward payload after sanitization.
+
+        This helper computes stable hashes and semantic task-alignment
+        diagnostics for a reward that already passed AST validation. It is
+        needed because evaluators and artifact writers need one authoritative
+        payload shape, and it differs from `sanitize_reward_code` by attaching
+        environment-specific validation derived from the task description.
+        """
+        raw_code_sha16 = hashlib.sha256(raw_code.encode("utf-8")).hexdigest()[:16]
+        sanitized_code_sha16 = hashlib.sha256(
+            sanitized_reward.sanitized_code.encode("utf-8")
+        ).hexdigest()[:16]
+        status = "ok"
+        failure_reason: Optional[str] = None
+        diagnostics_payload: dict[str, Any]
+        try:
+            diagnostics = build_reward_object_key_diagnostics(
+                sanitized_reward.sanitized_code,
+                env_description,
+            )
+            diagnostics_payload = _reward_key_diagnostics_to_dict(diagnostics)
+            missing_from_task = diagnostics_payload.get("missing_from_task", [])
+            if missing_from_task:
+                status = "invalid_task_mismatch"
+                failure_reason = (
+                    "Reward/task mismatch detected. Missing object keys from task "
+                    f"description: {missing_from_task}."
+                )
+        except Exception as exc:
+            status = "diagnostics_error"
+            failure_reason = (
+                "Reward/task diagnostics failed before evaluation: "
+                f"{exc.__class__.__name__}: {exc}"
+            )
+            diagnostics_payload = {
+                "referenced_object_keys": [],
+                "task_object_keys": [],
+                "missing_from_task": [],
+                "diagnostics_error": str(exc),
+            }
+        validation = GeneratedRewardValidation(
+            status=status,
+            failure_reason=failure_reason,
+            raw_code_sha16=raw_code_sha16,
+            sanitized_code_sha16=sanitized_code_sha16,
+            component_keys=sanitized_reward.component_keys,
+            diagnostics=diagnostics_payload,
+        )
+        return GeneratedReward(
+            dense_fn=sanitized_reward.dense_reward,
+            raw_code=raw_code,
+            sanitized_code=sanitized_reward.sanitized_code,
+            component_keys=sanitized_reward.component_keys,
+            validation=validation,
+        )
+
 
 def create_reward_generator(**kwargs) -> RewardGenerator:
     """Helper to instantiate a RewardGenerator with optional overrides."""
     return RewardGenerator(**kwargs)
 
 
-__all__ = ["RewardGenerator", "RewardSynthesizer", "create_reward_generator"]
+def _reward_key_diagnostics_to_dict(
+    diagnostics: RewardObjectKeyDiagnostics,
+) -> dict[str, Any]:
+    """Convert reward-key diagnostics into the shared artifact/logging schema.
+
+    This helper centralizes the mapping from the typed diagnostics dataclass to
+    a plain dictionary used across GEPA feedback, result objects, and
+    validation-artifact writes. It is needed because callers need stable JSON
+    shapes, and it differs from `asdict`-style conversions by preserving the
+    field names already used elsewhere in the repo.
+    """
+
+    return {
+        "referenced_object_keys": list(diagnostics.referenced_object_keys),
+        "task_object_keys": list(diagnostics.task_object_keys),
+        "missing_from_task": list(diagnostics.missing_from_task),
+    }
+
+
+def persist_generated_reward_artifacts(
+    output_dir: Path,
+    generated_reward: GeneratedReward,
+) -> dict[str, str]:
+    """Persist canonical reward-generation artifacts for one evaluation run.
+
+    This helper writes the sanitized executable reward source, the raw LM
+    response, and the structured validation payload into a shared artifact
+    layout used by both PPO and A* evaluators. It is needed because the
+    pipeline must now preserve canonical executable code separately from raw
+    model text, and it differs from the legacy inline writes by guaranteeing
+    that every caller emits the same filenames and validation schema.
+    """
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dense_reward_path = output_dir / "dense_reward_synthesized.py"
+    raw_response_path = output_dir / "dense_reward_raw_response.txt"
+    validation_path = output_dir / "reward_validation.json"
+    validation_payload = (
+        generated_reward.validation.to_dict()
+        if generated_reward.validation is not None
+        else {
+            "status": "ok",
+            "failure_reason": None,
+            "raw_code_sha256": "",
+            "sanitized_code_sha256": "",
+            "component_keys": list(generated_reward.component_keys),
+            "reward_object_key_diagnostics": None,
+        }
+    )
+    dense_reward_path.write_text(
+        generated_reward.sanitized_code + "\n",
+        encoding="utf-8",
+    )
+    raw_response_path.write_text(generated_reward.raw_code, encoding="utf-8")
+    validation_path.write_text(
+        json.dumps(validation_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "dense_reward_path": str(dense_reward_path),
+        "dense_reward_raw_response": str(raw_response_path),
+        "reward_validation": str(validation_path),
+    }
+
+
+__all__ = [
+    "GeneratedReward",
+    "GeneratedRewardValidation",
+    "RewardGenerator",
+    "RewardSynthesizer",
+    "create_reward_generator",
+    "persist_generated_reward_artifacts",
+]

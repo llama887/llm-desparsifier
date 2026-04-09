@@ -37,6 +37,69 @@ def _load_video_module():
 video_mod = _load_video_module()
 
 
+def _make_dummy_rollout_context(*, trace_steps_cap: int = 2) -> Any:
+    """Create a minimal rollout context suitable for orchestration tests.
+
+    This helper centralizes the stub context shape expected by the video
+    renderer and A* selector factories. It is needed because several tests only
+    care about orchestration and trace-metadata wiring rather than real
+    environment stepping, and it differs from inline construction by keeping
+    the dummy context consistent across tests that monkeypatch replay helpers.
+
+    Args:
+        trace_steps_cap: Maximum number of replay steps that the stub context
+            should advertise.
+
+    Returns:
+        Minimal `_RolloutContext` instance with inert callables and metadata.
+    """
+    return video_mod._RolloutContext(
+        env=object(),
+        env_params=object(),
+        reset_fn=lambda *_a: None,
+        step_fn=lambda *_a: None,
+        dense_reward_fn=lambda *_a: None,
+        reset_key=None,
+        env_text="synthetic env",
+        env_seed=0,
+        env_summary="goal synthetic",
+        reward_object_key_diagnostics={"missing_from_task": []},
+        trace_steps_cap=trace_steps_cap,
+    )
+
+
+def _make_fake_astar_bundle(*, generated_states: int, expanded_states: int) -> Any:
+    """Create a deterministic A* selector bundle for orchestration tests.
+
+    This helper packages synthetic planner stats into the exact selector-bundle
+    shape consumed by `_run_rollout_video`. It is needed because the tests added
+    in this change validate preplanning and comparison wiring without running
+    the actual planner, and it differs from `_build_astar_action_selector_bundle`
+    by returning fixed stats immediately.
+
+    Args:
+        generated_states: Synthetic generated-state count for the bundle.
+        expanded_states: Synthetic expanded-state count for the bundle.
+
+    Returns:
+        `_ActionSelectorBundle` with inert action selection and stable planner
+        statistics.
+    """
+    return video_mod._ActionSelectorBundle(
+        selector=lambda *_a: (0, None),
+        trace_metadata={
+            "search_stats": {
+                "solved": True,
+                "terminated_reason": "solved",
+                "generated_states": generated_states,
+                "expanded_states": expanded_states,
+                "solution_cost": 3,
+                "solution_length": 3,
+            }
+        },
+    )
+
+
 def test_configure_replay_jax_runtime_sets_safe_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -167,13 +230,13 @@ def test_main_writes_trace_even_when_replay_fails(
             state_root=tmp_path,
             run_dir=run_dir,
             latest_candidates=None,
+            astar=False,
             output=None,
             trace_output=None,
             astar_heuristic_output=None,
             astar_heuristic_trace_output=None,
             astar_no_heuristic_output=None,
             astar_no_heuristic_trace_output=None,
-            no_astar_video=False,
             astar_max_nodes=64,
             astar_max_expansions=64,
             fps=8,
@@ -269,15 +332,15 @@ def test_astar_planner_prefers_progressing_path_with_dense_heuristic() -> None:
     assert plan.search_stats["expanded_states"] >= 1
 
 
-def test_main_generates_replay_and_astar_outputs_by_default(
+def test_main_generates_replay_output_only_by_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Verify default CLI behavior invokes replay and both A* rollout modes.
+    """Verify default CLI behavior generates only the replay rollout.
 
-    This test ensures `main()` runs replay plus both A* modes when
-    `--no-astar-video` is not set. It is needed because the script now produces
-    three rollout artifacts by default, and it differs from planner tests by
-    validating orchestration and output defaults.
+    This test ensures `main()` now skips A* rollout generation unless `--astar`
+    is set explicitly. It is needed because A* video creation is now opt-in,
+    and it differs from planner tests by validating the default CLI
+    orchestration path.
     """
 
     run_dir = tmp_path / "candidate-run"
@@ -292,13 +355,13 @@ def test_main_generates_replay_and_astar_outputs_by_default(
             state_root=tmp_path,
             run_dir=run_dir,
             latest_candidates=None,
+            astar=False,
             output=None,
             trace_output=None,
             astar_heuristic_output=None,
             astar_heuristic_trace_output=None,
             astar_no_heuristic_output=None,
             astar_no_heuristic_trace_output=None,
-            no_astar_video=False,
             astar_max_nodes=32,
             astar_max_expansions=32,
             fps=8,
@@ -337,27 +400,20 @@ def test_main_generates_replay_and_astar_outputs_by_default(
     monkeypatch.setattr(video_mod, "_write_trace_payload", lambda *_a, **_k: None)
     video_mod.main()
 
-    assert len(calls) == 3
+    assert len(calls) == 1
     assert calls[0]["rollout_mode"] == video_mod.ROLLOUT_MODE_REPLAY
-    assert calls[1]["rollout_mode"] == video_mod.ROLLOUT_MODE_ASTAR_NO_HEURISTIC
-    assert calls[2]["rollout_mode"] == video_mod.ROLLOUT_MODE_ASTAR_HEURISTIC
     assert calls[0]["output_path"] == run_dir / video_mod.DEFAULT_VIDEO_NAME
-    assert calls[1]["output_path"] == run_dir / video_mod.DEFAULT_ASTAR_NO_HEURISTIC_VIDEO_NAME
-    assert calls[2]["output_path"] == run_dir / video_mod.DEFAULT_ASTAR_HEURISTIC_VIDEO_NAME
     assert calls[0]["trace_output"] == run_dir / video_mod.DEFAULT_TRACE_NAME
-    assert calls[1]["trace_output"] == run_dir / video_mod.DEFAULT_ASTAR_NO_HEURISTIC_TRACE_NAME
-    assert calls[2]["trace_output"] == run_dir / video_mod.DEFAULT_ASTAR_HEURISTIC_TRACE_NAME
 
 
-def test_main_respects_no_astar_video_flag(
+def test_main_generates_astar_outputs_when_flag_enabled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Ensure the opt-out flag disables A* rollout orchestration.
+    """Ensure `--astar` enables both A* rollout modes.
 
-    This test validates that `--no-astar-video` preserves legacy behavior by
-    running only the trajectory replay rollout. It is needed because users may
-    disable extra outputs on constrained systems, and it differs from default
-    orchestration tests by asserting selective mode suppression.
+    This test validates the new opt-in behavior for A* rendering. It is needed
+    because the CLI should keep replay-only mode fast by default while still
+    allowing explicit heuristic-vs-baseline video generation.
     """
 
     run_dir = tmp_path / "candidate-run"
@@ -372,13 +428,13 @@ def test_main_respects_no_astar_video_flag(
             state_root=tmp_path,
             run_dir=run_dir,
             latest_candidates=None,
+            astar=True,
             output=None,
             trace_output=None,
             astar_heuristic_output=None,
             astar_heuristic_trace_output=None,
             astar_no_heuristic_output=None,
             astar_no_heuristic_trace_output=None,
-            no_astar_video=True,
             astar_max_nodes=32,
             astar_max_expansions=32,
             fps=8,
@@ -392,6 +448,24 @@ def test_main_respects_no_astar_video_flag(
         "_build_replay_reward_key_diagnostics",
         lambda _run_dir, _trajectory: {"missing_from_task": []},
     )
+    dummy_context = _make_dummy_rollout_context()
+    monkeypatch.setattr(video_mod, "_build_rollout_context", lambda *_a, **_k: dummy_context)
+
+    def fake_build_astar_action_selector_bundle(**kwargs: Any) -> Any:
+        """Return deterministic preplanned bundles without invoking the planner."""
+
+        use_dense_heuristic = bool(kwargs["use_dense_heuristic"])
+        return _make_fake_astar_bundle(
+            generated_states=5 if use_dense_heuristic else 8,
+            expanded_states=3 if use_dense_heuristic else 6,
+        )
+
+    monkeypatch.setattr(
+        video_mod,
+        "_build_astar_action_selector_bundle",
+        fake_build_astar_action_selector_bundle,
+    )
+
     def _record_rollout_call(**kwargs: Any):
         """Append rollout invocation args to a list for assertion checks."""
 
@@ -409,8 +483,10 @@ def test_main_respects_no_astar_video_flag(
     )
 
     video_mod.main()
-    assert len(calls) == 1
+    assert len(calls) == 3
     assert calls[0]["rollout_mode"] == video_mod.ROLLOUT_MODE_REPLAY
+    assert calls[1]["rollout_mode"] == video_mod.ROLLOUT_MODE_ASTAR_NO_HEURISTIC
+    assert calls[2]["rollout_mode"] == video_mod.ROLLOUT_MODE_ASTAR_HEURISTIC
 
 
 def test_build_astar_overlay_status_lines_include_searched_count() -> None:
@@ -433,6 +509,35 @@ def test_build_astar_overlay_status_lines_include_searched_count() -> None:
 
     assert lines[0] == "astar solved (17 searched) (solved)"
     assert lines[1] == "states gen=17 exp=9"
+
+
+def test_build_astar_overlay_status_lines_include_comparison_verdict() -> None:
+    """Ensure A* overlays show the shared heuristic-vs-baseline verdict.
+
+    This test validates that the A* sidebar now includes an explicit comparison
+    block before the per-rollout planner status lines. It is needed because the
+    video should answer whether the heuristic was faster, slower, or tied
+    without requiring users to compare two raw counters manually.
+    """
+
+    lines = video_mod._build_astar_overlay_status_lines(
+        {
+            "solved": True,
+            "terminated_reason": "solved",
+            "generated_states": 17,
+            "expanded_states": 9,
+        },
+        heuristic_comparison={
+            "comparison_verdict": "heuristic_faster",
+            "heuristic_expanded_states": 9,
+            "baseline_expanded_states": 14,
+        },
+    )
+
+    assert lines[0] == "compare heuristic faster"
+    assert lines[1] == "expanded heur=9 base=14"
+    assert lines[2] == "astar solved (17 searched) (solved)"
+    assert lines[3] == "states gen=17 exp=9"
 
 
 def test_build_rollout_trace_payload_includes_astar_selection_schema(tmp_path: Path) -> None:
@@ -514,13 +619,13 @@ def test_main_raises_when_astar_fails_after_replay_success(
             state_root=tmp_path,
             run_dir=run_dir,
             latest_candidates=None,
+            astar=True,
             output=None,
             trace_output=None,
             astar_heuristic_output=None,
             astar_heuristic_trace_output=None,
             astar_no_heuristic_output=None,
             astar_no_heuristic_trace_output=None,
-            no_astar_video=False,
             astar_max_nodes=32,
             astar_max_expansions=32,
             fps=8,
@@ -533,6 +638,23 @@ def test_main_raises_when_astar_fails_after_replay_success(
         video_mod,
         "_build_replay_reward_key_diagnostics",
         lambda _run_dir, _trajectory: {"missing_from_task": []},
+    )
+    dummy_context = _make_dummy_rollout_context()
+    monkeypatch.setattr(video_mod, "_build_rollout_context", lambda *_a, **_k: dummy_context)
+
+    def fake_build_astar_action_selector_bundle(**kwargs: Any) -> Any:
+        """Return deterministic preplanned bundles without running the planner."""
+
+        use_dense_heuristic = bool(kwargs["use_dense_heuristic"])
+        return _make_fake_astar_bundle(
+            generated_states=5 if use_dense_heuristic else 8,
+            expanded_states=3 if use_dense_heuristic else 6,
+        )
+
+    monkeypatch.setattr(
+        video_mod,
+        "_build_astar_action_selector_bundle",
+        fake_build_astar_action_selector_bundle,
     )
 
     def fake_run_rollout_video(**kwargs: Any):
@@ -619,13 +741,13 @@ def test_main_prints_batch_heuristic_summary_for_latest_candidates(
             state_root=tmp_path,
             run_dir=None,
             latest_candidates=2,
+            astar=True,
             output=None,
             trace_output=None,
             astar_heuristic_output=None,
             astar_heuristic_trace_output=None,
             astar_no_heuristic_output=None,
             astar_no_heuristic_trace_output=None,
-            no_astar_video=False,
             astar_max_nodes=32,
             astar_max_expansions=32,
             fps=8,
@@ -638,12 +760,12 @@ def test_main_prints_batch_heuristic_summary_for_latest_candidates(
             {
                 "run_dir": run_dirs[0],
                 "errors": [],
-                "heuristic_comparison": {"heuristic_converged_faster": True},
+                "heuristic_comparison": {"comparison_verdict": "heuristic_faster"},
             },
             {
                 "run_dir": run_dirs[1],
                 "errors": [],
-                "heuristic_comparison": {"heuristic_converged_faster": False},
+                "heuristic_comparison": {"comparison_verdict": "same_search_outcome"},
             },
         ]
     )
@@ -656,24 +778,61 @@ def test_main_prints_batch_heuristic_summary_for_latest_candidates(
     video_mod.main()
 
     stdout = capsys.readouterr().out
-    assert "heuristic_converged_faster=1/2" in stdout
+    assert "heuristic_faster=1" in stdout
+    assert "heuristic_slower=0" in stdout
+    assert "same_search_outcome=1" in stdout
+    assert "total=2" in stdout
 
 
 def test_build_heuristic_comparison_payload_marks_heuristic_faster_when_baseline_unsolved() -> None:
-    """Ensure faster convergence treats heuristic-only solves as an improvement.
+    """Ensure heuristic-only solves are classified as faster.
 
-    This test captures the intended comparison semantics for batch summaries. It
-    is needed because a heuristic that solves within budget while baseline does
-    not should count as converging faster, and it differs from generated-state
-    reduction checks by covering the asymmetric solved/unsolved case directly.
+    This test captures the highest-priority comparison rule: solving the task
+    within budget beats a baseline that never solves, regardless of any other
+    planner counters.
     """
 
     comparison = video_mod._build_heuristic_comparison_payload(
-        baseline_search_stats={"generated_states": 100, "solved": False},
-        heuristic_search_stats={"generated_states": 80, "solved": True},
+        baseline_search_stats={"generated_states": 100, "expanded_states": 60, "solved": False},
+        heuristic_search_stats={"generated_states": 80, "expanded_states": 55, "solved": True},
     )
 
+    assert comparison["comparison_basis"] == "expanded_states"
+    assert comparison["comparison_verdict"] == "heuristic_faster"
     assert comparison["heuristic_converged_faster"] is True
+
+
+def test_build_heuristic_comparison_payload_marks_heuristic_slower_with_more_expansions() -> None:
+    """Ensure larger expanded-state counts classify heuristic A* as slower.
+
+    This test validates the expanded-state tie-break that should apply once both
+    planner runs have the same solved status. It is needed because the sidebar
+    wording now depends on this exact comparison contract.
+    """
+
+    comparison = video_mod._build_heuristic_comparison_payload(
+        baseline_search_stats={"generated_states": 90, "expanded_states": 20, "solved": True},
+        heuristic_search_stats={"generated_states": 70, "expanded_states": 35, "solved": True},
+    )
+
+    assert comparison["comparison_verdict"] == "heuristic_slower"
+    assert comparison["heuristic_converged_faster"] is False
+
+
+def test_build_heuristic_comparison_payload_marks_same_outcome_on_equal_expansions() -> None:
+    """Ensure equal solve status plus equal expansions yields an explicit tie.
+
+    This test locks down the neutral classification used when neither planner
+    outcome is better under the solved-then-expanded comparison rule.
+    """
+
+    comparison = video_mod._build_heuristic_comparison_payload(
+        baseline_search_stats={"generated_states": 75, "expanded_states": 18, "solved": True},
+        heuristic_search_stats={"generated_states": 65, "expanded_states": 18, "solved": True},
+    )
+
+    assert comparison["comparison_verdict"] == "same_search_outcome"
+    assert comparison["heuristic_converged_faster"] is False
 
 
 def test_format_overlay_lines_wraps_long_goal_summary() -> None:
@@ -731,6 +890,121 @@ def test_format_overlay_lines_never_includes_human_control_legend() -> None:
     )
 
     assert all("controls" not in line.lower() for line in lines)
+
+
+def test_format_overlay_lines_for_replay_do_not_add_comparison_block() -> None:
+    """Ensure replay overlays stay free of heuristic-comparison status text.
+
+    This test verifies that trajectory replay frames still contain only goal and
+    reward diagnostics when no A* status block is supplied. It is needed
+    because the heuristic-vs-baseline verdict should appear only on the two A*
+    videos, not the recorded replay video.
+    """
+
+    lines = video_mod._format_overlay_lines(
+        env_summary="Reach the green goal tile.",
+        step_index=0,
+        total_steps=3,
+        dense_reward=0.0,
+        dense_total=0.0,
+        sparse_reward=0.0,
+        sparse_total=0.0,
+        component_values={},
+        component_totals={},
+        component_order=(),
+    )
+
+    assert all(not line.startswith("compare ") for line in lines)
+
+
+def test_run_single_candidate_injects_comparison_into_both_astar_traces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Ensure preplanned A* trace metadata includes the shared comparison block.
+
+    This test exercises the new orchestration flow where both A* plans are
+    computed before rendering and the resulting comparison payload is embedded
+    into both selector bundles. It is needed because the sidebar text and the
+    trace JSON now depend on the same shared comparison metadata.
+    """
+
+    run_dir = tmp_path / "candidate-run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    trajectory = {"actions": [0, 1], "reset_key": [1, 2], "env_id": "x", "benchmark_id": "y"}
+    astar_trace_payloads: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(video_mod, "_load_json", lambda _p: trajectory)
+    monkeypatch.setattr(
+        video_mod,
+        "_build_replay_reward_key_diagnostics",
+        lambda _run_dir, _trajectory: {"missing_from_task": []},
+    )
+    monkeypatch.setattr(
+        video_mod,
+        "_build_rollout_context",
+        lambda *_a, **_k: _make_dummy_rollout_context(),
+    )
+
+    def fake_build_astar_action_selector_bundle(**kwargs: Any) -> Any:
+        """Return A* bundles with deterministic search stats for comparison."""
+
+        use_dense_heuristic = bool(kwargs["use_dense_heuristic"])
+        return _make_fake_astar_bundle(
+            generated_states=6 if use_dense_heuristic else 10,
+            expanded_states=4 if use_dense_heuristic else 9,
+        )
+
+    monkeypatch.setattr(
+        video_mod,
+        "_build_astar_action_selector_bundle",
+        fake_build_astar_action_selector_bundle,
+    )
+
+    def fake_run_rollout_video(**kwargs: Any) -> Any:
+        """Capture the final trace metadata that each rollout would write."""
+
+        mode = str(kwargs["rollout_mode"])
+        if mode == video_mod.ROLLOUT_MODE_REPLAY:
+            return video_mod._RolloutRunResult(
+                replay_error=None,
+                trace_output=Path(kwargs["trace_output"]),
+                trace_payload={"rollout_mode": mode},
+            )
+        bundle = kwargs["action_selector_factory"](_make_dummy_rollout_context())
+        payload = dict(bundle.trace_metadata or {})
+        payload["rollout_mode"] = mode
+        astar_trace_payloads.append(payload)
+        return video_mod._RolloutRunResult(
+            replay_error=None,
+            trace_output=Path(kwargs["trace_output"]),
+            trace_payload=payload,
+        )
+
+    monkeypatch.setattr(video_mod, "_run_rollout_video", fake_run_rollout_video)
+
+    summary = video_mod._run_single_candidate(
+        run_dir=run_dir,
+        args=Namespace(
+            output=None,
+            trace_output=None,
+            astar=True,
+            astar_heuristic_output=None,
+            astar_heuristic_trace_output=None,
+            astar_no_heuristic_output=None,
+            astar_no_heuristic_trace_output=None,
+            astar_max_nodes=32,
+            astar_max_expansions=32,
+            fps=8,
+            max_steps=None,
+        ),
+    )
+
+    assert summary["heuristic_comparison"]["comparison_verdict"] == "heuristic_faster"
+    assert len(astar_trace_payloads) == 2
+    assert all(
+        payload["heuristic_comparison"]["comparison_verdict"] == "heuristic_faster"
+        for payload in astar_trace_payloads
+    )
 
 
 def test_summarize_env_text_keeps_full_text_without_truncation() -> None:

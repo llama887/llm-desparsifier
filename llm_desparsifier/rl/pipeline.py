@@ -7,6 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Optional, Protocol, TypedDict
 
 import distrax
@@ -25,6 +26,10 @@ from xminigrid.benchmarks import Benchmark
 from xminigrid.environment import Environment, EnvParams
 from xminigrid.wrappers import GymAutoResetWrapper
 
+from llm_desparsifier.rewards.generator import (
+    GeneratedReward,
+    persist_generated_reward_artifacts,
+)
 from llm_desparsifier.rl.eval import GroundTruthEvalConfig, run_ground_truth_eval
 from llm_desparsifier.rl.structures import RolloutStats, Transition
 from llm_desparsifier.rl.wrappers import DesparsifyRewardWrapper
@@ -38,8 +43,75 @@ class RewardGeneratorProtocol(Protocol):
 
     def generate(
         self, env: Environment, env_params: EnvParams
-    ) -> tuple[Callable[..., Any], str]:
-        """Return a dense reward function and the emitted source code."""
+    ) -> GeneratedReward:
+        """Return the canonical generated dense reward payload for one task."""
+
+
+def _normalize_make_states_result(
+    make_states_result: tuple[Any, ...],
+) -> tuple[
+    Any,
+    Any,
+    Any,
+    Any,
+    Any,
+    Any,
+    str,
+    str,
+    str,
+    Optional[Mapping[str, Any]],
+    dict[str, str],
+    Optional[Callable[..., Mapping[str, Any]]],
+]:
+    """Normalize legacy and current `make_states` returns into one stable shape.
+
+    This helper keeps `run_training_with_reward` compatible with older unit
+    tests and local stubs that still return the historical 9-item tuple while
+    the real pipeline now returns additional artifact and validation metadata.
+    It is needed because the new reward contract widens the orchestration
+    payload, and it differs from changing every caller at once by synthesizing
+    sensible defaults only when the shorter legacy tuple is encountered.
+
+    Args:
+        make_states_result: Raw tuple returned by `make_states` or a stubbed
+            replacement in tests.
+
+    Returns:
+        Canonical 12-item tuple consumed by `run_training_with_reward`.
+    """
+    if len(make_states_result) == 12:
+        return make_states_result
+    if len(make_states_result) == 9:
+        (
+            rng,
+            env,
+            env_params,
+            benchmark,
+            init_hstate,
+            train_state,
+            emitted_code,
+            dense_path,
+            ctx_fn_used,
+        ) = make_states_result
+        return (
+            rng,
+            env,
+            env_params,
+            benchmark,
+            init_hstate,
+            train_state,
+            emitted_code,
+            "",
+            dense_path,
+            None,
+            {},
+            ctx_fn_used,
+        )
+    raise ValueError(
+        "make_states returned an unexpected tuple shape. "
+        f"Expected 12 items (current contract) or 9 items (legacy test stubs), "
+        f"got {len(make_states_result)}."
+    )
 
 
 RewardMode = Literal["dense", "sparse"]
@@ -54,8 +126,10 @@ class TrainingResult:
     artifacts: Mapping[str, str]
     final_metrics: Mapping[str, float]
     emitted_reward_code: str
+    raw_reward_code: str = ""
     reward_mode: RewardMode = "dense"
     ground_truth_eval: Optional[Mapping[str, Any]] = None
+    reward_validation: Optional[Mapping[str, Any]] = None
 
 
 # ======================
@@ -526,7 +600,10 @@ def make_states(
     env_params = env_params.replace(ruleset=example_ruleset)
 
     emitted_code = ""
+    raw_reward_code = ""
     dense_path = ""
+    reward_validation: Optional[Mapping[str, Any]] = None
+    generated_artifact_paths: dict[str, str] = {}
     ctx_fn_used = ctx_fn if reward_mode == "dense" else None
 
     if reward_mode == "dense":
@@ -534,12 +611,23 @@ def make_states(
             raise ValueError(
                 "reward_generator must be provided for dense training runs"
             )
-        dense_reward, emitted_code = reward_generator.generate(env, env_params)
-        os.makedirs(output_dir, exist_ok=True)
-        dense_path = os.path.join(output_dir, "dense_reward_synthesized.py")
-        with open(dense_path, "w", encoding="utf-8") as f:
-            f.write(emitted_code)
-        env = DesparsifyRewardWrapper(env, dense_fn=dense_reward, ctx_fn=ctx_fn)
+        generated_reward = reward_generator.generate(env, env_params)
+        emitted_code = generated_reward.sanitized_code
+        raw_reward_code = generated_reward.raw_code
+        reward_validation = generated_reward.validation.to_dict()
+        generated_artifact_paths = persist_generated_reward_artifacts(
+            Path(output_dir),
+            generated_reward,
+        )
+        dense_path = generated_artifact_paths["dense_reward_path"]
+        failure_reason = reward_validation.get("failure_reason")
+        if failure_reason:
+            raise ValueError(str(failure_reason))
+        env = DesparsifyRewardWrapper(
+            env,
+            dense_fn=generated_reward.dense_fn,
+            ctx_fn=ctx_fn,
+        )
     else:
         os.makedirs(output_dir, exist_ok=True)
 
@@ -590,7 +678,10 @@ def make_states(
         init_hstate,
         train_state,
         emitted_code,
+        raw_reward_code,
         dense_path,
+        reward_validation,
+        generated_artifact_paths,
         ctx_fn_used,
     )
 
@@ -1308,14 +1399,19 @@ def run_training_with_reward(
         init_hstate,
         train_state,
         emitted_code,
+        raw_reward_code,
         dense_path,
+        reward_validation,
+        generated_artifact_paths,
         ctx_fn_used,
-    ) = make_states(
-        config,
-        reward_generator,
-        output_dir,
-        ctx_fn=ctx_fn_to_use,
-        reward_mode=reward_mode,
+    ) = _normalize_make_states_result(
+        make_states(
+            config,
+            reward_generator,
+            output_dir,
+            ctx_fn=ctx_fn_to_use,
+            reward_mode=reward_mode,
+        )
     )
     reward_sha16 = (
         hashlib.sha256(emitted_code.encode("utf-8")).hexdigest()[:16]
@@ -1529,6 +1625,10 @@ def run_training_with_reward(
 
     artifacts = {
         "dense_reward_path": dense_path,
+        "dense_reward_raw_response": generated_artifact_paths.get(
+            "dense_reward_raw_response",
+            "",
+        ),
         "training_curve_ground_truth": gt_curve_path,
         "training_curve_dense": dense_curve_path,
         "training_curve_combined": combined_curve_path,
@@ -1540,6 +1640,7 @@ def run_training_with_reward(
         "reward_mode": reward_mode,
         "ground_truth_metrics_csv": "",
         "ground_truth_summary": "",
+        "reward_validation": generated_artifact_paths.get("reward_validation", ""),
     }
 
     return TrainingResult(
@@ -1548,6 +1649,8 @@ def run_training_with_reward(
         artifacts=artifacts,
         final_metrics=final_metrics,
         emitted_reward_code=emitted_code,
+        raw_reward_code=raw_reward_code,
         reward_mode=reward_mode,
         ground_truth_eval=ground_truth_eval,
+        reward_validation=reward_validation,
     )

@@ -85,3 +85,32 @@ def dense_reward(env_params, ts_prev, action, ts_next, ctx):
     assert diagnostics.referenced_object_keys == ("red_key",)
     assert diagnostics.task_object_keys == ("blue_square", "green_pyramid")
     assert diagnostics.missing_from_task == ("red_key",)
+
+
+def test_reward_key_diagnostics_extracts_objects_from_natural_language_goal() -> None:
+    """Treat goal sentences as the authoritative source of task object names.
+
+    This regression test guards the newer natural-language parsing path used by
+    hard candidate validation. It is needed because the environment description
+    now contains many non-goal object names, and diagnostics should still focus
+    on the actual goal objects named in the generated task/success sentences.
+    """
+
+    reward_code = """
+def dense_reward(env_params, ts_prev, action, ts_next, ctx):
+    object_positions = ctx.get("object_positions", {})
+    _ = object_positions.get("red_ball", jnp.array([-1, -1], dtype=jnp.int32))
+    _ = object_positions.get("brown_hexagon", jnp.array([-1, -1], dtype=jnp.int32))
+    reward_components = {"progress": jnp.asarray(0.0, dtype=jnp.float32)}
+    return reward_components["progress"], reward_components
+"""
+    env_text = (
+        "Initial objects include: green goal, blue key, red ball, brown hexagon. "
+        "Your task is to place the red ball immediately left of the brown hexagon. "
+        "Success when the red ball is exactly one cell left of the brown hexagon."
+    )
+
+    diagnostics = build_reward_object_key_diagnostics(reward_code, env_text)
+
+    assert diagnostics.task_object_keys == ("brown_hexagon", "red_ball")
+    assert diagnostics.missing_from_task == ()

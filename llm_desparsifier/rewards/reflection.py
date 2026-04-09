@@ -7,7 +7,7 @@ from typing import Any, Mapping, Optional
 import dspy
 import numpy as np
 
-from llm_desparsifier.rewards.llm_client import configure_portkey_lm
+from llm_desparsifier.rewards.llm_client import configure_gemini_lm
 
 EUREKA_GUIDANCE = (
     "You are the Reward Reflection module, your job is to reflect on the current generated reward function."
@@ -48,7 +48,7 @@ def create_reward_reflection_module(lm: Optional[dspy.LM] = None) -> dspy.Module
     """Create a DSPy module that will emit EUREKA-style reflections."""
 
     if lm is None:
-        lm = configure_portkey_lm()
+        lm = configure_gemini_lm()
     dspy.configure(lm=lm)
     return dspy.ChainOfThought(RewardReflectionSignature)
 

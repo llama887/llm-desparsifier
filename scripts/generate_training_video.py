@@ -17,9 +17,22 @@ import imageio.v2 as imageio
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from llm_desparsifier.search.astar import (
+    AStarPlanResult as SharedAStarPlanResult,
+)
+from llm_desparsifier.search.astar import (
+    estimate_dense_qmax,
+    extract_step_reward_details,
+    is_sparse_success,
+    plan_with_astar,
+    state_cache_key_from_timestep,
+)
+
 DEFAULT_STATE_ROOT = Path("artifacts/gepa_state")
 TRAJECTORY_FILENAME = "eval_trajectory.json"
 DENSE_REWARD_FILENAME = "dense_reward_synthesized.py"
+TASK_INSTANCE_FILENAME = "task_instance.json"
+ASTAR_PLAN_FILENAME = "astar_plan.json"
 DEFAULT_VIDEO_NAME = "training_video.mp4"
 DEFAULT_TRACE_NAME = "training_video_trace.json"
 DEFAULT_ASTAR_HEURISTIC_VIDEO_NAME = "training_video_astar_heuristic.mp4"
@@ -43,6 +56,27 @@ OVERLAY_PLOT_MARGIN = 8
 OVERLAY_PLOT_LINE_WIDTH = 2
 OVERLAY_PLOT_LABEL_PAD = 4
 CPU_FALLBACK_REEXEC_FLAG = "LLM_DESPARSIFIER_VIDEO_CPU_FALLBACK_DONE"
+
+
+@dataclass(frozen=True)
+class _HeuristicOnlyNode:
+    """Store one explored node for video-local `h_only` A* planning.
+
+    This record keeps the minimal ancestry and score data required to run the
+    generate-video planner with a state-only dense heuristic. It is needed
+    because the video workflow now intentionally diverges from the shared A*
+    implementation by using dense reward only as `h(state)` while preserving
+    deterministic path reconstruction, and it differs from the shared search
+    node type by fixing `g` to zero for all nodes instead of tracking path
+    length.
+    """
+
+    key: bytes
+    timestep: Any
+    parent_key: bytes | None
+    parent_action: int | None
+    h_cost: float
+    f_cost: float
 
 
 def _is_cuda_backend_init_error(exc: BaseException) -> bool:
@@ -157,6 +191,11 @@ def parse_args() -> argparse.Namespace:
         help="Output trace JSON path (default: <run_dir>/training_video_trace.json)",
     )
     parser.add_argument(
+        "--astar",
+        action="store_true",
+        help="Enable A* rollout video/trace generation",
+    )
+    parser.add_argument(
         "--astar-heuristic-output",
         type=Path,
         default=None,
@@ -191,11 +230,6 @@ def parse_args() -> argparse.Namespace:
             "Output A* no-heuristic trace JSON path "
             "(default: <run_dir>/training_video_astar_no_heuristic_trace.json)"
         ),
-    )
-    parser.add_argument(
-        "--no-astar-video",
-        action="store_true",
-        help="Disable A* rollout video/trace generation",
     )
     parser.add_argument(
         "--astar-max-nodes",
@@ -244,6 +278,56 @@ def _load_json(path: Path) -> dict:
         raise ValueError(f"Failed to read JSON from {path}") from exc
 
 
+def _load_replay_payload(run_dir: Path) -> dict[str, Any]:
+    """Load replay input from either the legacy or heuristic-only artifact set.
+
+    This helper preserves backwards compatibility with legacy
+    `eval_trajectory.json` runs while allowing the refactored heuristic pipeline
+    to replay directly from `task_instance.json` plus `astar_plan.json`. It is
+    needed because the renderer must support both artifact generations during the
+    transition, and it differs from direct trajectory loading by synthesizing the
+    legacy replay shape when only the new files are present.
+    """
+
+    trajectory_path = run_dir / TRAJECTORY_FILENAME
+    try:
+        return _load_json(trajectory_path)
+    except (FileNotFoundError, ValueError):
+        pass
+    task_instance_path = run_dir / TASK_INSTANCE_FILENAME
+    astar_plan_path = run_dir / ASTAR_PLAN_FILENAME
+    try:
+        task_instance = _load_json(task_instance_path)
+        astar_plan = _load_json(astar_plan_path)
+        reset_payload = task_instance.get("reset_payload", {})
+        return {
+            "version": 2,
+            "env_id": task_instance["env_id"],
+            "benchmark_id": task_instance["benchmark_id"],
+            "deterministic_rulesets": True,
+            "fixed_ruleset_seed": task_instance.get("ruleset_seed"),
+            "ruleset_index": None,
+            "ruleset_key": None,
+            "reset_key": reset_payload.get("reset_key", task_instance.get("reset_key", [0, 0])),
+            "episode_index": 0,
+            "episode_length": len(astar_plan.get("actions", [])),
+            "episode_return": 0.0,
+            "actions": astar_plan.get("actions", []),
+            "num_eval_episodes": 1,
+            "eval_seed": task_instance.get("seed"),
+            "env_seed": task_instance.get("seed"),
+            "env_text": task_instance.get("ruleset_text", task_instance.get("goal_description")),
+            "img_obs": False,
+            "search_stats": _load_json(run_dir / "astar_search_stats.json").get("aggregate_stats", {}),
+        }
+    except (FileNotFoundError, ValueError):
+        pass
+    raise FileNotFoundError(
+        f"Missing replay artifacts in {run_dir}; expected either {TRAJECTORY_FILENAME} "
+        f"or {TASK_INSTANCE_FILENAME} + {ASTAR_PLAN_FILENAME}"
+    )
+
+
 def _list_candidate_runs(state_root: Path) -> list[Path]:
     """List replayable GEPA candidate run directories ordered by recency.
 
@@ -260,21 +344,28 @@ def _list_candidate_runs(state_root: Path) -> list[Path]:
     Returns:
         Candidate run directories sorted from most recently modified to oldest.
     """
-    runs_root = state_root / "gepa_runs"
-    if not runs_root.exists():
-        raise FileNotFoundError(f"Missing gepa_runs directory under {state_root}")
+    candidate_roots = [
+        state_root / "gepa_runs",
+        state_root / "heuristic_runs",
+    ]
     candidates: list[Path] = []
-    for path in runs_root.rglob(TRAJECTORY_FILENAME):
-        run_dir = path.parent
-        if not run_dir.name.startswith("candidate-"):
+    for runs_root in candidate_roots:
+        if not runs_root.exists():
             continue
-        if (run_dir / DENSE_REWARD_FILENAME).exists():
-            candidates.append(run_dir)
+        for path in runs_root.rglob(TRAJECTORY_FILENAME):
+            run_dir = path.parent
+            if run_dir.name.startswith("candidate-"):
+                candidates.append(run_dir)
+        for path in runs_root.rglob(ASTAR_PLAN_FILENAME):
+            run_dir = path.parent
+            if run_dir.name.startswith("candidate-"):
+                candidates.append(run_dir)
+    candidates = sorted(set(candidates), key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
         raise FileNotFoundError(
-            f"No run directories with {TRAJECTORY_FILENAME} found under {runs_root}"
+            f"No replayable candidate runs found under {state_root}"
         )
-    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates
 
 
 def _select_latest_run(state_root: Path) -> Path:
@@ -320,12 +411,15 @@ def _resolve_run_dir(state_root: Path, run_dir: Path | None) -> Path:
     resolved = (
         run_dir.expanduser().resolve() if run_dir else _select_latest_run(state_root)
     )
-    trajectory_path = resolved / TRAJECTORY_FILENAME
-    reward_path = resolved / DENSE_REWARD_FILENAME
-    if not trajectory_path.exists():
-        raise FileNotFoundError(f"Missing {TRAJECTORY_FILENAME} in {resolved}")
-    if not reward_path.exists():
-        raise FileNotFoundError(f"Missing {DENSE_REWARD_FILENAME} in {resolved}")
+    has_legacy = (resolved / TRAJECTORY_FILENAME).exists()
+    has_heuristic = (resolved / TASK_INSTANCE_FILENAME).exists() and (
+        resolved / ASTAR_PLAN_FILENAME
+    ).exists()
+    if not has_legacy and not has_heuristic:
+        raise FileNotFoundError(
+            f"Missing replay artifacts in {resolved}; expected {TRAJECTORY_FILENAME} "
+            f"or {TASK_INSTANCE_FILENAME} + {ASTAR_PLAN_FILENAME}"
+        )
     return resolved
 
 
@@ -474,21 +568,87 @@ def _format_overlay_lines(
     return lines
 
 
-def _build_astar_overlay_status_lines(search_stats: Mapping[str, Any]) -> list[str]:
-    """Build concise overlay lines summarizing A* search completion status.
+def _format_heuristic_comparison_verdict(verdict: str) -> str:
+    """Convert a structured heuristic-comparison verdict into sidebar text.
+
+    This helper maps the JSON-stable verdict codes stored in
+    `heuristic_comparison` onto concise human-readable strings for overlays and
+    logs. It is needed because the comparison payload should remain structured
+    and machine-friendly while the rendered video should read naturally, and it
+    differs from inlining string replacements by keeping the wording consistent
+    everywhere the verdict is shown.
+
+    Args:
+        verdict: Structured comparison verdict emitted by
+            `_build_heuristic_comparison_payload`.
+
+    Returns:
+        Short human-readable label suitable for the video sidebar.
+    """
+    verdict_map = {
+        "heuristic_faster": "heuristic faster",
+        "heuristic_slower": "heuristic slower",
+        "same_search_outcome": "same search outcome",
+    }
+    return verdict_map.get(verdict, verdict.replace("_", " "))
+
+
+def _classify_heuristic_comparison_verdict(
+    *,
+    baseline_solved: bool,
+    heuristic_solved: bool,
+    baseline_expanded: int,
+    heuristic_expanded: int,
+) -> str:
+    """Classify whether heuristic A* did better, worse, or the same.
+
+    This helper implements the comparison contract shared by the video sidebar,
+    trace payload, and batch stdout summary. It is needed because the project
+    now wants one explicit verdict derived from solve status first and then
+    `expanded_states`, and it differs from `_format_heuristic_comparison_verdict`
+    by returning the structured machine-readable code rather than display text.
+
+    Args:
+        baseline_solved: Whether the no-heuristic baseline solved the task.
+        heuristic_solved: Whether the dense-heuristic A* run solved the task.
+        baseline_expanded: Expanded-state count for the no-heuristic baseline.
+        heuristic_expanded: Expanded-state count for the dense-heuristic run.
+
+    Returns:
+        Structured verdict string: `heuristic_faster`,
+        `heuristic_slower`, or `same_search_outcome`.
+    """
+    if heuristic_solved != baseline_solved:
+        return "heuristic_faster" if heuristic_solved else "heuristic_slower"
+    if heuristic_expanded < baseline_expanded:
+        return "heuristic_faster"
+    if heuristic_expanded > baseline_expanded:
+        return "heuristic_slower"
+    return "same_search_outcome"
+
+
+def _build_astar_overlay_status_lines(
+    search_stats: Mapping[str, Any],
+    *,
+    heuristic_comparison: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Build concise overlay lines summarizing A* search status and comparison.
 
     This helper converts planner-level `search_stats` into short text rows that
     can be rendered on every video frame. It is needed because users should see
     directly in the MP4 whether A* solved the task or stopped due to budget
-    limits, and it differs from trace-only diagnostics by exposing completion
-    state in the visual artifact itself.
+    limits, and now also whether the heuristic beat the no-heuristic baseline.
+    It differs from trace-only diagnostics by exposing both completion state and
+    the shared cross-rollout verdict directly in the visual artifact itself.
 
     Args:
         search_stats: Planner summary dictionary attached by A* selector factory.
+        heuristic_comparison: Optional cross-rollout comparison payload shared by
+            the heuristic and no-heuristic A* videos for the same candidate.
 
     Returns:
-        Ordered status lines describing solve state plus searched-state counts
-        and the generated/expanded state breakdown.
+        Ordered status lines describing the heuristic comparison verdict, solve
+        state, and generated/expanded state counts.
     """
     solved = bool(search_stats.get("solved", False))
     reason = str(search_stats.get("terminated_reason", "unknown"))
@@ -496,10 +656,27 @@ def _build_astar_overlay_status_lines(search_stats: Mapping[str, Any]) -> list[s
     expanded = int(search_stats.get("expanded_states", 0))
     searched = generated
     status = f"solved ({searched} searched)" if solved else "terminated_early"
-    return [
-        f"astar {status} ({reason})",
-        f"states gen={generated} exp={expanded}",
-    ]
+
+    lines: list[str] = []
+    if isinstance(heuristic_comparison, Mapping):
+        verdict = _format_heuristic_comparison_verdict(
+            str(heuristic_comparison.get("comparison_verdict", "same_search_outcome"))
+        )
+        heuristic_expanded = int(heuristic_comparison.get("heuristic_expanded_states", 0))
+        baseline_expanded = int(heuristic_comparison.get("baseline_expanded_states", 0))
+        lines.extend(
+            [
+                f"compare {verdict}",
+                f"expanded heur={heuristic_expanded} base={baseline_expanded}",
+            ]
+        )
+    lines.extend(
+        [
+            f"astar {status} ({reason})",
+            f"states gen={generated} exp={expanded}",
+        ]
+    )
+    return lines
 
 
 def _wrap_overlay_goal_line(env_summary: str, *, max_chars: int) -> list[str]:
@@ -789,9 +966,11 @@ def _load_dense_reward(run_dir: Path) -> Any:
     from training-time reward generation by skipping LLM synthesis and relying
     on the cached code artifact.
     """
+    reward_path = run_dir / DENSE_REWARD_FILENAME
+    if not reward_path.exists():
+        return None
     from llm_desparsifier.rewards.sanitizer import sanitize_and_compile
 
-    reward_path = run_dir / DENSE_REWARD_FILENAME
     code = reward_path.read_text(encoding="utf-8")
     return sanitize_and_compile(code)
 
@@ -815,6 +994,8 @@ def _wrap_env_with_dense_reward(
     Returns:
         The wrapped replay environment with dense diagnostics enabled.
     """
+    if dense_reward_fn is None:
+        return env
     from llm_desparsifier.rl.wrappers import DesparsifyRewardWrapper
     from llm_desparsifier.utils import extract_xland_ctx
 
@@ -955,35 +1136,14 @@ class _ActionSelectorBundle:
 
 
 @dataclass
-class _AStarNode:
-    """Node record used by the local deterministic A* planner.
-
-    This immutable node stores parent linkage and search scores needed to
-    reconstruct an action sequence once a solved (or best-effort fallback) node
-    is selected. It is needed because the rollout video requires full action
-    plans, and it differs from transient heap entries by preserving state
-    identity, cumulative cost, heuristic score, and the action that reached the
-    node in a traceable structure.
-    """
-
-    key: bytes
-    timestep: Any
-    parent_key: bytes | None
-    parent_action: int | None
-    g_cost: int
-    h_cost: float
-    f_cost: float
-
-
-@dataclass
 class _AStarPlanResult:
-    """Search output containing planned actions and instrumentation counters.
+    """Video-local wrapper around the shared A* plan result.
 
-    This result object bridges A* planning and rollout rendering by packaging
-    both the action sequence and run-level search metrics. It is needed because
-    the video trace must show whether heuristics reduced search work, and it
-    differs from returning only actions by including generated/expanded counts,
-    termination reason, and optional per-step selection annotations.
+    This wrapper preserves the rollout-script-specific per-step selection
+    annotations while delegating the actual search to the shared planner. It is
+    needed because the video trace schema records one annotation per replayed
+    action, and it differs from the shared planner result by adding only these
+    render-time annotations.
     """
 
     actions: list[int]
@@ -1049,18 +1209,7 @@ def _extract_step_reward_details(timestep: Any) -> tuple[float, float, dict[str,
         Tuple of `(dense_reward, sparse_reward, reward_components_raw)` where
         sparse defaults to dense and components default to an empty mapping.
     """
-    import jax.numpy as jnp
-
-    extras = getattr(timestep, "extras", None)
-    dense_reward_value = float(jnp.asarray(timestep.reward))
-    sparse_reward_value = dense_reward_value
-    reward_components: dict[str, Any] = {}
-    if extras is not None:
-        sparse_reward_value = float(
-            jnp.asarray(extras.get("ground_truth_reward", dense_reward_value))
-        )
-        reward_components = extras.get("reward_components") or {}
-    return dense_reward_value, sparse_reward_value, reward_components
+    return extract_step_reward_details(timestep)
 
 
 def _update_rollout_accumulators(
@@ -1138,100 +1287,6 @@ def _trajectory_action_selector(
     return _ActionSelectorBundle(selector=selector, trace_metadata=None)
 
 
-def _state_cache_key_from_timestep(timestep: Any) -> bytes:
-    """Build a stable hashable key from the environment state pytree leaves.
-
-    This helper converts replay state tensors into a bytes key suitable for
-    Python dict/set indexing during graph search. It is needed because A*
-    requires revisitation checks on logically identical states, and it differs
-    from object-identity hashing by using raw tensor values (plus dtype/shape)
-    so keys remain deterministic across JAX wrapper objects.
-    """
-    import jax
-
-    leaves = []
-    for leaf in jax.tree_util.tree_leaves(timestep.state):
-        try:
-            arr = np.asarray(leaf)
-        except TypeError:
-            # PRNG typed keys cannot be converted directly; use raw key words.
-            arr = np.asarray(jax.random.key_data(leaf))
-        leaves.append(
-            arr.dtype.str.encode("ascii")
-            + b"|"
-            + str(arr.shape).encode("ascii")
-            + b"|"
-            + arr.tobytes()
-            + b";"
-        )
-    return b"".join(leaves)
-
-
-def _is_sparse_success(timestep: Any) -> bool:
-    """Return whether a timestep satisfies sparse success semantics.
-
-    This helper enforces the same solve criterion used in evaluation (`sparse >
-    0`) so A* plan termination aligns with training metrics. It is needed
-    because dense shaping rewards can be positive on non-solved states, and it
-    differs from `timestep.last()` checks by targeting ground-truth task success
-    rather than generic episode termination.
-    """
-    _, sparse_reward_value, _ = _extract_step_reward_details(timestep)
-    return sparse_reward_value > 0.0
-
-
-def _estimate_dense_qmax(
-    *,
-    env: Any,
-    timestep: Any,
-    step_fn: Any,
-    env_params: Any,
-) -> float:
-    """Estimate max one-step dense reward from a state for heuristic shaping.
-
-    This helper evaluates all discrete actions and returns the maximal immediate
-    dense reward. It is needed because the dense-heuristic A* mode derives a
-    non-negative distance proxy from reward advantage relative to the root
-    state, and it differs from rollout action selection by serving only as a
-    heuristic estimate while preserving full A* graph expansion.
-    """
-    import jax.numpy as jnp
-
-    num_actions = int(env.num_actions(env_params))
-    if num_actions <= 0:
-        return 0.0
-    best = float("-inf")
-    for action_value in range(num_actions):
-        next_ts = step_fn(env_params, timestep, jnp.asarray(action_value))
-        candidate_dense = float(jnp.asarray(next_ts.reward))
-        best = max(best, candidate_dense)
-    if best == float("-inf"):
-        return 0.0
-    return best
-
-
-def _reconstruct_action_path(
-    nodes: dict[bytes, _AStarNode],
-    leaf_key: bytes,
-) -> list[int]:
-    """Reconstruct ordered actions from root to the given node key.
-
-    This helper walks parent links produced during A* expansion and returns a
-    forward action sequence for rollout playback. It is needed because search
-    stores ancestry incrementally for memory efficiency, and it differs from
-    storing full path vectors per node by keeping planner memory usage bounded.
-    """
-    actions: list[int] = []
-    current_key: bytes | None = leaf_key
-    while current_key is not None:
-        node = nodes[current_key]
-        if node.parent_action is not None:
-            actions.append(int(node.parent_action))
-        current_key = node.parent_key
-    actions.reverse()
-    return actions
-
-
 def _plan_with_astar(
     *,
     env: Any,
@@ -1242,123 +1297,36 @@ def _plan_with_astar(
     max_nodes: int,
     max_expansions: int,
 ) -> _AStarPlanResult:
-    """Plan an action sequence with deterministic A* and collect search stats.
+    """Plan an action sequence with deterministic A* and local trace metadata.
 
-    This planner performs graph search from the replay reset state, terminating
-    when sparse success is discovered or configured search budgets are reached.
-    It is needed to replace local one-step action selection with global
-    lookahead, and it differs from JAxtar's fully JAX-batched implementation by
-    using a Python priority queue for robustness in this script while keeping
-    the same A* semantics and diagnostic metrics expected by downstream traces.
+    This wrapper uses the shared planner for the no-heuristic baseline but runs
+    a video-local `h_only` planner when dense guidance is enabled so the search
+    priority reflects state-only dense desirability rather than path-length-plus
+    proxy cost. It is needed because the user wants to inspect `h_only`
+    behavior specifically in generate-video diagnostics, and it differs from
+    `llm_desparsifier.search.plan_with_astar` by swapping in that local
+    heuristic-only formulation while still returning the same trace shape.
     """
-    import jax.numpy as jnp
-
-    if max_nodes <= 0:
-        raise ValueError("max_nodes must be > 0")
-    if max_expansions <= 0:
-        raise ValueError("max_expansions must be > 0")
-
-    num_actions = int(env.num_actions(env_params))
-    if num_actions <= 0:
-        raise ValueError("Environment returned zero actions for A* search")
-
-    root_key = _state_cache_key_from_timestep(root_timestep)
-    root_qmax = _estimate_dense_qmax(
-        env=env,
-        timestep=root_timestep,
-        step_fn=step_fn,
-        env_params=env_params,
-    )
-    root_h = 0.0
-    nodes: dict[bytes, _AStarNode] = {
-        root_key: _AStarNode(
-            key=root_key,
-            timestep=root_timestep,
-            parent_key=None,
-            parent_action=None,
-            g_cost=0,
-            h_cost=root_h,
-            f_cost=root_h,
+    shared_plan = (
+        _plan_with_h_only_astar(
+            env=env,
+            env_params=env_params,
+            step_fn=step_fn,
+            root_timestep=root_timestep,
+            max_nodes=max_nodes,
+            max_expansions=max_expansions,
         )
-    }
-    best_g: dict[bytes, int] = {root_key: 0}
-    heuristic_cache: dict[bytes, float] = {root_key: root_qmax}
-    open_heap: list[tuple[float, int, bytes]] = [(0.0, 0, root_key)]
-    tie_counter = 1
-    expanded_states = 0
-    termination_reason = "open_set_exhausted"
-    solved_key: bytes | None = None
-    best_fallback_key = root_key
-
-    while open_heap:
-        current_f, _, current_key = heapq.heappop(open_heap)
-        current_node = nodes[current_key]
-        current_best_g = best_g.get(current_key)
-        if current_best_g is None or current_best_g != current_node.g_cost:
-            continue
-        if current_f > current_node.f_cost + 1e-8:
-            continue
-
-        expanded_states += 1
-        best_fallback_key = current_key
-        if expanded_states > max_expansions:
-            termination_reason = "max_expansions_reached"
-            break
-        if _is_sparse_success(current_node.timestep):
-            solved_key = current_key
-            termination_reason = "solved"
-            break
-        if bool(current_node.timestep.last()):
-            continue
-
-        for action_value in range(num_actions):
-            next_ts = step_fn(env_params, current_node.timestep, jnp.asarray(action_value))
-            next_key = _state_cache_key_from_timestep(next_ts)
-            next_g = current_node.g_cost + 1
-            prev_best = best_g.get(next_key)
-            if prev_best is not None and next_g >= prev_best:
-                continue
-            if prev_best is None and len(nodes) >= max_nodes:
-                termination_reason = "max_nodes_reached"
-                break
-
-            qmax = heuristic_cache.get(next_key)
-            if qmax is None:
-                qmax = _estimate_dense_qmax(
-                    env=env,
-                    timestep=next_ts,
-                    step_fn=step_fn,
-                    env_params=env_params,
-                )
-                heuristic_cache[next_key] = qmax
-            h_value = max(0.0, root_qmax - qmax) if use_dense_heuristic else 0.0
-            f_value = float(next_g) + float(h_value)
-
-            best_g[next_key] = next_g
-            nodes[next_key] = _AStarNode(
-                key=next_key,
-                timestep=next_ts,
-                parent_key=current_key,
-                parent_action=action_value,
-                g_cost=next_g,
-                h_cost=h_value,
-                f_cost=f_value,
-            )
-            heapq.heappush(open_heap, (f_value, tie_counter, next_key))
-            tie_counter += 1
-            if _is_sparse_success(next_ts):
-                solved_key = next_key
-                termination_reason = "solved"
-                break
-
-        if solved_key is not None or termination_reason == "max_nodes_reached":
-            break
-
-    final_key = solved_key if solved_key is not None else best_fallback_key
-    planned_actions = _reconstruct_action_path(nodes, final_key)
-    final_node = nodes[final_key]
-    final_dense, final_sparse, _ = _extract_step_reward_details(final_node.timestep)
-
+        if use_dense_heuristic
+        else plan_with_astar(
+            env=env,
+            env_params=env_params,
+            step_fn=step_fn,
+            root_timestep=root_timestep,
+            use_dense_heuristic=False,
+            max_nodes=max_nodes,
+            max_expansions=max_expansions,
+        )
+    )
     per_step_selection = [
         {
             "policy": "astar_plan",
@@ -1372,28 +1340,175 @@ def _plan_with_astar(
             "tie_break": ASTAR_TIE_BREAK,
             "source": "planned_path",
         }
-        for idx, action_value in enumerate(planned_actions)
+        for idx, action_value in enumerate(shared_plan.actions)
     ]
-
-    search_stats = {
-        "planner": "python_astar_dense_proxy",
-        "solved": solved_key is not None,
-        "terminated_reason": termination_reason,
-        "generated_states": int(len(nodes)),
-        "expanded_states": int(expanded_states),
-        "max_nodes": int(max_nodes),
-        "max_expansions": int(max_expansions),
-        "solution_length": int(len(planned_actions)),
-        "solution_cost": int(len(planned_actions)),
-        "final_dense_reward": float(final_dense),
-        "final_sparse_reward": float(final_sparse),
-        "use_dense_heuristic": bool(use_dense_heuristic),
-        "heuristic_reference_qmax": float(root_qmax),
-    }
     return _AStarPlanResult(
-        actions=planned_actions,
+        actions=list(shared_plan.actions),
         per_step_selection=per_step_selection,
-        search_stats=search_stats,
+        search_stats=dict(shared_plan.search_stats),
+    )
+
+
+def _reconstruct_h_only_path(
+    nodes: dict[bytes, _HeuristicOnlyNode], leaf_key: bytes
+) -> list[int]:
+    """Reconstruct the chosen action sequence for the video-local `h_only` run.
+
+    This helper walks parent links emitted by `_plan_with_h_only_astar` so the
+    video overlay and trace can reuse the exact same planned action list format
+    used everywhere else in the script. It is needed because the local
+    heuristic-only planner stores ancestry incrementally instead of copying
+    prefixes at each node, and it differs from the shared search helper by
+    operating on the video-local node type.
+    """
+
+    actions: list[int] = []
+    current_key: bytes | None = leaf_key
+    while current_key is not None:
+        node = nodes[current_key]
+        if node.parent_action is not None:
+            actions.append(int(node.parent_action))
+        current_key = node.parent_key
+    actions.reverse()
+    return actions
+
+
+def _plan_with_h_only_astar(
+    *,
+    env: Any,
+    env_params: Any,
+    step_fn: Any,
+    root_timestep: Any,
+    max_nodes: int,
+    max_expansions: int,
+) -> SharedAStarPlanResult:
+    """Plan with dense reward used only as state heuristic `h(state)`.
+
+    This helper implements the generate-video-specific planner variant requested
+    by the user: zero path cost and `h(state) = -max_a dense_reward(state, a)`.
+    It is needed because the video diagnostics should now visualize that
+    heuristic-only formulation directly, and it differs from the shared planner
+    by removing path-length accumulation entirely from the heuristic-enabled
+    path while leaving sparse success checks and replay determinism unchanged.
+    """
+
+    import jax.numpy as jnp
+
+    if max_nodes <= 0:
+        raise ValueError("max_nodes must be > 0")
+    if max_expansions <= 0:
+        raise ValueError("max_expansions must be > 0")
+
+    num_actions = int(env.num_actions(env_params))
+    if num_actions <= 0:
+        raise ValueError("Environment returned zero actions for A* search")
+
+    root_key = state_cache_key_from_timestep(root_timestep)
+    root_h = -float(
+        estimate_dense_qmax(
+            env=env,
+            timestep=root_timestep,
+            step_fn=step_fn,
+            env_params=env_params,
+        )
+    )
+    nodes: dict[bytes, _HeuristicOnlyNode] = {
+        root_key: _HeuristicOnlyNode(
+            key=root_key,
+            timestep=root_timestep,
+            parent_key=None,
+            parent_action=None,
+            h_cost=root_h,
+            f_cost=root_h,
+        )
+    }
+    seen_keys: set[bytes] = {root_key}
+    heuristic_cache: dict[bytes, float] = {root_key: root_h}
+    open_heap: list[tuple[float, int, bytes]] = [(root_h, 0, root_key)]
+    tie_counter = 1
+    expanded_states = 0
+    termination_reason = "open_set_exhausted"
+    solved_key: bytes | None = None
+    best_fallback_key = root_key
+
+    while open_heap:
+        current_f, _, current_key = heapq.heappop(open_heap)
+        current_node = nodes[current_key]
+        if current_f > current_node.f_cost + 1e-8:
+            continue
+
+        expanded_states += 1
+        best_fallback_key = current_key
+        if expanded_states > max_expansions:
+            termination_reason = "max_expansions_reached"
+            break
+        if is_sparse_success(current_node.timestep):
+            solved_key = current_key
+            termination_reason = "solved"
+            break
+        if bool(current_node.timestep.last()):
+            continue
+
+        for action_value in range(num_actions):
+            next_ts = step_fn(env_params, current_node.timestep, jnp.asarray(action_value))
+            next_key = state_cache_key_from_timestep(next_ts)
+            if next_key in seen_keys:
+                continue
+            if len(nodes) >= max_nodes:
+                termination_reason = "max_nodes_reached"
+                break
+
+            h_value = heuristic_cache.get(next_key)
+            if h_value is None:
+                h_value = -float(
+                    estimate_dense_qmax(
+                        env=env,
+                        timestep=next_ts,
+                        step_fn=step_fn,
+                        env_params=env_params,
+                    )
+                )
+                heuristic_cache[next_key] = h_value
+            nodes[next_key] = _HeuristicOnlyNode(
+                key=next_key,
+                timestep=next_ts,
+                parent_key=current_key,
+                parent_action=action_value,
+                h_cost=h_value,
+                f_cost=h_value,
+            )
+            seen_keys.add(next_key)
+            heapq.heappush(open_heap, (h_value, tie_counter, next_key))
+            tie_counter += 1
+            if is_sparse_success(next_ts):
+                solved_key = next_key
+                termination_reason = "solved"
+                break
+
+        if solved_key is not None or termination_reason == "max_nodes_reached":
+            break
+
+    final_key = solved_key if solved_key is not None else best_fallback_key
+    planned_actions = _reconstruct_h_only_path(nodes, final_key)
+    final_node = nodes[final_key]
+    final_dense, final_sparse, _ = extract_step_reward_details(final_node.timestep)
+    return SharedAStarPlanResult(
+        actions=planned_actions,
+        search_stats={
+            "planner": "python_astar_h_only_proxy",
+            "solved": solved_key is not None,
+            "terminated_reason": termination_reason,
+            "generated_states": int(len(nodes)),
+            "expanded_states": int(expanded_states),
+            "max_nodes": int(max_nodes),
+            "max_expansions": int(max_expansions),
+            "solution_length": int(len(planned_actions)),
+            "solution_cost": 0.0,
+            "final_dense_reward": float(final_dense),
+            "final_sparse_reward": float(final_sparse),
+            "use_dense_heuristic": True,
+            "heuristic_mode": "h_only",
+        },
     )
 
 
@@ -1427,6 +1542,67 @@ def _planned_action_selector(
     return selector
 
 
+def _build_astar_action_selector_bundle(
+    *,
+    context: _RolloutContext,
+    use_dense_heuristic: bool,
+    max_nodes: int,
+    max_expansions: int,
+    heuristic_comparison: Mapping[str, Any] | None = None,
+) -> _ActionSelectorBundle:
+    """Plan one A* rollout immediately and package replay-ready metadata.
+
+    This helper performs the deterministic A* search up front and converts the
+    result into the shared selector-bundle shape consumed by `_run_rollout_video`.
+    It is needed because the video script must now compare heuristic and
+    no-heuristic search outcomes before rendering either A* video so the shared
+    verdict can appear in both sidebars. It differs from
+    `_astar_action_selector_factory` by executing planning immediately instead
+    of deferring it until the render loop requests a selector.
+
+    Args:
+        context: Prepared rollout context describing the deterministic task
+            instance to plan against.
+        use_dense_heuristic: Whether the dense reward should define the A*
+            heuristic term.
+        max_nodes: Maximum number of unique states A* may generate.
+        max_expansions: Maximum number of states A* may expand from the open set.
+        heuristic_comparison: Optional shared comparison payload that should be
+            embedded into the resulting trace metadata and sidebar text.
+
+    Returns:
+        `_ActionSelectorBundle` containing a deterministic replay selector plus
+        planner search stats and optional cross-rollout comparison metadata.
+    """
+    initial_timestep = context.reset_fn(context.env_params, context.reset_key)
+    plan = _plan_with_astar(
+        env=context.env,
+        env_params=context.env_params,
+        step_fn=context.step_fn,
+        root_timestep=initial_timestep,
+        use_dense_heuristic=use_dense_heuristic,
+        max_nodes=max_nodes,
+        max_expansions=max_expansions,
+    )
+    mode_name = (
+        ROLLOUT_MODE_ASTAR_HEURISTIC
+        if use_dense_heuristic
+        else ROLLOUT_MODE_ASTAR_NO_HEURISTIC
+    )
+    selector = _planned_action_selector(
+        actions=plan.actions,
+        per_step_selection=plan.per_step_selection,
+        mode_name=mode_name,
+    )
+    trace_metadata: dict[str, Any] = {"search_stats": dict(plan.search_stats)}
+    if heuristic_comparison is not None:
+        trace_metadata["heuristic_comparison"] = dict(heuristic_comparison)
+    return _ActionSelectorBundle(
+        selector=selector,
+        trace_metadata=trace_metadata,
+    )
+
+
 def _astar_action_selector_factory(
     *,
     use_dense_heuristic: bool,
@@ -1440,34 +1616,44 @@ def _astar_action_selector_factory(
     because A* must plan against the wrapped dense-reward environment and then
     feed actions back into the same loop, and it differs from per-step selectors
     logic by solving a full search problem up front and exposing search-level
-    diagnostics in trace metadata.
+    diagnostics in trace metadata. It remains useful for single-plan execution,
+    while `_build_astar_action_selector_bundle` is used when callers need both
+    plans before rendering to derive a shared comparison verdict.
     """
 
     def builder(context: _RolloutContext) -> _ActionSelectorBundle:
-        initial_timestep = context.reset_fn(context.env_params, context.reset_key)
-        plan = _plan_with_astar(
-            env=context.env,
-            env_params=context.env_params,
-            step_fn=context.step_fn,
-            root_timestep=initial_timestep,
+        return _build_astar_action_selector_bundle(
+            context=context,
             use_dense_heuristic=use_dense_heuristic,
             max_nodes=max_nodes,
             max_expansions=max_expansions,
         )
-        mode_name = (
-            ROLLOUT_MODE_ASTAR_HEURISTIC
-            if use_dense_heuristic
-            else ROLLOUT_MODE_ASTAR_NO_HEURISTIC
-        )
-        selector = _planned_action_selector(
-            actions=plan.actions,
-            per_step_selection=plan.per_step_selection,
-            mode_name=mode_name,
-        )
-        return _ActionSelectorBundle(
-            selector=selector,
-            trace_metadata={"search_stats": plan.search_stats},
-        )
+
+    return builder
+
+
+def _preplanned_action_selector_factory(
+    bundle: _ActionSelectorBundle,
+) -> Callable[[_RolloutContext], _ActionSelectorBundle]:
+    """Return a selector factory that reuses one precomputed selector bundle.
+
+    This helper adapts an already planned selector bundle back into the
+    factory-shaped interface expected by `_run_rollout_video`. It is needed
+    because A* videos now precompute both plans before rendering so the shared
+    heuristic comparison can be shown in the sidebar, and it differs from the
+    normal planner factory by ignoring the render-time context and reusing the
+    exact preplanned actions and trace metadata.
+
+    Args:
+        bundle: Precomputed selector bundle to reuse during rendering.
+
+    Returns:
+        Factory callable that always returns `bundle`.
+    """
+
+    def builder(_context: _RolloutContext) -> _ActionSelectorBundle:
+        """Return the precomputed selector bundle unchanged."""
+        return bundle
 
     return builder
 
@@ -1562,6 +1748,12 @@ def _build_replay_reward_key_diagnostics(run_dir: Path, trajectory: dict) -> dic
         keys, task-described object keys, and any missing keys. On failure, the
         payload contains `diagnostics_error` so replay can proceed.
     """
+    if not (run_dir / DENSE_REWARD_FILENAME).exists():
+        return {
+            "referenced_object_keys": [],
+            "task_object_keys": [],
+            "missing_from_task": [],
+        }
     from llm_desparsifier.rewards import build_reward_object_key_diagnostics
 
     try:
@@ -1654,9 +1846,10 @@ def _run_rollout_video(
     This helper runs full replay rendering for one rollout strategy while
     handling trace writes on both success and failure. It is needed because the
     script now supports multiple rollout modes with identical rendering logic,
-    and it differs from the previous single-mode monolith by accepting a pluggable
-    action-selection function and returning an optional error for aggregated exit
-    handling in `main()`.
+    including preplanned A* bundles that already contain shared comparison
+    metadata for sidebar display. It differs from the previous single-mode
+    monolith by accepting a pluggable action-selection function and returning an
+    optional error for aggregated exit handling in `main()`.
 
     Args:
         run_dir: Candidate run directory containing replay artifacts.
@@ -1679,12 +1872,19 @@ def _run_rollout_video(
     action_selector = selector_bundle.selector
     rollout_status_lines: list[str] | None = None
     planned_length = None
-    search_stats = (selector_bundle.trace_metadata or {}).get("search_stats")
+    trace_metadata = selector_bundle.trace_metadata or {}
+    search_stats = trace_metadata.get("search_stats")
+    heuristic_comparison = trace_metadata.get("heuristic_comparison")
     if isinstance(search_stats, Mapping):
         maybe_length = search_stats.get("solution_length")
         if isinstance(maybe_length, int) and maybe_length >= 0:
             planned_length = maybe_length
-        rollout_status_lines = _build_astar_overlay_status_lines(search_stats)
+        rollout_status_lines = _build_astar_overlay_status_lines(
+            search_stats,
+            heuristic_comparison=(
+                heuristic_comparison if isinstance(heuristic_comparison, Mapping) else None
+            ),
+        )
     acc = _initialize_rollout_accumulators(context.dense_reward_fn)
     trace_steps: list[dict[str, Any]] = []
     replay_error: str | None = None
@@ -1804,9 +2004,10 @@ def _build_heuristic_comparison_payload(
     This helper compares no-heuristic and dense-heuristic A* search statistics
     and derives stable scalar metrics for user inspection. It is needed because
     heuristic impact should be explicit rather than inferred manually from two
-    separate traces, and it differs from per-run search stats by producing
-    direct deltas, convergence-speed classification, and shared-baseline
-    comparisons that can also be aggregated across many candidate runs.
+    separate traces or videos. It differs from per-run search stats by
+    producing direct deltas, a human-readable verdict based on solve status and
+    expanded-state count, and shared-baseline comparisons that can be rendered
+    inside both A* videos and aggregated across many candidate runs.
     """
     baseline_generated = int(baseline_search_stats.get("generated_states", 0))
     heuristic_generated = int(heuristic_search_stats.get("generated_states", 0))
@@ -1814,21 +2015,29 @@ def _build_heuristic_comparison_payload(
     reduction_pct = (
         (100.0 * reduction_abs / baseline_generated) if baseline_generated > 0 else 0.0
     )
+    baseline_expanded = int(baseline_search_stats.get("expanded_states", 0))
+    heuristic_expanded = int(heuristic_search_stats.get("expanded_states", 0))
     baseline_cost = baseline_search_stats.get("solution_cost")
     heuristic_cost = heuristic_search_stats.get("solution_cost")
     baseline_len = baseline_search_stats.get("solution_length")
     heuristic_len = heuristic_search_stats.get("solution_length")
     baseline_solved = bool(baseline_search_stats.get("solved", False))
     heuristic_solved = bool(heuristic_search_stats.get("solved", False))
-    heuristic_converged_faster = False
-    if heuristic_solved:
-        if not baseline_solved:
-            heuristic_converged_faster = True
-        elif heuristic_generated < baseline_generated:
-            heuristic_converged_faster = True
+    comparison_verdict = _classify_heuristic_comparison_verdict(
+        baseline_solved=baseline_solved,
+        heuristic_solved=heuristic_solved,
+        baseline_expanded=baseline_expanded,
+        heuristic_expanded=heuristic_expanded,
+    )
+
+    heuristic_converged_faster = comparison_verdict == "heuristic_faster"
     return {
+        "comparison_basis": "expanded_states",
+        "comparison_verdict": comparison_verdict,
         "baseline_generated_states": baseline_generated,
         "heuristic_generated_states": heuristic_generated,
+        "baseline_expanded_states": baseline_expanded,
+        "heuristic_expanded_states": heuristic_expanded,
         "generated_state_reduction_abs": int(reduction_abs),
         "generated_state_reduction_pct": float(reduction_pct),
         "baseline_solved": baseline_solved,
@@ -1874,6 +2083,15 @@ def _validate_cli_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 "Explicit output-path overrides are only supported for single-run mode"
             )
+    if not args.astar:
+        astar_output_overrides = (
+            args.astar_heuristic_output,
+            args.astar_heuristic_trace_output,
+            args.astar_no_heuristic_output,
+            args.astar_no_heuristic_trace_output,
+        )
+        if any(path is not None for path in astar_output_overrides):
+            raise ValueError("A* output-path overrides require --astar")
 
 
 def _resolve_target_run_dirs(args: argparse.Namespace, state_root: Path) -> list[Path]:
@@ -1905,9 +2123,11 @@ def _run_single_candidate(
 
     This helper contains the per-run orchestration that was previously embedded
     in `main()`. It is needed because batch mode must reuse the exact same
-    rollout behavior, trace writing, and error semantics for each candidate, and
-    it differs from `_run_rollout_video` by coordinating all rollout modes plus
-    per-run heuristic-comparison post-processing.
+    rollout behavior, trace writing, and error semantics for each candidate,
+    including precomputing both A* plans before rendering so their shared
+    comparison verdict can appear in both sidebars. It differs from
+    `_run_rollout_video` by coordinating all rollout modes plus per-run
+    heuristic-comparison planning and aggregation.
 
     Args:
         run_dir: Candidate directory containing replay artifacts.
@@ -1917,12 +2137,11 @@ def _run_single_candidate(
         A summary dictionary containing the processed run path, any rollout
         errors, and optional heuristic comparison metadata for aggregation.
     """
-    trajectory_path = run_dir / TRAJECTORY_FILENAME
-    trajectory = _load_json(trajectory_path)
+    trajectory = _load_replay_payload(run_dir)
 
     actions = trajectory.get("actions", [])
     if not actions:
-        raise ValueError(f"Trajectory {trajectory_path} contains no actions")
+        raise ValueError(f"Replay payload in {run_dir} contains no actions")
 
     reward_key_diagnostics = _build_replay_reward_key_diagnostics(run_dir, trajectory)
     missing_keys = reward_key_diagnostics.get("missing_from_task") or []
@@ -1962,7 +2181,43 @@ def _run_single_candidate(
     if replay_result.replay_error is not None:
         errors.append(f"{ROLLOUT_MODE_REPLAY}: {replay_result.replay_error}")
 
-    if replay_result.replay_error is None and not args.no_astar_video:
+    if replay_result.replay_error is None and args.astar:
+        planning_context = _build_rollout_context(run_dir, trajectory)
+        astar_baseline_bundle = _build_astar_action_selector_bundle(
+            context=planning_context,
+            use_dense_heuristic=False,
+            max_nodes=args.astar_max_nodes,
+            max_expansions=args.astar_max_expansions,
+        )
+        astar_heuristic_bundle = _build_astar_action_selector_bundle(
+            context=planning_context,
+            use_dense_heuristic=True,
+            max_nodes=args.astar_max_nodes,
+            max_expansions=args.astar_max_expansions,
+        )
+        baseline_metadata = astar_baseline_bundle.trace_metadata or {}
+        heuristic_metadata = astar_heuristic_bundle.trace_metadata or {}
+        baseline_stats = baseline_metadata.get("search_stats")
+        heuristic_stats = heuristic_metadata.get("search_stats")
+        if isinstance(baseline_stats, Mapping) and isinstance(heuristic_stats, Mapping):
+            comparison = _build_heuristic_comparison_payload(
+                baseline_search_stats=baseline_stats,
+                heuristic_search_stats=heuristic_stats,
+            )
+            baseline_metadata["heuristic_comparison"] = dict(comparison)
+            heuristic_metadata["heuristic_comparison"] = dict(comparison)
+            astar_baseline_bundle.trace_metadata = baseline_metadata
+            astar_heuristic_bundle.trace_metadata = heuristic_metadata
+            print(
+                "[generate_training_video] heuristic search comparison: "
+                f"run_dir={run_dir} "
+                f"verdict={comparison['comparison_verdict']} "
+                f"basis={comparison['comparison_basis']} "
+                f"baseline_expanded={comparison['baseline_expanded_states']} "
+                f"heuristic_expanded={comparison['heuristic_expanded_states']} "
+                f"baseline_generated={comparison['baseline_generated_states']} "
+                f"heuristic_generated={comparison['heuristic_generated_states']}"
+            )
         astar_baseline_result = _run_rollout_video(
             run_dir=run_dir,
             trajectory=trajectory,
@@ -1971,11 +2226,7 @@ def _run_single_candidate(
             trace_output=astar_no_heuristic_trace_output,
             fps=args.fps,
             max_steps=args.max_steps,
-            action_selector_factory=_astar_action_selector_factory(
-                use_dense_heuristic=False,
-                max_nodes=args.astar_max_nodes,
-                max_expansions=args.astar_max_expansions,
-            ),
+            action_selector_factory=_preplanned_action_selector_factory(astar_baseline_bundle),
         )
         if astar_baseline_result.replay_error is not None:
             errors.append(
@@ -1989,39 +2240,11 @@ def _run_single_candidate(
             trace_output=astar_heuristic_trace_output,
             fps=args.fps,
             max_steps=args.max_steps,
-            action_selector_factory=_astar_action_selector_factory(
-                use_dense_heuristic=True,
-                max_nodes=args.astar_max_nodes,
-                max_expansions=args.astar_max_expansions,
-            ),
+            action_selector_factory=_preplanned_action_selector_factory(astar_heuristic_bundle),
         )
         if astar_heuristic_result.replay_error is not None:
             errors.append(
                 f"{ROLLOUT_MODE_ASTAR_HEURISTIC}: {astar_heuristic_result.replay_error}"
-            )
-
-        baseline_stats = astar_baseline_result.trace_payload.get("search_stats")
-        heuristic_stats = astar_heuristic_result.trace_payload.get("search_stats")
-        if isinstance(baseline_stats, Mapping) and isinstance(heuristic_stats, Mapping):
-            comparison = _build_heuristic_comparison_payload(
-                baseline_search_stats=baseline_stats,
-                heuristic_search_stats=heuristic_stats,
-            )
-            astar_baseline_result.trace_payload["heuristic_comparison"] = comparison
-            astar_heuristic_result.trace_payload["heuristic_comparison"] = comparison
-            _write_trace_payload(
-                astar_baseline_result.trace_output, astar_baseline_result.trace_payload
-            )
-            _write_trace_payload(
-                astar_heuristic_result.trace_output, astar_heuristic_result.trace_payload
-            )
-            print(
-                "[generate_training_video] heuristic search comparison: "
-                f"run_dir={run_dir} "
-                f"baseline_generated={comparison['baseline_generated_states']} "
-                f"heuristic_generated={comparison['heuristic_generated_states']} "
-                f"heuristic_converged_faster={comparison['heuristic_converged_faster']} "
-                f"reduction_pct={comparison['generated_state_reduction_pct']:.2f}"
             )
 
     return {
@@ -2037,8 +2260,9 @@ def _print_batch_summary(run_summaries: list[dict[str, Any]]) -> None:
     This helper reduces per-run comparison payloads into a small stdout summary
     for batch invocations. It is needed because users requested a direct answer
     to how often the dense heuristic converged faster than baseline over the
-    latest candidate set, and it differs from per-run trace payloads by
-    aggregating counts across environments in the current CLI execution.
+    latest candidate set, and now also whether it was slower or tied. It differs
+    from per-run trace payloads by aggregating verdict counts across
+    environments in the current CLI execution.
 
     Args:
         run_summaries: Per-run orchestration summaries returned by
@@ -2051,12 +2275,20 @@ def _print_batch_summary(run_summaries: list[dict[str, Any]]) -> None:
     ]
     if not comparisons:
         return
-    faster_count = sum(
-        1 for comparison in comparisons if bool(comparison["heuristic_converged_faster"])
-    )
+    verdict_counts = {
+        "heuristic_faster": 0,
+        "heuristic_slower": 0,
+        "same_search_outcome": 0,
+    }
+    for comparison in comparisons:
+        verdict = str(comparison.get("comparison_verdict", "same_search_outcome"))
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
     print(
         "[generate_training_video] batch heuristic summary: "
-        f"heuristic_converged_faster={faster_count}/{len(comparisons)}"
+        f"heuristic_faster={verdict_counts['heuristic_faster']} "
+        f"heuristic_slower={verdict_counts['heuristic_slower']} "
+        f"same_search_outcome={verdict_counts['same_search_outcome']} "
+        f"total={len(comparisons)}"
     )
 
 
@@ -2065,7 +2297,7 @@ def main() -> None:
 
     This entry point resolves run artifacts, validates CLI limits, executes the
     existing policy trajectory replay, and optionally executes two A* rollout
-    variants (with and without dense heuristic) against the same dense reward.
+    variants (with and without dense heuristic) when `--astar` is enabled.
     It is needed so users can compare heuristic search efficiency directly, and
     it differs from earlier behavior by emitting three independent rollout
     artifact pairs plus explicit cross-run heuristic comparison metrics.

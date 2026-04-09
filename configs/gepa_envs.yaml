@@ -1,131 +1,233 @@
-# Default batch of environments for GEPA data collection.
 jobs:
-  - name: trivial-r1-11x11-seed0
-    env_id: XLand-MiniGrid-R1-11x11
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 0
-    eval_seed: 1000
-  - name: trivial-r1-13x13-seed1
-    env_id: XLand-MiniGrid-R1-13x13
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 1
-    eval_seed: 1001
-  - name: trivial-r1-15x15-seed2
-    env_id: XLand-MiniGrid-R1-15x15
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 2
-    eval_seed: 1002
-  - name: trivial-r2-11x11-seed3
-    env_id: XLand-MiniGrid-R2-11x11
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 3
-    eval_seed: 1003
-  - name: trivial-r2-13x13-seed4
-    env_id: XLand-MiniGrid-R2-13x13
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 4
-    eval_seed: 1004
-  - name: trivial-r2-15x15-seed5
-    env_id: XLand-MiniGrid-R2-15x15
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 5
-    eval_seed: 1005
-  - name: trivial-r4-11x11-seed6
-    env_id: XLand-MiniGrid-R4-11x11
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 6
-    eval_seed: 1006
-  - name: trivial-r4-13x13-seed7
-    env_id: XLand-MiniGrid-R4-13x13
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 7
-    eval_seed: 1007
-  - name: trivial-r4-15x15-seed8
-    env_id: XLand-MiniGrid-R4-15x15
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 8
-    eval_seed: 1008
-  - name: trivial-r6-17x17-seed9
-    env_id: XLand-MiniGrid-R6-17x17
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 9
-    eval_seed: 1009
-  - name: trivial-r9-19x19-seed10
-    env_id: XLand-MiniGrid-R9-19x19
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 10
-    eval_seed: 1010
-
-# Held-out evaluation environments (smallest + largest per R type).
+- name: train-r1-11x11
+  env_id: XLand-MiniGrid-R1-11x11
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1000
+  - 1001
+  - 1002
+  deterministic_rulesets: false
+  astar_max_nodes: 373
+  astar_max_expansions: 251
+- name: train-r1-13x13
+  env_id: XLand-MiniGrid-R1-13x13
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1010
+  - 1011
+  - 1012
+  deterministic_rulesets: false
+  astar_max_nodes: 2924
+  astar_max_expansions: 2379
+- name: train-r1-15x15
+  env_id: XLand-MiniGrid-R1-15x15
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1020
+  - 1021
+  - 1022
+  deterministic_rulesets: false
+  astar_max_nodes: 2497
+  astar_max_expansions: 2032
+- name: train-r2-11x11
+  env_id: XLand-MiniGrid-R2-11x11
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1100
+  - 1101
+  - 1102
+  deterministic_rulesets: false
+  astar_max_nodes: 3005
+  astar_max_expansions: 2599
+- name: train-r2-13x13
+  env_id: XLand-MiniGrid-R2-13x13
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1110
+  - 1111
+  - 1112
+  deterministic_rulesets: false
+  astar_max_nodes: 4728
+  astar_max_expansions: 2700
+- name: train-r2-15x15
+  env_id: XLand-MiniGrid-R2-15x15
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1120
+  - 1121
+  - 1122
+  deterministic_rulesets: false
+  astar_max_nodes: 3567
+  astar_max_expansions: 2934
+- name: train-r4-11x11
+  env_id: XLand-MiniGrid-R4-11x11
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1200
+  - 1201
+  - 1202
+  deterministic_rulesets: false
+  astar_max_nodes: 6481
+  astar_max_expansions: 4781
+- name: train-r4-13x13
+  env_id: XLand-MiniGrid-R4-13x13
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1210
+  - 1211
+  - 1212
+  deterministic_rulesets: false
+  astar_max_nodes: 4732
+  astar_max_expansions: 3418
+- name: train-r4-15x15
+  env_id: XLand-MiniGrid-R4-15x15
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1220
+  - 1221
+  - 1222
+  deterministic_rulesets: false
+  astar_max_nodes: 1839
+  astar_max_expansions: 1529
+- name: train-r6-17x17
+  env_id: XLand-MiniGrid-R6-17x17
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1300
+  - 1301
+  - 1302
+  deterministic_rulesets: false
+  astar_max_nodes: 2799
+  astar_max_expansions: 2317
+- name: train-r9-19x19
+  env_id: XLand-MiniGrid-R9-19x19
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 1400
+  - 1401
+  - 1402
+  deterministic_rulesets: false
+  astar_max_nodes: 2266
+  astar_max_expansions: 1796
 eval_jobs:
-  - name: eval-r1-9x9-seed0
-    env_id: XLand-MiniGrid-R1-9x9
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 0
-    eval_seed: 2000
-  - name: eval-r1-17x17-seed1
-    env_id: XLand-MiniGrid-R1-17x17
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 1
-    eval_seed: 2001
-  - name: eval-r2-9x9-seed2
-    env_id: XLand-MiniGrid-R2-9x9
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 2
-    eval_seed: 2002
-  - name: eval-r2-17x17-seed3
-    env_id: XLand-MiniGrid-R2-17x17
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 3
-    eval_seed: 2003
-  - name: eval-r4-9x9-seed4
-    env_id: XLand-MiniGrid-R4-9x9
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 4
-    eval_seed: 2004
-  - name: eval-r4-17x17-seed5
-    env_id: XLand-MiniGrid-R4-17x17
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 5
-    eval_seed: 2005
-  - name: eval-r6-13x13-seed6
-    env_id: XLand-MiniGrid-R6-13x13
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 6
-    eval_seed: 2006
-  - name: eval-r6-19x19-seed7
-    env_id: XLand-MiniGrid-R6-19x19
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 7
-    eval_seed: 2007
-  - name: eval-r9-16x16-seed8
-    env_id: XLand-MiniGrid-R9-16x16
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 8
-    eval_seed: 2008
-  - name: eval-r9-25x25-seed9
-    env_id: XLand-MiniGrid-R9-25x25
-    benchmark_id: trivial-1m
-    total_timesteps: 100000000
-    train_seed: 9
-    eval_seed: 2009
+- name: holdout-r1-9x9
+  env_id: XLand-MiniGrid-R1-9x9
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 2000
+  - 2001
+  - 2002
+  deterministic_rulesets: false
+  astar_max_nodes: 452
+  astar_max_expansions: 317
+- name: holdout-r1-17x17
+  env_id: XLand-MiniGrid-R1-17x17
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 2010
+  - 2011
+  - 2012
+  deterministic_rulesets: false
+  astar_max_nodes: 2801
+  astar_max_expansions: 2269
+- name: holdout-r2-9x9
+  env_id: XLand-MiniGrid-R2-9x9
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 2100
+  - 2101
+  - 2102
+  deterministic_rulesets: false
+  astar_max_nodes: 54
+  astar_max_expansions: 26
+- name: holdout-r2-17x17
+  env_id: XLand-MiniGrid-R2-17x17
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 2110
+  - 2111
+  - 2112
+  deterministic_rulesets: false
+  astar_max_nodes: 2829
+  astar_max_expansions: 2247
+- name: holdout-r4-9x9
+  env_id: XLand-MiniGrid-R4-9x9
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 2200
+  - 2201
+  - 2202
+  deterministic_rulesets: false
+  astar_max_nodes: 618
+  astar_max_expansions: 452
+- name: holdout-r4-17x17
+  env_id: XLand-MiniGrid-R4-17x17
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 2210
+  - 2211
+  - 2212
+  deterministic_rulesets: false
+  astar_max_nodes: 2806
+  astar_max_expansions: 2352
+- name: holdout-r6-13x13
+  env_id: XLand-MiniGrid-R6-13x13
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 2300
+  - 2301
+  - 2302
+  deterministic_rulesets: false
+  astar_max_nodes: 4693
+  astar_max_expansions: 3594
+- name: holdout-r6-19x19
+  env_id: XLand-MiniGrid-R6-19x19
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 2310
+  - 2311
+  - 2312
+  deterministic_rulesets: false
+  astar_max_nodes: 2265
+  astar_max_expansions: 1892
+- name: holdout-r9-16x16
+  env_id: XLand-MiniGrid-R9-16x16
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 2400
+  - 2401
+  - 2402
+  deterministic_rulesets: false
+  astar_max_nodes: 3181
+  astar_max_expansions: 2484
+- name: holdout-r9-25x25
+  env_id: XLand-MiniGrid-R9-25x25
+  benchmark_id: trivial-1m
+  num_gepa_eval_seeds: 4
+  holdout_seeds:
+  - 2410
+  - 2411
+  - 2412
+  deterministic_rulesets: false
+  astar_max_nodes: 1323
+  astar_max_expansions: 1065
