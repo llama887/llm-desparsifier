@@ -86,5 +86,6 @@ fi
     --state-root "$BASE_STATE_ROOT" \
     --max-phase-iterations 10 \
     --max-expansions 50000 \
+    --levels-per-game "${LEVELS_PER_GAME:-3}" \
     --llm "gemini/gemini-3-pro-preview" \
     --script-doctor "$SD_PATH"

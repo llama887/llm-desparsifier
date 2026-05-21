@@ -82,6 +82,7 @@ PHASE_EARLY_STOP_PATIENCE = 3
 DEFAULT_MAX_PHASE_ITERATIONS = 10
 DEFAULT_ASTAR_MAX_EXPANSIONS = 50_000
 DEFAULT_LLM = "gemini/gemini-3-pro-preview"
+DEFAULT_LEVELS_PER_GAME = 3
 
 PUZZLESCRIPT_HEURISTIC_CONTRACT = """You are writing a heuristic function for A* search on a PuzzleScript grid puzzle.
 
@@ -523,19 +524,20 @@ def evaluate_one_game(
     heuristic_fn: Callable,
     max_expansions: int,
     output_dir: Optional[Path] = None,
+    level_i: int = 0,
     blind_baseline: Optional[dict[str, Any]] = None,
     builtin_baseline: Optional[dict[str, Any]] = None,
     env_description: Optional[str] = None,
     heuristic_code: Optional[str] = None,
     reflection_lm: Any = None,
 ) -> dict[str, Any]:
-    """Compile game, run A*, return result dict with score and feedback."""
+    """Compile game, run A* on one level, return result dict with feedback."""
     json_str = evaluator.compile_game(game_text)
     compiled = json.loads(json_str)
     engine = evaluator.load_engine(json_str)
-    engine.load_level(0)
+    engine.load_level(level_i)
     diagnostics = _sample_local_heuristic_diagnostics(engine, compiled, heuristic_fn)
-    engine.load_level(0)
+    engine.load_level(level_i)
 
     result = puzzlescript_astar(
         engine=engine, compiled_json=compiled,
@@ -562,7 +564,7 @@ def evaluate_one_game(
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "search_stats.json").write_text(json.dumps({
-            "game": game_name, "solved": result.solved,
+            "game": game_name, "level": level_i, "solved": result.solved,
             "expanded": result.expanded_states,
             "generated": result.generated_states,
             "solution_length": result.solution_length,
@@ -575,6 +577,7 @@ def evaluate_one_game(
 
     return {
         "score": result.score,
+        "level": level_i,
         "solved": result.solved,
         "expanded": result.expanded_states,
         "generated": result.generated_states,
@@ -584,6 +587,110 @@ def evaluate_one_game(
         "feedback_diagnostics": diagnostics,
         "trace_summary": result.trace_summary,
     }
+
+
+def _aggregate_level_results(
+    *,
+    game_name: str,
+    level_results: list[dict[str, Any]],
+    output_dir: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Aggregate multiple level evaluations into one GEPA metric payload."""
+
+    if not level_results:
+        return {
+            "score": 0.0,
+            "solved": False,
+            "expanded": 0,
+            "generated": 0,
+            "solution_length": 0,
+            "feedback": f"No levels evaluated for {game_name}",
+            "level_results": [],
+        }
+
+    score = sum(float(row["score"]) for row in level_results) / len(level_results)
+    solved = all(bool(row["solved"]) for row in level_results)
+    expanded = sum(int(row["expanded"]) for row in level_results)
+    generated = sum(int(row["generated"]) for row in level_results)
+    solution_length = sum(int(row["solution_length"]) for row in level_results)
+    failed = [row for row in level_results if not row["solved"]]
+    if failed:
+        lead = failed[0]
+        feedback = (
+            f"Multi-level aggregate for {game_name}: solved {len(level_results) - len(failed)}/"
+            f"{len(level_results)}, mean_score={score:.4f}. First failed level "
+            f"{lead['level']} feedback:\n{lead.get('feedback', '')}"
+        )
+    else:
+        feedback = (
+            f"Multi-level aggregate for {game_name}: solved {len(level_results)}/"
+            f"{len(level_results)}, mean_score={score:.4f}, expanded_total={expanded}."
+        )
+
+    payload = {
+        "score": score,
+        "solved": solved,
+        "expanded": expanded,
+        "generated": generated,
+        "solution_length": solution_length,
+        "feedback": feedback,
+        "level_results": level_results,
+    }
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "search_stats.json").write_text(json.dumps({
+            "game": game_name,
+            "levels": [row["level"] for row in level_results],
+            "solved": solved,
+            "score": score,
+            "expanded": expanded,
+            "generated": generated,
+            "solution_length": solution_length,
+            "level_results": level_results,
+            "feedback": feedback,
+        }, indent=2))
+    return payload
+
+
+def evaluate_game_levels(
+    evaluator: PuzzleScriptEvaluator,
+    game_name: str,
+    game_text: str,
+    heuristic_fn: Callable,
+    level_budgets: Mapping[int, int],
+    output_dir: Optional[Path] = None,
+    blind_baselines: Optional[Mapping[int, dict[str, Any]]] = None,
+    builtin_baselines: Optional[Mapping[int, dict[str, Any]]] = None,
+    env_description: Optional[str] = None,
+    heuristic_code: Optional[str] = None,
+    reflection_lm: Any = None,
+) -> dict[str, Any]:
+    """Evaluate one heuristic on several levels and average their scores."""
+
+    level_results: list[dict[str, Any]] = []
+    for level_i, budget in level_budgets.items():
+        level_output = output_dir / f"level-{level_i:02d}" if output_dir else None
+        level_results.append(
+            evaluate_one_game(
+                evaluator,
+                game_name,
+                game_text,
+                heuristic_fn,
+                budget,
+                level_i=level_i,
+                output_dir=level_output,
+                blind_baseline=(blind_baselines or {}).get(level_i),
+                builtin_baseline=(builtin_baselines or {}).get(level_i),
+                env_description=env_description,
+                heuristic_code=heuristic_code,
+                reflection_lm=reflection_lm,
+            )
+        )
+    return _aggregate_level_results(
+        game_name=game_name,
+        level_results=level_results,
+        output_dir=output_dir,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +734,7 @@ def run_curriculum(
     max_phase_iterations: int,
     max_expansions: int,
     llm_name: str,
+    levels_per_game: int,
 ) -> None:
     state_root.mkdir(parents=True, exist_ok=True)
     logs_root = state_root / "runs"
@@ -641,6 +749,7 @@ def run_curriculum(
     # Pre-compile all game texts and env descriptions
     all_game_texts: dict[str, str] = {}
     all_env_descs: dict[str, str] = {}
+    level_indices_by_game: dict[str, list[int]] = {}
     for entry in train_jobs + eval_jobs:
         name = entry["name"]
         text = load_game_text(name, sd_path)
@@ -651,6 +760,10 @@ def run_curriculum(
                 compiled = json.loads(json_str)
                 engine = evaluator.load_engine(json_str)
                 engine.load_level(0)
+                n_levels = engine.get_num_levels()
+                requested_levels = max(1, int(entry.get("levels", n_levels) or n_levels))
+                level_count = min(n_levels, requested_levels, max(1, levels_per_game))
+                level_indices_by_game[name] = list(range(level_count))
                 all_env_descs[name] = build_env_description(
                     compiled, engine.get_id_dict(), text)
             except Exception as e:
@@ -678,35 +791,51 @@ def run_curriculum(
             "best_heuristic_code": None, "best_prompt_text": None,
         }
 
-    # Run blind baseline on ALL training games and compute per-game GEPA budgets.
+    # Run blind baseline on ALL training levels and compute per-level GEPA budgets.
     # Budget = floor(0.95 * blind_expanded) so that a heuristic matching blind
     # search will exceed its budget and score 0, forcing GEPA to improve.
-    print("\n--- Blind A* baseline (h=0) on ALL training games ---")
+    print("\n--- Blind A* baseline (h=0) on ALL training levels ---")
     all_train_names = [e["name"] for e in train_jobs if e["name"] in all_game_texts]
-    blind_baselines: dict[str, dict] = {}
-    builtin_baselines: dict[str, dict] = {}
-    per_game_budgets: dict[str, int] = {}
+    blind_baselines: dict[str, dict[int, dict[str, Any]]] = {}
+    builtin_baselines: dict[str, dict[int, dict[str, Any]]] = {}
+    per_game_budgets: dict[str, dict[int, int]] = {}
 
     for name in all_train_names:
-        r = evaluate_one_game(evaluator, name, all_game_texts[name],
-                              blind_heuristic, max_expansions)
-        blind_baselines[name] = r
-        if r["solved"] and r["expanded"] > 0:
-            per_game_budgets[name] = max(math.floor(0.95 * r["expanded"]), 1)
-        else:
-            # Blind didn't solve -- keep global max as fallback
-            per_game_budgets[name] = max_expansions
-        print(f"  {name}: solved={r['solved']} expanded={r['expanded']} "
-              f"score={r['score']:.4f} -> gepa_budget={per_game_budgets[name]}")
+        blind_baselines[name] = {}
+        per_game_budgets[name] = {}
+        for level_i in level_indices_by_game.get(name, [0]):
+            r = evaluate_one_game(
+                evaluator, name, all_game_texts[name],
+                blind_heuristic, max_expansions, level_i=level_i,
+            )
+            blind_baselines[name][level_i] = r
+            if r["solved"] and r["expanded"] > 0:
+                per_game_budgets[name][level_i] = max(math.floor(0.95 * r["expanded"]), 1)
+            else:
+                # Blind didn't solve -- keep global max as fallback
+                per_game_budgets[name][level_i] = max_expansions
+            print(
+                f"  {name} level={level_i}: solved={r['solved']} expanded={r['expanded']} "
+                f"score={r['score']:.4f} -> gepa_budget={per_game_budgets[name][level_i]}"
+            )
 
     state["per_game_budgets"] = per_game_budgets
+    state["level_indices_by_game"] = level_indices_by_game
 
-    print("\n--- Built-in heuristic baseline ---")
+    print("\n--- Built-in heuristic baseline on training levels ---")
     for name in all_train_names:
-        r = evaluate_one_game(evaluator, name, all_game_texts[name],
-                              builtin_heuristic, max_expansions)
-        builtin_baselines[name] = r
-        print(f"  {name}: solved={r['solved']} expanded={r['expanded']} score={r['score']:.4f}")
+        builtin_baselines[name] = {}
+        for level_i in level_indices_by_game.get(name, [0]):
+            budget = per_game_budgets.get(name, {}).get(level_i, max_expansions)
+            r = evaluate_one_game(
+                evaluator, name, all_game_texts[name],
+                builtin_heuristic, budget, level_i=level_i,
+            )
+            builtin_baselines[name][level_i] = r
+            print(
+                f"  {name} level={level_i}: solved={r['solved']} "
+                f"expanded={r['expanded']} score={r['score']:.4f}"
+            )
 
     current_phase = state["current_phase"]
     global_iteration = state["global_iteration"]
@@ -721,7 +850,8 @@ def run_curriculum(
     print(f"  Phases: {[len(p) for p in phase_schedule]} games")
     print(f"  Threshold: {PHASE_SOLVE_RATE_THRESHOLD}, Patience: {PHASE_EARLY_STOP_PATIENCE}")
     print(f"  Max expansions (global): {max_expansions}, Max iters/phase: {max_phase_iterations}")
-    print(f"  Per-game GEPA budgets: {per_game_budgets}")
+    print(f"  Levels per game: {levels_per_game}")
+    print(f"  Per-game/level GEPA budgets: {per_game_budgets}")
     print(f"{'='*70}")
 
     while stop_reason is None and current_phase <= total_phases:
@@ -804,18 +934,18 @@ def run_curriculum(
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "heuristic.py").write_text(code)
 
-            # Evaluate with per-game budget (tighter than blind search)
-            game_budget = per_game_budgets.get(game_name, max_expansions)
+            # Evaluate across selected levels with per-level budgets.
+            game_budgets = per_game_budgets.get(game_name, {0: max_expansions})
             try:
-                result = evaluate_one_game(
+                result = evaluate_game_levels(
                     evaluator,
                     game_name,
                     all_game_texts[game_name],
                     heuristic_fn,
-                    game_budget,
-                    run_dir,
-                    blind_baseline=blind_baselines.get(game_name),
-                    builtin_baseline=builtin_baselines.get(game_name),
+                    game_budgets,
+                    output_dir=run_dir,
+                    blind_baselines=blind_baselines.get(game_name),
+                    builtin_baselines=builtin_baselines.get(game_name),
                     env_description=env_desc,
                     heuristic_code=code,
                     reflection_lm=lm,
@@ -831,7 +961,7 @@ def run_curriculum(
 
             solved_str = "Y" if result["solved"] else "N"
             print(f"    [{game_name}] score={score:.4f} solved={solved_str} "
-                  f"expanded={result['expanded']} budget={game_budget}")
+                  f"expanded={result['expanded']} levels={list(game_budgets)}")
 
             return ScoreWithFeedback(score=score, feedback=feedback)
 
@@ -884,14 +1014,18 @@ def run_curriculum(
         scores = []
         n_solved = 0
         for name in active_names:
-            result = evaluate_one_game(
+            final_budgets = {
+                level_i: max_expansions
+                for level_i in level_indices_by_game.get(name, [0])
+            }
+            result = evaluate_game_levels(
                 evaluator,
                 name,
                 all_game_texts[name],
                 heuristic_fn,
-                max_expansions,
-                blind_baseline=blind_baselines.get(name),
-                builtin_baseline=builtin_baselines.get(name),
+                final_budgets,
+                blind_baselines=blind_baselines.get(name),
+                builtin_baselines=builtin_baselines.get(name),
                 env_description=all_env_descs.get(name, name),
                 heuristic_code=code,
                 reflection_lm=lm,
@@ -901,7 +1035,7 @@ def run_curriculum(
                 n_solved += 1
             solved_str = "Y" if result["solved"] else "N"
             print(f"    {name:<40} score={result['score']:.4f} solved={solved_str} "
-                  f"expanded={result['expanded']}")
+                  f"expanded={result['expanded']} levels={len(final_budgets)}")
 
         mean_score = sum(scores) / len(scores) if scores else 0.0
         solve_rate = n_solved / n_games if n_games else 0.0
@@ -996,12 +1130,22 @@ def run_curriculum(
             name = entry["name"]
             if name not in all_game_texts:
                 continue
-            r = evaluate_one_game(evaluator, name, all_game_texts[name],
-                                  best_fn, max_expansions,
-                                  blind_baseline=blind_baselines.get(name),
-                                  builtin_baseline=builtin_baselines.get(name))
+            holdout_budgets = {
+                level_i: max_expansions
+                for level_i in level_indices_by_game.get(name, [0])
+            }
+            r = evaluate_game_levels(
+                evaluator,
+                name,
+                all_game_texts[name],
+                best_fn,
+                holdout_budgets,
+            )
             solved_str = "Y" if r["solved"] else "N"
-            print(f"  {name:<40} score={r['score']:.4f} solved={solved_str}")
+            print(
+                f"  {name:<40} score={r['score']:.4f} solved={solved_str} "
+                f"levels={len(holdout_budgets)}"
+            )
     print("=" * 70)
 
 
@@ -1017,6 +1161,8 @@ def main() -> None:
     parser.add_argument("--llm", type=str, default=DEFAULT_LLM)
     parser.add_argument("--script-doctor", type=Path,
                         default=SCRIPT_DOCTOR_PATH)
+    parser.add_argument("--levels-per-game", type=int,
+                        default=DEFAULT_LEVELS_PER_GAME)
     args = parser.parse_args()
 
     evaluator = PuzzleScriptEvaluator(args.script_doctor)
@@ -1027,6 +1173,7 @@ def main() -> None:
         sd_path=args.script_doctor, state_root=args.state_root,
         max_phase_iterations=args.max_phase_iterations,
         max_expansions=args.max_expansions, llm_name=args.llm,
+        levels_per_game=args.levels_per_game,
     )
 
 

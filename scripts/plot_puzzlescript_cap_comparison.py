@@ -75,6 +75,16 @@ HOLDOUT_JOBS: list[tuple[str, int]] = [
     ("Soko-bine", 50_000),
     ("Remote_Control_Sokoban", 50_000),
     ("Darkness_Sokoban", 50_000),
+    ("1D_Sokoban", 50_000),
+    ("Aperture_Science_Sokoban_Testing_Initiative", 50_000),
+    ("Beam_Islands", 50_000),
+    ("Crates_and_Portals", 50_000),
+    ("Gravity_Sokoban", 50_000),
+    ("Ice_Cubes", 50_000),
+    ("Inswaption", 50_000),
+    ("Memory_Push", 50_000),
+    ("Not_Normal_Crates", 50_000),
+    ("PrograMaze", 50_000),
 ]
 
 # Blind-search expansions as logged in sbatch/logs/llm-desparsifier-6308463.out.
@@ -525,7 +535,7 @@ def evaluate_base_prompt_holdout(
         result = puzzlescript_astar(
             engine,
             compiled,
-            lambda ctx, h=heuristic_fn: h(None, None, ctx),
+            heuristic_fn,
             max_expansions=cap,
             timeout_s=timeout_s,
         )
