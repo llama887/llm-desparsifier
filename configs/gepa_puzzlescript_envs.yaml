@@ -1,0 +1,71 @@
+# PuzzleScript Sokoban environments for GEPA curriculum.
+# Curriculum phases: first 5 jobs, then all 10.
+# Eval jobs are held out for validation.
+
+jobs:
+- name: sokoban_basic
+  levels: 2
+  objects: 5
+  grid: "6x7"
+- name: Broken_Leg_Sokoban
+  levels: 20
+  objects: 6
+  grid: "6x7"
+- name: Collapsable_Sokoban
+  levels: 7
+  objects: 5
+  grid: "10x10"
+- name: Pulling_Box_Sokoban
+  levels: 21
+  objects: 5
+  grid: "6x8"
+- name: Swap_Sokoban
+  levels: 21
+  objects: 5
+  grid: "6x7"
+- name: Sokoban_Flipped
+  levels: 21
+  objects: 5
+  grid: "6x8"
+- name: Algorithm-Generated_Sokoban_Levels
+  levels: 40
+  objects: 7
+  grid: "6x6"
+- name: Tractor_Beam_Sokoban9
+  levels: 24
+  objects: 9
+  grid: "6x7"
+- name: Muddy_Sokoban_Level_Set_I
+  levels: 7
+  objects: 8
+  grid: "7x7"
+- name: Ultimate_Sokoban_Supreme
+  levels: 22
+  objects: 6
+  grid: "8x9"
+
+eval_jobs:
+- name: sokoban_sanity
+  levels: 3
+  objects: 5
+  grid: "6x7"
+- name: No_Right_Turn_Sokoban
+  levels: 8
+  objects: 8
+  grid: "7x11"
+- name: Cold_Feet_Sokoban
+  levels: 7
+  objects: 10
+  grid: "6x7"
+- name: Soko-bine
+  levels: 9
+  objects: 7
+  grid: "6x7"
+- name: Remote_Control_Sokoban
+  levels: 7
+  objects: 6
+  grid: "9x9"
+- name: Darkness_Sokoban
+  levels: 2
+  objects: 9
+  grid: "7x7"
