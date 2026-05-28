@@ -1262,6 +1262,15 @@ wheels = [
 ]
 
 [[package]]
+name = "javascript"
+version = "1!1.2.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1d/e5/782b7cfba2491e96ff463e24fadb4486ce2bc226f2071e493a9caa07f345/javascript-1!1.2.6.tar.gz", hash = "sha256:442e885b54dd9a6afe797dd6d5c3c575ec38da02a7d16749bf315aad0fa620c9", size = 38508, upload-time = "2025-09-25T11:15:44.411Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/95/4f/43e4b0bd6b76930e921cf5d9357cefb8ace9a2615bf53c05ff2e314ec434/javascript-1!1.2.6-py3-none-any.whl", hash = "sha256:0c68af196d450715bb74e9a25f11db67435070d91ceaff5ef28c4b4c95235ebf", size = 34802, upload-time = "2025-09-25T11:15:42.142Z" },
+]
+
+[[package]]
 name = "jax"
 version = "0.7.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1680,6 +1689,7 @@ dependencies = [
     { name = "dspy" },
     { name = "imageio" },
     { name = "imageio-ffmpeg" },
+    { name = "javascript" },
     { name = "jax", extra = ["cuda12"] },
     { name = "mypy" },
     { name = "pillow" },
@@ -1699,6 +1709,7 @@ requires-dist = [
     { name = "dspy", specifier = ">=3.0.3" },
     { name = "imageio", specifier = ">=2.34.1" },
     { name = "imageio-ffmpeg", specifier = ">=0.5.1" },
+    { name = "javascript", specifier = ">=1!1.2.6" },
     { name = "jax", extras = ["cuda12"], specifier = ">=0.7.2" },
     { name = "mypy", specifier = ">=1.19.1" },
     { name = "pillow", specifier = ">=10.3.0" },

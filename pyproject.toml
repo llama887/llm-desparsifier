@@ -20,6 +20,7 @@ dependencies = [
     "ruff>=0.15.1",
     "pygame>=2.6.1",
     "axoniq>=0.2.3",
+    "javascript>=1!1.2.6",
 ]
 
 [build-system]

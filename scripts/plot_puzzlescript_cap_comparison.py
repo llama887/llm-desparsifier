@@ -3,22 +3,21 @@
 
 This script supports two evaluation splits:
 1. `train`: the 10 training games with per-game calibrated caps.
-2. `holdout`: the 6 holdout games with the global search cap used by the batch run.
+2. `holdout`: the holdout games with the global search cap used by the batch run.
 
 For `train`, it compares:
 1. Blind A* at the same per-game expansion cap.
 2. The engine builtin heuristic.
-3. The first-pass "base prompt" heuristic proxy, taken as the earliest saved
-   candidate for each environment in the original GEPA run directory.
-4. The saved optimized heuristic, re-evaluated locally under the same cap.
+3. The seeded human prompt, synthesized and evaluated on each game.
+4. The GEPA-optimized prompt, synthesized and evaluated on each game.
 
 For `holdout`, it compares:
 1. Blind A* at the shared global expansion cap.
 2. The engine builtin heuristic.
-3. The saved optimized heuristic at that same cap.
+3. The GEPA-optimized prompt at that same cap.
 
-The holdout split omits a base-prompt curve because the checked-in artifacts do
-not include a saved base-prompt holdout evaluation.
+The holdout split omits a base-prompt curve unless `--include-base-holdout` is
+set, because it requires fresh LLM synthesis calls.
 
 Outputs:
   - comparison_under_cap.json
@@ -150,13 +149,16 @@ def parse_args() -> argparse.Namespace:
         "--base-state-root",
         type=Path,
         default=REPO_ROOT / "artifacts" / "gepa_puzzlescript_state",
-        help="State root whose earliest saved candidates proxy the unoptimized base prompt.",
+        help="Legacy state root for earliest-candidate baseline; not used by the default prompt comparison.",
     )
     parser.add_argument(
         "--optimized-state-root",
         type=Path,
         default=REPO_ROOT / "artifacts" / "gepa_puzzlescript_state_llm_feedback_20260415_1239",
-        help="State root containing best_heuristic.py for optimized evaluation.",
+        help=(
+            "State root containing best_prompt.txt for GEPA prompt evaluation. "
+            "Legacy best_heuristics/<env>.py files are only used with --use-saved-optimized-heuristics."
+        ),
     )
     parser.add_argument(
         "--script-doctor",
@@ -174,7 +176,7 @@ def parse_args() -> argparse.Namespace:
         "--timeout-s",
         type=float,
         default=60.0,
-        help="Wall-clock timeout per optimized search evaluation.",
+        help="Wall-clock timeout per search evaluation.",
     )
     parser.add_argument(
         "--split",
@@ -189,8 +191,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--llm",
-        default="gemini/gemini-3-pro-preview",
-        help="LLM used when synthesizing the base prompt on holdout.",
+        default="deepseek/deepseek-v4-pro",
+        help="LLM used when synthesizing prompt-produced heuristics.",
+    )
+    parser.add_argument(
+        "--use-saved-optimized-heuristics",
+        action="store_true",
+        help=(
+            "Use saved best_heuristics/<env>.py for the optimized series instead "
+            "of synthesizing from best_prompt.txt. This is not a prompt-vs-prompt comparison."
+        ),
     )
     return parser.parse_args()
 
@@ -222,11 +232,15 @@ def evaluate_optimized(
     jobs: list[tuple[str, int]],
 ) -> dict[str, dict[str, int | bool]]:
     evaluator = PuzzleScriptEvaluator(script_doctor)
-    heuristic_code = (optimized_state_root / "best_heuristic.py").read_text()
-    heuristic_fn = sanitize_and_compile_puzzlescript_heuristic(heuristic_code)
 
     rows: dict[str, dict[str, int | bool]] = {}
     for env, cap in jobs:
+        per_game_path = optimized_state_root / "best_heuristics" / f"{env}.py"
+        if per_game_path.exists():
+            heuristic_code = per_game_path.read_text()
+        else:
+            heuristic_code = (optimized_state_root / "best_heuristic.py").read_text()
+        heuristic_fn = sanitize_and_compile_puzzlescript_heuristic(heuristic_code)
         compiled = json.loads(evaluator.compile_game_file(env))
         engine = evaluator.load_engine(json.dumps(compiled))
         engine.load_level(0)
@@ -505,6 +519,26 @@ def evaluate_base_prompt_holdout(
     jobs: list[tuple[str, int]],
     llm_name: str,
 ) -> dict[str, dict[str, int | bool]]:
+    runner = _load_run_puzzlescript_batch_module()
+    return evaluate_prompt_jobs(
+        prompt_text=runner.PUZZLESCRIPT_HEURISTIC_CONTRACT,
+        script_doctor=script_doctor,
+        timeout_s=timeout_s,
+        jobs=jobs,
+        llm_name=llm_name,
+        log_prefix="base-holdout",
+    )
+
+
+def evaluate_prompt_jobs(
+    *,
+    prompt_text: str,
+    script_doctor: Path,
+    timeout_s: float,
+    jobs: list[tuple[str, int]],
+    llm_name: str,
+    log_prefix: str,
+) -> dict[str, dict[str, int | bool]]:
     import dspy
 
     runner = _load_run_puzzlescript_batch_module()
@@ -514,24 +548,29 @@ def evaluate_base_prompt_holdout(
 
     rows: dict[str, dict[str, int | bool]] = {}
     for env, cap in jobs:
-        print(f"[base-holdout] synthesizing {env}", flush=True)
+        print(f"[{log_prefix}] synthesizing {env}", flush=True)
         game_text = runner.load_game_text(env, script_doctor)
         if not game_text:
-            raise FileNotFoundError(f"Could not load holdout game text for {env}")
+            raise FileNotFoundError(f"Could not load game text for {env}")
         json_str = evaluator.compile_game(game_text)
         compiled = json.loads(json_str)
         engine = evaluator.load_engine(json_str)
         engine.load_level(0)
         env_description = build_env_description(compiled, engine.get_id_dict(), game_text)
         heuristic_fn, _code, error = runner.synthesize_heuristic_from_prompt(
-            runner.PUZZLESCRIPT_HEURISTIC_CONTRACT,
+            prompt_text,
             env_description,
             lm,
         )
         if error:
-            raise RuntimeError(f"Base prompt synthesis failed for {env}: {error}")
+            print(f"[{log_prefix}] {env} synthesis failed: {error}", flush=True)
+            rows[env] = {
+                "expanded": int(cap),
+                "solved": False,
+            }
+            continue
         engine.load_level(0)
-        print(f"[base-holdout] evaluating {env}", flush=True)
+        print(f"[{log_prefix}] evaluating {env}", flush=True)
         result = puzzlescript_astar(
             engine,
             compiled,
@@ -540,7 +579,7 @@ def evaluate_base_prompt_holdout(
             timeout_s=timeout_s,
         )
         print(
-            f"[base-holdout] {env} solved={result.solved} expanded={result.expanded_states}",
+            f"[{log_prefix}] {env} solved={result.solved} expanded={result.expanded_states}",
             flush=True,
         )
         rows[env] = {
@@ -761,16 +800,50 @@ def plot_holdout_rows(rows: list[HoldoutComparisonRow], output_dir: Path) -> lis
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    runner = _load_run_puzzlescript_batch_module()
+    if getattr(runner, "load_dotenv", None) is not None:
+        runner.load_dotenv(REPO_ROOT / ".env", override=True)
+    seed_prompt = runner.PUZZLESCRIPT_HEURISTIC_CONTRACT
+    optimized_prompt_path = args.optimized_state_root / "best_prompt.txt"
 
     if args.split == "train":
-        base_prompt_proxy = load_base_prompt_proxy(args.base_state_root)
-        optimized_results = evaluate_optimized(
-            args.optimized_state_root,
-            args.script_doctor,
-            args.timeout_s,
-            TRAINING_JOBS,
+        base_results = evaluate_prompt_jobs(
+            prompt_text=seed_prompt,
+            script_doctor=args.script_doctor,
+            timeout_s=args.timeout_s,
+            jobs=TRAINING_JOBS,
+            llm_name=args.llm,
+            log_prefix="seed-train",
         )
-        rows = build_rows(base_prompt_proxy, optimized_results)
+        if args.use_saved_optimized_heuristics:
+            optimized_results = evaluate_optimized(
+                args.optimized_state_root,
+                args.script_doctor,
+                args.timeout_s,
+                TRAINING_JOBS,
+            )
+        else:
+            if not optimized_prompt_path.exists():
+                raise FileNotFoundError(f"Missing optimized prompt: {optimized_prompt_path}")
+            optimized_results = evaluate_prompt_jobs(
+                prompt_text=optimized_prompt_path.read_text(encoding="utf-8"),
+                script_doctor=args.script_doctor,
+                timeout_s=args.timeout_s,
+                jobs=TRAINING_JOBS,
+                llm_name=args.llm,
+                log_prefix="gepa-train",
+            )
+        rows = build_rows(
+            {
+                env: {
+                    "candidate_id": -1,
+                    "expanded": row["expanded"],
+                    "solved": row["solved"],
+                }
+                for env, row in base_results.items()
+            },
+            optimized_results,
+        )
         json_path = args.output_dir / "comparison_under_cap.json"
         json_path.write_text(
             json.dumps([asdict(row) for row in rows], indent=2) + "\n",
@@ -782,18 +855,32 @@ def main() -> None:
         builtin_results = evaluate_builtin(args.script_doctor, args.timeout_s, HOLDOUT_JOBS)
         base_results = None
         if args.include_base_holdout:
-            base_results = evaluate_base_prompt_holdout(
+            base_results = evaluate_prompt_jobs(
+                prompt_text=seed_prompt,
+                script_doctor=args.script_doctor,
+                timeout_s=args.timeout_s,
+                jobs=HOLDOUT_JOBS,
+                llm_name=args.llm,
+                log_prefix="seed-holdout",
+            )
+        if args.use_saved_optimized_heuristics:
+            optimized_results = evaluate_optimized(
+                args.optimized_state_root,
                 args.script_doctor,
                 args.timeout_s,
                 HOLDOUT_JOBS,
-                args.llm,
             )
-        optimized_results = evaluate_optimized(
-            args.optimized_state_root,
-            args.script_doctor,
-            args.timeout_s,
-            HOLDOUT_JOBS,
-        )
+        else:
+            if not optimized_prompt_path.exists():
+                raise FileNotFoundError(f"Missing optimized prompt: {optimized_prompt_path}")
+            optimized_results = evaluate_prompt_jobs(
+                prompt_text=optimized_prompt_path.read_text(encoding="utf-8"),
+                script_doctor=args.script_doctor,
+                timeout_s=args.timeout_s,
+                jobs=HOLDOUT_JOBS,
+                llm_name=args.llm,
+                log_prefix="gepa-holdout",
+            )
         rows = build_holdout_rows(
             blind_results,
             builtin_results,

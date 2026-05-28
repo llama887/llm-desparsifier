@@ -29,5 +29,4 @@ mkdir -p "$WANDB_DIR"
 BASE_STATE_ROOT="${STATE_ROOT:-$PWD/artifacts/gepa_state}"
 
 uv sync
-uv run scripts/run_reward_batch.py --state-root "${BASE_STATE_ROOT}-2.5pro-single" --llm "@vertex-ai-3e806d/gemini-2.5-pro" --test-single-env
-uv run scripts/run_reward_batch.py --state-root "${BASE_STATE_ROOT}-o3mini-single" --llm "@o3-mini-5791cb/o3-mini" --test-single-env
+uv run scripts/run_reward_batch.py --state-root "${BASE_STATE_ROOT}-deepseek-v4-pro-single" --llm "deepseek-v4-pro" --test-single-env

@@ -8,7 +8,7 @@ This repository uses DSPy GEPA to optimize prompts that cause an LLM to emit adm
 - Core switches:
   - `--env-grid configs/gepa_envs.yaml`
   - `--max-phase-iterations <int>` (default `10`)
-  - `--llm <gemini-model-name>`
+  - `--llm <deepseek-model-name>`
   - `--astar-max-nodes <int>`
   - `--astar-max-expansions <int>`
   - `--deterministic-envs`

@@ -26,13 +26,16 @@ from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 
 from llm_desparsifier.heuristics import (
     BASE_HEURISTIC_PROMPT,
-    DEFAULT_GEMINI_MODEL,
+    DEFAULT_DEEPSEEK_MODEL,
     HEURISTIC_CONTRACT_TEXT,
     HeuristicGenerator,
     aggregate_validation_results,
     build_heuristic_feedback,
-    configure_gemini_lm,
+    configure_deepseek_lm,
 )
+
+# Compatibility for tests or external scripts that still patch the old name.
+configure_gemini_lm = configure_deepseek_lm
 from llm_desparsifier.search import (
     JAxtarSearchBackend,
     SearchConfig,
@@ -342,7 +345,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_PHASE_ITERATIONS,
     )
-    parser.add_argument("--llm", default=DEFAULT_GEMINI_MODEL)
+    parser.add_argument("--llm", default=DEFAULT_DEEPSEEK_MODEL)
     parser.add_argument("--astar-max-nodes", type=int, default=DEFAULT_ASTAR_MAX_NODES)
     parser.add_argument(
         "--astar-max-expansions",
@@ -1728,8 +1731,8 @@ def run_batch() -> None:
         raise ValueError("A* budgets must be > 0")
 
     model_name = args.llm
-    base_lm = configure_gemini_lm(model_name=model_name)
-    reflection_lm = configure_gemini_lm(model_name=model_name)
+    base_lm = configure_deepseek_lm(model_name=model_name)
+    reflection_lm = configure_deepseek_lm(model_name=model_name)
     dspy.configure(lm=reflection_lm)
     wandb_run = None
     candidate_runs_table = None

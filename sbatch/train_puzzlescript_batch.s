@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=04:00:00
+#SBATCH --time=48:00:00
 #SBATCH --account=torch_pr_45_tandon_advanced
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=fyy2003@nyu.edu
@@ -87,5 +87,7 @@ fi
     --max-phase-iterations 10 \
     --max-expansions 50000 \
     --levels-per-game "${LEVELS_PER_GAME:-3}" \
-    --llm "gemini/gemini-3-pro-preview" \
+    --gepa-num-threads "${GEPA_NUM_THREADS:-4}" \
+    --llm "deepseek/deepseek-v4-pro" \
+    --llm-max-tokens "${LLM_MAX_TOKENS:-32000}" \
     --script-doctor "$SD_PATH"

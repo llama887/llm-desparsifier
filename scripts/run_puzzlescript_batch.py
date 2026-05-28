@@ -17,6 +17,7 @@ import math
 import os
 import statistics
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -41,6 +42,11 @@ from puzzlescript_sanitizer import sanitize_and_compile_puzzlescript_heuristic
 import dspy
 from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 import yaml
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - dotenv is optional in cluster jobs
+    load_dotenv = None
 
 
 class _HeuristicSynthesisSignature(dspy.Signature):
@@ -81,8 +87,10 @@ PHASE_SOLVE_RATE_THRESHOLD = 0.80
 PHASE_EARLY_STOP_PATIENCE = 3
 DEFAULT_MAX_PHASE_ITERATIONS = 10
 DEFAULT_ASTAR_MAX_EXPANSIONS = 50_000
-DEFAULT_LLM = "gemini/gemini-3-pro-preview"
+DEFAULT_LLM = "deepseek/deepseek-v4-pro"
+DEFAULT_LLM_MAX_TOKENS = 32_000
 DEFAULT_LEVELS_PER_GAME = 3
+DEFAULT_GEPA_NUM_THREADS = 1
 
 PUZZLESCRIPT_HEURISTIC_CONTRACT = """You are writing a heuristic function for A* search on a PuzzleScript grid puzzle.
 
@@ -138,6 +146,103 @@ The heuristic must vary based on the actual game state.
 """
 
 
+def load_local_env() -> None:
+    """Load repo-local .env credentials when available."""
+
+    if load_dotenv is not None:
+        load_dotenv(_PROJECT_ROOT / ".env")
+
+
+class LMCostLogger:
+    """Append DSPy LM history costs and write cumulative GEPA cost summaries."""
+
+    def __init__(self, lm: Any, output_dir: Path) -> None:
+        self.lm = lm
+        self.output_dir = output_dir
+        self.events_path = output_dir / "llm_cost_events.jsonl"
+        self.summary_path = output_dir / "llm_cost_summary.json"
+        self._seen_history = 0
+        self._events: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _as_float(value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _usage_payload(usage: Any) -> dict[str, Any]:
+        if usage is None:
+            return {}
+        if isinstance(usage, Mapping):
+            return dict(usage)
+        if hasattr(usage, "model_dump"):
+            return dict(usage.model_dump())
+        if hasattr(usage, "dict"):
+            return dict(usage.dict())
+        return {}
+
+    def sync(self, label: str, extra: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+        """Record new LM calls since the previous sync and return a summary."""
+
+        history = list(getattr(self.lm, "history", []) or [])
+        new_entries = history[self._seen_history :]
+        self._seen_history = len(history)
+
+        new_events: list[dict[str, Any]] = []
+        for entry in new_entries:
+            if not isinstance(entry, Mapping):
+                continue
+            usage = self._usage_payload(entry.get("usage"))
+            event = {
+                "label": label,
+                "timestamp": entry.get("timestamp"),
+                "uuid": entry.get("uuid"),
+                "model": entry.get("model"),
+                "response_model": entry.get("response_model"),
+                "model_type": entry.get("model_type"),
+                "cost_usd": self._as_float(entry.get("cost")),
+                "usage": usage,
+            }
+            if extra:
+                event.update({f"extra_{key}": value for key, value in extra.items()})
+            new_events.append(event)
+
+        if new_events:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            with self.events_path.open("a", encoding="utf-8") as f:
+                for event in new_events:
+                    f.write(json.dumps(event, sort_keys=True, default=str) + "\n")
+            self._events.extend(new_events)
+
+        summary = self.summary()
+        self.summary_path.write_text(
+            json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"  [llm-cost] {label}: +${sum(e['cost_usd'] for e in new_events):.6f} "
+            f"({len(new_events)} calls), total=${summary['total_cost_usd']:.6f} "
+            f"({summary['total_calls']} calls)"
+        )
+        return summary
+
+    def summary(self) -> dict[str, Any]:
+        by_model: dict[str, dict[str, Any]] = {}
+        for event in self._events:
+            model = str(event.get("model") or event.get("response_model") or "unknown")
+            row = by_model.setdefault(model, {"calls": 0, "cost_usd": 0.0})
+            row["calls"] += 1
+            row["cost_usd"] += self._as_float(event.get("cost_usd"))
+        return {
+            "total_calls": len(self._events),
+            "total_cost_usd": sum(self._as_float(e.get("cost_usd")) for e in self._events),
+            "by_model": by_model,
+            "events_path": str(self.events_path),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -169,6 +274,27 @@ def load_game_text(name: str, sd_path: Path) -> Optional[str]:
         if path.exists():
             return path.read_text()
     return None
+
+
+def build_level_env_description(
+    base_env_description: str,
+    engine: Any,
+    compiled: dict[str, Any],
+    level_i: int,
+) -> str:
+    """Add the specific level's initial state to a game description."""
+
+    engine.load_level(level_i)
+    ctx = build_puzzlescript_ctx(engine, compiled)
+    return (
+        base_env_description
+        + "\n\n"
+        + f"Level of interest: {level_i}\n"
+        + "Initial state for this level:\n"
+        + str(ctx.get("ascii_state", ""))
+        + "\n\n"
+        + "Write the heuristic for this specific level while still using the rules above."
+    )
 
 
 def gepa_score(solved: bool, expanded: int, max_expansions: int) -> float:
@@ -722,6 +848,134 @@ def synthesize_heuristic_from_prompt(
         return None, code, f"Sanitization failed: {e}"
 
 
+def evaluate_prompt_per_game(
+    *,
+    evaluator: PuzzleScriptEvaluator,
+    prompt_text: str,
+    game_names: list[str],
+    all_game_texts: Mapping[str, str],
+    all_env_descs: Mapping[str, str],
+    level_indices_by_game: Mapping[str, list[int]],
+    max_expansions: int,
+    lm: Any,
+    blind_baselines: Optional[Mapping[str, Mapping[int, dict[str, Any]]]] = None,
+    builtin_baselines: Optional[Mapping[str, Mapping[int, dict[str, Any]]]] = None,
+    output_dir: Optional[Path] = None,
+    reflection_lm: Any = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Synthesize and evaluate one heuristic per game from a shared prompt."""
+
+    results: list[dict[str, Any]] = []
+    heuristic_codes: dict[str, str] = {}
+    for name in game_names:
+        if name not in all_game_texts:
+            continue
+        env_desc = all_env_descs.get(name, name)
+        heuristic_fn, code, error = synthesize_heuristic_from_prompt(
+            prompt_text,
+            env_desc,
+            lm,
+        )
+        if error:
+            print(f"    [{name}] final synthesis error: {error[:200]}")
+            heuristic_fn = builtin_heuristic
+            code = f"# FALLBACK: {error[:200]}"
+
+        heuristic_codes[name] = code
+        if output_dir is not None:
+            game_output_dir = output_dir / name
+            game_output_dir.mkdir(parents=True, exist_ok=True)
+            (game_output_dir / "heuristic.py").write_text(code)
+        else:
+            game_output_dir = None
+
+        final_budgets = {
+            level_i: max_expansions
+            for level_i in level_indices_by_game.get(name, [0])
+        }
+        result = evaluate_game_levels(
+            evaluator,
+            name,
+            all_game_texts[name],
+            heuristic_fn,
+            final_budgets,
+            output_dir=game_output_dir,
+            blind_baselines=(blind_baselines or {}).get(name),
+            builtin_baselines=(builtin_baselines or {}).get(name),
+            env_description=env_desc,
+            heuristic_code=code,
+            reflection_lm=reflection_lm,
+        )
+        result["game"] = name
+        results.append(result)
+    return results, heuristic_codes
+
+
+def evaluate_prompt_per_level(
+    *,
+    evaluator: PuzzleScriptEvaluator,
+    prompt_text: str,
+    examples: list[Mapping[str, Any]],
+    all_game_texts: Mapping[str, str],
+    all_level_env_descs: Mapping[str, Mapping[int, str]],
+    max_expansions: int,
+    lm: Any,
+    blind_baselines: Optional[Mapping[str, Mapping[int, dict[str, Any]]]] = None,
+    builtin_baselines: Optional[Mapping[str, Mapping[int, dict[str, Any]]]] = None,
+    output_dir: Optional[Path] = None,
+    reflection_lm: Any = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Synthesize and evaluate one heuristic per game level."""
+
+    results: list[dict[str, Any]] = []
+    heuristic_codes: dict[str, str] = {}
+    for example in examples:
+        name = str(example["game"])
+        level_i = int(example["level"])
+        budget = int(example.get("budget", max_expansions))
+        if name not in all_game_texts:
+            continue
+        env_desc = all_level_env_descs.get(name, {}).get(level_i, name)
+        heuristic_fn, code, error = synthesize_heuristic_from_prompt(
+            prompt_text,
+            env_desc,
+            lm,
+        )
+        level_key = f"{name}::level-{level_i:02d}"
+        if error:
+            print(f"    [{level_key}] final synthesis error: {error[:200]}")
+            heuristic_fn = builtin_heuristic
+            code = f"# FALLBACK: {error[:200]}"
+
+        heuristic_codes[level_key] = code
+        if output_dir is not None:
+            level_output_dir = output_dir / name / f"level-{level_i:02d}"
+            level_output_dir.mkdir(parents=True, exist_ok=True)
+            (level_output_dir / "heuristic.py").write_text(code)
+        else:
+            level_output_dir = None
+
+        result = evaluate_one_game(
+            evaluator,
+            name,
+            all_game_texts[name],
+            heuristic_fn,
+            budget,
+            output_dir=level_output_dir,
+            level_i=level_i,
+            blind_baseline=(blind_baselines or {}).get(name, {}).get(level_i),
+            builtin_baseline=(builtin_baselines or {}).get(name, {}).get(level_i),
+            env_description=env_desc,
+            heuristic_code=code,
+            reflection_lm=reflection_lm,
+        )
+        result["game"] = name
+        result["level"] = level_i
+        result["example"] = level_key
+        results.append(result)
+    return results, heuristic_codes
+
+
 # ---------------------------------------------------------------------------
 # Main curriculum runner with GEPA
 # ---------------------------------------------------------------------------
@@ -734,7 +988,9 @@ def run_curriculum(
     max_phase_iterations: int,
     max_expansions: int,
     llm_name: str,
+    llm_max_tokens: int,
     levels_per_game: int,
+    gepa_num_threads: int,
 ) -> None:
     state_root.mkdir(parents=True, exist_ok=True)
     logs_root = state_root / "runs"
@@ -742,13 +998,15 @@ def run_curriculum(
     state_path = state_root / "curriculum_state.json"
 
     # Configure LLM
-    lm = dspy.LM(llm_name)
+    lm = dspy.LM(llm_name, max_tokens=llm_max_tokens)
     dspy.configure(lm=lm)
-    print(f"LLM: {llm_name}")
+    cost_logger = LMCostLogger(lm, state_root)
+    print(f"LLM: {llm_name} max_tokens={llm_max_tokens}")
 
     # Pre-compile all game texts and env descriptions
     all_game_texts: dict[str, str] = {}
     all_env_descs: dict[str, str] = {}
+    all_level_env_descs: dict[str, dict[int, str]] = {}
     level_indices_by_game: dict[str, list[int]] = {}
     for entry in train_jobs + eval_jobs:
         name = entry["name"]
@@ -764,8 +1022,12 @@ def run_curriculum(
                 requested_levels = max(1, int(entry.get("levels", n_levels) or n_levels))
                 level_count = min(n_levels, requested_levels, max(1, levels_per_game))
                 level_indices_by_game[name] = list(range(level_count))
-                all_env_descs[name] = build_env_description(
-                    compiled, engine.get_id_dict(), text)
+                base_desc = build_env_description(compiled, engine.get_id_dict(), text)
+                all_env_descs[name] = base_desc
+                all_level_env_descs[name] = {
+                    level_i: build_level_env_description(base_desc, engine, compiled, level_i)
+                    for level_i in level_indices_by_game[name]
+                }
             except Exception as e:
                 print(f"  [WARN] Could not compile {name}: {e}")
 
@@ -788,7 +1050,8 @@ def run_curriculum(
             "phase_records": {}, "total_phases": total_phases,
             "phase_game_counts": [len(p) for p in phase_schedule],
             "global_iteration": 0, "stop_reason": None,
-            "best_heuristic_code": None, "best_prompt_text": None,
+            "best_heuristic_code": None, "best_heuristic_codes": {},
+            "best_prompt_text": None,
         }
 
     # Run blind baseline on ALL training levels and compute per-level GEPA budgets.
@@ -842,6 +1105,7 @@ def run_curriculum(
     best_prompt_state = None
     best_prompt_text = state.get("best_prompt_text") or PUZZLESCRIPT_HEURISTIC_CONTRACT
     best_code = state.get("best_heuristic_code")
+    best_codes_by_game = dict(state.get("best_heuristic_codes") or {})
     stop_reason = state["stop_reason"]
     run_counter = 0
 
@@ -851,6 +1115,7 @@ def run_curriculum(
     print(f"  Threshold: {PHASE_SOLVE_RATE_THRESHOLD}, Patience: {PHASE_EARLY_STOP_PATIENCE}")
     print(f"  Max expansions (global): {max_expansions}, Max iters/phase: {max_phase_iterations}")
     print(f"  Levels per game: {levels_per_game}")
+    print(f"  GEPA threads: {gepa_num_threads}")
     print(f"  Per-game/level GEPA budgets: {per_game_budgets}")
     print(f"{'='*70}")
 
@@ -859,12 +1124,22 @@ def run_curriculum(
         phase_key = str(current_phase)
         active_names = [e["name"] for e in phase_entries if e["name"] in all_game_texts]
         n_games = len(active_names)
+        active_level_examples = [
+            {
+                "game": name,
+                "level": level_i,
+                "budget": per_game_budgets.get(name, {}).get(level_i, max_expansions),
+            }
+            for name in active_names
+            for level_i in level_indices_by_game.get(name, [0])
+        ]
+        n_examples = len(active_level_examples)
         is_final = current_phase >= total_phases
 
         records = state.setdefault("phase_records", {})
         if phase_key not in records:
             records[phase_key] = {
-                "n_games": n_games, "best_solve_rate": None,
+                "n_games": n_games, "n_examples": n_examples, "best_solve_rate": None,
                 "best_mean_score": None, "non_improving_streak": 0,
                 "iterations": 0, "advanced": False, "completed": False,
                 "stop_reason": None, "iteration_results": [],
@@ -873,23 +1148,24 @@ def run_curriculum(
         phase_iter = rec["iterations"]
 
         # Build DSPy examples for GEPA
-        combined_desc = "\n\n".join(
-            f"--- {name} ---\n{all_env_descs[name]}"
-            for name in active_names if name in all_env_descs
-        )
         trainset = []
-        for name in active_names:
-            desc = all_env_descs.get(name, name)
+        for level_example in active_level_examples:
+            name = str(level_example["game"])
+            level_i = int(level_example["level"])
+            desc = all_level_env_descs.get(name, {}).get(level_i, all_env_descs.get(name, name))
             ex = dspy.Example(
                 env_description=desc,
                 heuristic_contract=PUZZLESCRIPT_HEURISTIC_CONTRACT,
                 game_name=name,
+                level_i=level_i,
+                budget=int(level_example["budget"]),
             ).with_inputs("env_description", "heuristic_contract")
             trainset.append(ex)
 
         # Caches for GEPA metric
         score_cache: dict[int, float] = {}
         feedback_cache: dict[int, str] = {}
+        metric_lock = threading.Lock()
 
         def metric(
             example: dspy.Example,
@@ -904,12 +1180,17 @@ def run_curriculum(
 
             # Return cached score for reflection calls
             if pred_name is not None:
+                with metric_lock:
+                    cached_score = score_cache.get(prediction_id, 0.0)
+                    cached_feedback = feedback_cache.get(prediction_id, "No feedback.")
                 return ScoreWithFeedback(
-                    score=score_cache.get(prediction_id, 0.0),
-                    feedback=feedback_cache.get(prediction_id, "No feedback."),
+                    score=cached_score,
+                    feedback=cached_feedback,
                 )
 
             game_name = getattr(example, "game_name", "unknown")
+            level_i = int(getattr(example, "level_i", 0))
+            budget = int(getattr(example, "budget", max_expansions))
             if game_name not in all_game_texts:
                 return ScoreWithFeedback(score=0.0, feedback=f"Game {game_name} not found")
 
@@ -918,12 +1199,17 @@ def run_curriculum(
                 prompt_text = PUZZLESCRIPT_HEURISTIC_CONTRACT
 
             # Synthesize heuristic using the GEPA-optimized prompt
-            env_desc = all_env_descs.get(game_name, game_name)
+            env_desc = all_level_env_descs.get(game_name, {}).get(
+                level_i,
+                all_env_descs.get(game_name, game_name),
+            )
             heuristic_fn, code, error = synthesize_heuristic_from_prompt(
                 prompt_text, env_desc, lm)
 
-            run_dir = logs_root / f"candidate-{run_counter:04d}-{game_name}"
-            run_counter += 1
+            with metric_lock:
+                local_run_counter = run_counter
+                run_counter += 1
+            run_dir = logs_root / f"candidate-{local_run_counter:04d}-{game_name}-level-{level_i:02d}"
 
             if error:
                 print(f"    [{game_name}] synthesis error: {error[:100]}")
@@ -934,18 +1220,17 @@ def run_curriculum(
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "heuristic.py").write_text(code)
 
-            # Evaluate across selected levels with per-level budgets.
-            game_budgets = per_game_budgets.get(game_name, {0: max_expansions})
             try:
-                result = evaluate_game_levels(
+                result = evaluate_one_game(
                     evaluator,
                     game_name,
                     all_game_texts[game_name],
                     heuristic_fn,
-                    game_budgets,
+                    budget,
                     output_dir=run_dir,
-                    blind_baselines=blind_baselines.get(game_name),
-                    builtin_baselines=builtin_baselines.get(game_name),
+                    level_i=level_i,
+                    blind_baseline=blind_baselines.get(game_name, {}).get(level_i),
+                    builtin_baseline=builtin_baselines.get(game_name, {}).get(level_i),
                     env_description=env_desc,
                     heuristic_code=code,
                     reflection_lm=lm,
@@ -956,18 +1241,19 @@ def run_curriculum(
 
             score = float(result["score"])
             feedback = result["feedback"]
-            score_cache[prediction_id] = score
-            feedback_cache[prediction_id] = feedback
+            with metric_lock:
+                score_cache[prediction_id] = score
+                feedback_cache[prediction_id] = feedback
 
             solved_str = "Y" if result["solved"] else "N"
-            print(f"    [{game_name}] score={score:.4f} solved={solved_str} "
-                  f"expanded={result['expanded']} levels={list(game_budgets)}")
+            print(f"    [{game_name} level={level_i}] score={score:.4f} solved={solved_str} "
+                  f"expanded={result['expanded']} budget={budget}")
 
             return ScoreWithFeedback(score=score, feedback=feedback)
 
         # Build GEPA program and compiler
         print(f"\n{'='*70}")
-        print(f"Phase {current_phase}/{total_phases}: {n_games} games, "
+        print(f"Phase {current_phase}/{total_phases}: {n_games} games, {n_examples} level examples, "
               f"iteration {phase_iter + 1}/{max_phase_iterations}")
         print(f"{'='*70}")
 
@@ -987,12 +1273,21 @@ def run_curriculum(
             reflection_lm=lm,
             reflection_minibatch_size=1,
             track_stats=True,
-            num_threads=1,
+            num_threads=gepa_num_threads,
             log_dir=str(gepa_log_dir),
         )
 
         print(f"  Running GEPA (max_metric_calls={max_metric_calls})...")
         optimized = compiler.compile(program, trainset=trainset)
+        cost_logger.sync(
+            "gepa_compile",
+            {
+                "phase": current_phase,
+                "iteration": phase_iter + 1,
+                "n_games": n_games,
+                "max_metric_calls": max_metric_calls,
+            },
+        )
 
         # Extract optimized prompt
         optimized_prompt_state = optimized.prompt_generator.dump_state()
@@ -1002,43 +1297,45 @@ def run_curriculum(
         except Exception:
             optimized_prompt_text = best_prompt_text
 
-        # Evaluate optimized prompt on all active games
-        print(f"\n  Evaluating optimized prompt on {n_games} games...")
-        heuristic_fn, code, error = synthesize_heuristic_from_prompt(
-            optimized_prompt_text, combined_desc, lm)
-        if error:
-            print(f"  Final synthesis failed: {error[:200]}")
-            heuristic_fn = builtin_heuristic
-            code = f"# FALLBACK: {error[:200]}"
+        # Evaluate the shared optimized prompt by synthesizing one heuristic per level.
+        print(f"\n  Evaluating optimized prompt on {n_examples} level examples...")
+        final_eval_dir = logs_root / f"phase-{current_phase:02d}-iter-{phase_iter + 1:02d}-final"
+        final_results, final_codes_by_level = evaluate_prompt_per_level(
+            evaluator=evaluator,
+            prompt_text=optimized_prompt_text,
+            examples=active_level_examples,
+            all_game_texts=all_game_texts,
+            all_level_env_descs=all_level_env_descs,
+            max_expansions=max_expansions,
+            lm=lm,
+            blind_baselines=blind_baselines,
+            builtin_baselines=builtin_baselines,
+            output_dir=final_eval_dir,
+            reflection_lm=lm,
+        )
+        cost_logger.sync(
+            "final_per_level_eval",
+            {
+                "phase": current_phase,
+                "iteration": phase_iter + 1,
+                "n_level_examples": n_examples,
+            },
+        )
 
         scores = []
         n_solved = 0
-        for name in active_names:
-            final_budgets = {
-                level_i: max_expansions
-                for level_i in level_indices_by_game.get(name, [0])
-            }
-            result = evaluate_game_levels(
-                evaluator,
-                name,
-                all_game_texts[name],
-                heuristic_fn,
-                final_budgets,
-                blind_baselines=blind_baselines.get(name),
-                builtin_baselines=builtin_baselines.get(name),
-                env_description=all_env_descs.get(name, name),
-                heuristic_code=code,
-                reflection_lm=lm,
-            )
+        for result in final_results:
+            name = result["game"]
+            level_i = result["level"]
             scores.append(result["score"])
             if result["solved"]:
                 n_solved += 1
             solved_str = "Y" if result["solved"] else "N"
-            print(f"    {name:<40} score={result['score']:.4f} solved={solved_str} "
-                  f"expanded={result['expanded']} levels={len(final_budgets)}")
+            print(f"    {name:<40} level={level_i:<2} score={result['score']:.4f} "
+                  f"solved={solved_str} expanded={result['expanded']}")
 
         mean_score = sum(scores) / len(scores) if scores else 0.0
-        solve_rate = n_solved / n_games if n_games else 0.0
+        solve_rate = n_solved / n_examples if n_examples else 0.0
         print(f"\n  Phase result: score={mean_score:.4f} solve_rate={solve_rate:.3f}")
 
         # Track improvement
@@ -1048,10 +1345,12 @@ def run_curriculum(
             improved = True
             rec["best_mean_score"] = mean_score
             rec["non_improving_streak"] = 0
-            best_code = code
+            best_codes_by_game = dict(final_codes_by_level)
+            best_code = None
             best_prompt_text = optimized_prompt_text
             best_prompt_state = optimized_prompt_state
-            state["best_heuristic_code"] = code
+            state["best_heuristic_code"] = None
+            state["best_heuristic_codes"] = best_codes_by_game
             state["best_prompt_text"] = optimized_prompt_text
         else:
             rec["non_improving_streak"] += 1
@@ -1095,6 +1394,7 @@ def run_curriculum(
                 stop_reason = "phase_iteration_cap"
 
         state["stop_reason"] = stop_reason
+        state["llm_cost_summary"] = cost_logger.summary()
         with open(state_path, "w") as f:
             json.dump(state, f, indent=2)
 
@@ -1106,7 +1406,25 @@ def run_curriculum(
         print(f"  Phase {pk}: best_score={pr['best_mean_score']}, "
               f"solve_rate={pr['best_solve_rate']}, iters={pr['iterations']}")
 
-    if best_code:
+    if best_codes_by_game:
+        best_heuristics_dir = state_root / "best_heuristics"
+        best_heuristics_dir.mkdir(parents=True, exist_ok=True)
+        for name, code in sorted(best_codes_by_game.items()):
+            safe_name = name.replace("::", "__").replace("/", "_")
+            (best_heuristics_dir / f"{safe_name}.py").write_text(code)
+        manifest_path = best_heuristics_dir / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "artifact": "per-level heuristics",
+                    "shared_prompt": str(state_root / "best_prompt.txt"),
+                    "examples": sorted(best_codes_by_game),
+                },
+                indent=2,
+            )
+        )
+        print(f"  Best per-level heuristics: {best_heuristics_dir}")
+    elif best_code:
         (state_root / "best_heuristic.py").write_text(best_code)
         print(f"  Best heuristic: {state_root / 'best_heuristic.py'}")
     if best_prompt_text:
@@ -1116,40 +1434,43 @@ def run_curriculum(
     # Holdout
     if eval_jobs:
         print(f"\n--- Holdout ({len(eval_jobs)} games) ---")
-        if best_code and "FALLBACK" not in best_code:
-            try:
-                raw_best_fn = sanitize_and_compile_puzzlescript_heuristic(best_code)
-
-                def best_fn(ctx: dict[str, Any]) -> float:
-                    return float(raw_best_fn(None, None, ctx))
-            except Exception:
-                best_fn = builtin_heuristic
-        else:
-            best_fn = builtin_heuristic
-        for entry in eval_jobs:
-            name = entry["name"]
-            if name not in all_game_texts:
-                continue
-            holdout_budgets = {
-                level_i: max_expansions
-                for level_i in level_indices_by_game.get(name, [0])
+        holdout_names = [entry["name"] for entry in eval_jobs if entry["name"] in all_game_texts]
+        holdout_examples = [
+            {
+                "game": name,
+                "level": level_i,
+                "budget": max_expansions,
             }
-            r = evaluate_game_levels(
-                evaluator,
-                name,
-                all_game_texts[name],
-                best_fn,
-                holdout_budgets,
-            )
+            for name in holdout_names
+            for level_i in level_indices_by_game.get(name, [0])
+        ]
+        holdout_results, _holdout_codes = evaluate_prompt_per_level(
+            evaluator=evaluator,
+            prompt_text=best_prompt_text,
+            examples=holdout_examples,
+            all_game_texts=all_game_texts,
+            all_level_env_descs=all_level_env_descs,
+            max_expansions=max_expansions,
+            lm=lm,
+            output_dir=state_root / "holdout_heuristics",
+        )
+        cost_logger.sync(
+            "holdout_per_level_eval",
+            {"n_games": len(holdout_names), "n_level_examples": len(holdout_examples)},
+        )
+        for r in holdout_results:
+            name = r["game"]
+            level_i = r["level"]
             solved_str = "Y" if r["solved"] else "N"
             print(
-                f"  {name:<40} score={r['score']:.4f} solved={solved_str} "
-                f"levels={len(holdout_budgets)}"
+                f"  {name:<40} level={level_i:<2} score={r['score']:.4f} solved={solved_str}"
             )
+    cost_logger.sync("run_complete")
     print("=" * 70)
 
 
 def main() -> None:
+    load_local_env()
     parser = argparse.ArgumentParser(
         description="GEPA PuzzleScript heuristic optimization")
     parser.add_argument("--env-grid", type=Path, default=DEFAULT_ENV_GRID)
@@ -1159,10 +1480,14 @@ def main() -> None:
     parser.add_argument("--max-expansions", type=int,
                         default=DEFAULT_ASTAR_MAX_EXPANSIONS)
     parser.add_argument("--llm", type=str, default=DEFAULT_LLM)
+    parser.add_argument("--llm-max-tokens", type=int,
+                        default=DEFAULT_LLM_MAX_TOKENS)
     parser.add_argument("--script-doctor", type=Path,
                         default=SCRIPT_DOCTOR_PATH)
     parser.add_argument("--levels-per-game", type=int,
                         default=DEFAULT_LEVELS_PER_GAME)
+    parser.add_argument("--gepa-num-threads", type=int,
+                        default=DEFAULT_GEPA_NUM_THREADS)
     args = parser.parse_args()
 
     evaluator = PuzzleScriptEvaluator(args.script_doctor)
@@ -1173,7 +1498,9 @@ def main() -> None:
         sd_path=args.script_doctor, state_root=args.state_root,
         max_phase_iterations=args.max_phase_iterations,
         max_expansions=args.max_expansions, llm_name=args.llm,
+        llm_max_tokens=args.llm_max_tokens,
         levels_per_game=args.levels_per_game,
+        gepa_num_threads=max(1, args.gepa_num_threads),
     )
 
 

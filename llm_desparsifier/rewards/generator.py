@@ -12,7 +12,7 @@ from typing import Any, Callable, List, Mapping, Optional
 
 import dspy
 
-from llm_desparsifier.rewards.llm_client import configure_gemini_lm
+from llm_desparsifier.rewards.llm_client import configure_deepseek_lm
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT, describe_ruleset
 from llm_desparsifier.rewards.reward_key_diagnostics import (
     RewardObjectKeyDiagnostics,
@@ -132,7 +132,7 @@ class RewardGenerator:
 
     def __post_init__(self):
         if self.lm is None:
-            self.lm = configure_gemini_lm()
+            self.lm = configure_deepseek_lm()
             # Configure DSPy only when we own the LM; avoids thread ownership errors
             # when a caller supplies an already-configured LM from another thread.
             dspy.configure(lm=self.lm)

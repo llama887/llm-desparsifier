@@ -18,7 +18,7 @@ from typing import Any, Callable, Optional
 
 import dspy
 
-from .llm_client import configure_gemini_lm
+from .llm_client import configure_deepseek_lm
 from .prompting import BASE_HEURISTIC_PROMPT, HEURISTIC_CONTRACT_TEXT
 from .sanitizer import sanitize_and_compile_heuristic
 
@@ -99,7 +99,7 @@ class HeuristicGenerator:
 
     def __post_init__(self) -> None:
         if self.lm is None:
-            self.lm = configure_gemini_lm()
+            self.lm = configure_deepseek_lm()
             dspy.configure(lm=self.lm)
         if self.max_sanitize_attempts < 1:
             raise ValueError("max_sanitize_attempts must be >= 1")

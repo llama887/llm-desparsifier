@@ -28,14 +28,14 @@ import yaml
 from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 
 from llm_desparsifier.rewards import (
+    DEFAULT_DEEPSEEK_MODEL,
     RewardGenerator,
     build_reward_object_key_diagnostics,
     build_reward_reflection,
-    configure_gemini_lm,
+    configure_deepseek_lm,
     create_reward_reflection_module,
     summarize_trajectory_behavior_from_path,
 )
-from llm_desparsifier.rewards.llm_client import DEFAULT_GEMINI_MODEL
 from llm_desparsifier.rewards.parser import CONSTRAINTS_TEXT
 from llm_desparsifier.rewards.reflection import EUREKA_GUIDANCE
 from llm_desparsifier.rl.pipeline import TrainingResult, run_training_with_reward
@@ -315,8 +315,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--llm",
-        default=DEFAULT_GEMINI_MODEL,
-        help="Gemini model name to use for GEPA (default: %(default)s).",
+        default=DEFAULT_DEEPSEEK_MODEL,
+        help="DeepSeek model name to use for GEPA (default: %(default)s).",
     )
     parser.add_argument(
         "--reward-llm-temp",
@@ -2140,11 +2140,11 @@ def run_batch() -> None:
         )
 
     constraints_text, prompt_state, prompt_meta = load_prompt_payload(state_root)
-    reward_lm = configure_gemini_lm(
+    reward_lm = configure_deepseek_lm(
         model_name=model_name,
         temperature=args.reward_llm_temp,
     )
-    reflection_lm = configure_gemini_lm(
+    reflection_lm = configure_deepseek_lm(
         model_name=model_name,
         temperature=args.reflection_llm_temp,
     )
