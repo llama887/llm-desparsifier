@@ -84,13 +84,24 @@ DEFAULT_STATE_ROOT = Path("artifacts/gepa_puzzlescript_state")
 
 CURRICULUM_PHASE_GAME_COUNTS = (5, 10)
 PHASE_SOLVE_RATE_THRESHOLD = 0.80
-PHASE_EARLY_STOP_PATIENCE = 3
-DEFAULT_MAX_PHASE_ITERATIONS = 10
+PHASE_EARLY_STOP_PATIENCE = 20
+DEFAULT_MAX_PHASE_ITERATIONS = 20
 DEFAULT_ASTAR_MAX_EXPANSIONS = 50_000
 DEFAULT_LLM = "deepseek/deepseek-v4-pro"
 DEFAULT_LLM_MAX_TOKENS = 32_000
 DEFAULT_LEVELS_PER_GAME = 3
 DEFAULT_GEPA_NUM_THREADS = 1
+
+
+def _phase_gepa_max_metric_calls(*, phase_iteration: int, trainset_size: int) -> int:
+    """Return the cumulative GEPA metric-call cap for one resumed phase run."""
+
+    if phase_iteration <= 0:
+        raise ValueError("phase_iteration must be > 0")
+    if trainset_size <= 0:
+        raise ValueError("trainset_size must be > 0")
+    return phase_iteration * trainset_size * 3
+
 
 PUZZLESCRIPT_HEURISTIC_CONTRACT = """You are writing a heuristic function for A* search on a PuzzleScript grid puzzle.
 
@@ -156,6 +167,12 @@ def load_local_env() -> None:
 class LMCostLogger:
     """Append DSPy LM history costs and write cumulative GEPA cost summaries."""
 
+    DEEPSEEK_V4_PRO_PRICES_PER_MILLION = {
+        "prompt_cache_hit_tokens": 0.003625,
+        "prompt_cache_miss_tokens": 0.435,
+        "completion_tokens": 0.87,
+    }
+
     def __init__(self, lm: Any, output_dir: Path) -> None:
         self.lm = lm
         self.output_dir = output_dir
@@ -183,6 +200,35 @@ class LMCostLogger:
             return dict(usage.dict())
         return {}
 
+    @classmethod
+    def _usage_int(cls, usage: Mapping[str, Any], key: str) -> int:
+        value = usage.get(key)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _estimate_deepseek_cost(cls, model: Any, response_model: Any, usage: Mapping[str, Any]) -> float:
+        model_name = f"{model or ''} {response_model or ''}".lower()
+        if "deepseek" not in model_name or "v4-pro" not in model_name:
+            return 0.0
+
+        hit_tokens = cls._usage_int(usage, "prompt_cache_hit_tokens")
+        miss_tokens = cls._usage_int(usage, "prompt_cache_miss_tokens")
+        prompt_tokens = cls._usage_int(usage, "prompt_tokens")
+        completion_tokens = cls._usage_int(usage, "completion_tokens")
+
+        if hit_tokens == 0 and miss_tokens == 0 and prompt_tokens > 0:
+            miss_tokens = prompt_tokens
+
+        prices = cls.DEEPSEEK_V4_PRO_PRICES_PER_MILLION
+        return (
+            hit_tokens * prices["prompt_cache_hit_tokens"]
+            + miss_tokens * prices["prompt_cache_miss_tokens"]
+            + completion_tokens * prices["completion_tokens"]
+        ) / 1_000_000
+
     def sync(self, label: str, extra: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         """Record new LM calls since the previous sync and return a summary."""
 
@@ -195,6 +241,12 @@ class LMCostLogger:
             if not isinstance(entry, Mapping):
                 continue
             usage = self._usage_payload(entry.get("usage"))
+            logged_cost = self._as_float(entry.get("cost"))
+            estimated_cost = self._estimate_deepseek_cost(
+                entry.get("model"),
+                entry.get("response_model"),
+                usage,
+            )
             event = {
                 "label": label,
                 "timestamp": entry.get("timestamp"),
@@ -202,7 +254,9 @@ class LMCostLogger:
                 "model": entry.get("model"),
                 "response_model": entry.get("response_model"),
                 "model_type": entry.get("model_type"),
-                "cost_usd": self._as_float(entry.get("cost")),
+                "cost_usd": logged_cost or estimated_cost,
+                "logged_cost_usd": logged_cost,
+                "estimated_cost_usd": estimated_cost,
                 "usage": usage,
             }
             if extra:
@@ -230,16 +284,34 @@ class LMCostLogger:
 
     def summary(self) -> dict[str, Any]:
         by_model: dict[str, dict[str, Any]] = {}
+        token_totals = {
+            "prompt_tokens": 0,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
         for event in self._events:
             model = str(event.get("model") or event.get("response_model") or "unknown")
-            row = by_model.setdefault(model, {"calls": 0, "cost_usd": 0.0})
+            row = by_model.setdefault(model, {"calls": 0, "cost_usd": 0.0, "tokens": dict(token_totals)})
             row["calls"] += 1
             row["cost_usd"] += self._as_float(event.get("cost_usd"))
+            usage = event.get("usage") if isinstance(event.get("usage"), Mapping) else {}
+            for key in token_totals:
+                tokens = self._usage_int(usage, key)
+                token_totals[key] += tokens
+                row["tokens"][key] += tokens
         return {
             "total_calls": len(self._events),
             "total_cost_usd": sum(self._as_float(e.get("cost_usd")) for e in self._events),
+            "token_totals": token_totals,
             "by_model": by_model,
             "events_path": str(self.events_path),
+            "pricing_note": (
+                "DeepSeek V4 Pro estimated from official USD prices per 1M tokens: "
+                "cache_hit=$0.003625, cache_miss=$0.435, output=$0.87. "
+                "If cache hit/miss fields are absent, prompt tokens are treated as cache misses."
+            ),
         }
 
 
@@ -390,7 +462,7 @@ def _sample_local_heuristic_diagnostics(
             "ranking_mismatch": False,
         }
 
-    heuristic_values = [entry["heuristic"] for entry in successors]
+    heuristic_values = [float(entry["heuristic"]) for entry in successors]
     rounded_values = {round(value, 3) for value in heuristic_values}
     top_progress = max(successors, key=lambda entry: entry["score_normalized"])
     top_heuristic = min(successors, key=lambda entry: entry["heuristic"])
@@ -955,20 +1027,26 @@ def evaluate_prompt_per_level(
         else:
             level_output_dir = None
 
-        result = evaluate_one_game(
-            evaluator,
-            name,
-            all_game_texts[name],
-            heuristic_fn,
-            budget,
-            output_dir=level_output_dir,
-            level_i=level_i,
-            blind_baseline=(blind_baselines or {}).get(name, {}).get(level_i),
-            builtin_baseline=(builtin_baselines or {}).get(name, {}).get(level_i),
-            env_description=env_desc,
-            heuristic_code=code,
-            reflection_lm=reflection_lm,
-        )
+        try:
+            result = evaluate_one_game(
+                evaluator,
+                name,
+                all_game_texts[name],
+                heuristic_fn,
+                budget,
+                output_dir=level_output_dir,
+                level_i=level_i,
+                blind_baseline=(blind_baselines or {}).get(name, {}).get(level_i),
+                builtin_baseline=(builtin_baselines or {}).get(name, {}).get(level_i),
+                env_description=env_desc,
+                heuristic_code=code,
+                reflection_lm=reflection_lm,
+            )
+        except RuntimeError as e:
+            if "Level index out of range" in str(e):
+                print(f"    [{level_key}] skipping invalid level: {e}")
+                continue
+            raise
         result["game"] = name
         result["level"] = level_i
         result["example"] = level_key
@@ -1052,6 +1130,7 @@ def run_curriculum(
             "global_iteration": 0, "stop_reason": None,
             "best_heuristic_code": None, "best_heuristic_codes": {},
             "best_prompt_text": None,
+            "best_prompt_state": None,
         }
 
     # Run blind baseline on ALL training levels and compute per-level GEPA budgets.
@@ -1102,7 +1181,7 @@ def run_curriculum(
 
     current_phase = state["current_phase"]
     global_iteration = state["global_iteration"]
-    best_prompt_state = None
+    best_prompt_state = state.get("best_prompt_state")
     best_prompt_text = state.get("best_prompt_text") or PUZZLESCRIPT_HEURISTIC_CONTRACT
     best_code = state.get("best_heuristic_code")
     best_codes_by_game = dict(state.get("best_heuristic_codes") or {})
@@ -1263,9 +1342,13 @@ def run_curriculum(
         gepa_log_dir = logs_root / f"phase-{current_phase:02d}-gepa"
         gepa_log_dir.mkdir(parents=True, exist_ok=True)
 
-        # GEPA gets max_metric_calls = trainset_size * 3 per iteration
-        # (enough for 1 baseline + 2 candidates per job)
-        max_metric_calls = len(trainset) * 3
+        # DSPy's GEPA resumes from `log_dir` until the run reaches the supplied
+        # metric-call cap. The cap must therefore be cumulative across outer
+        # phase iterations; a fixed cap causes resumed iterations to do no work.
+        max_metric_calls = _phase_gepa_max_metric_calls(
+            phase_iteration=phase_iter + 1,
+            trainset_size=len(trainset),
+        )
 
         compiler = dspy.GEPA(
             metric=metric,
@@ -1352,6 +1435,7 @@ def run_curriculum(
             state["best_heuristic_code"] = None
             state["best_heuristic_codes"] = best_codes_by_game
             state["best_prompt_text"] = optimized_prompt_text
+            state["best_prompt_state"] = optimized_prompt_state
         else:
             rec["non_improving_streak"] += 1
 
@@ -1385,13 +1469,27 @@ def run_curriculum(
             stop_reason = "phase_iteration_cap"
         elif not is_final:
             if rec["non_improving_streak"] >= PHASE_EARLY_STOP_PATIENCE:
+                rec["advanced"] = True
                 rec["completed"] = True
-                rec["stop_reason"] = "threshold_failure_early_stop"
-                stop_reason = "threshold_failure_early_stop"
+                rec["stop_reason"] = "advanced_after_patience_cap"
+                if current_phase not in state["completed_phases"]:
+                    state["completed_phases"].append(current_phase)
+                current_phase += 1
+                state["current_phase"] = current_phase
+                print("  >>> Phase advanced after reaching non-improvement patience cap "
+                      f"without hitting solve-rate threshold ({solve_rate:.3f} < "
+                      f"{PHASE_SOLVE_RATE_THRESHOLD})")
             elif phase_iter >= max_phase_iterations:
+                rec["advanced"] = True
                 rec["completed"] = True
-                rec["stop_reason"] = "phase_iteration_cap"
-                stop_reason = "phase_iteration_cap"
+                rec["stop_reason"] = "advanced_after_iteration_cap"
+                if current_phase not in state["completed_phases"]:
+                    state["completed_phases"].append(current_phase)
+                current_phase += 1
+                state["current_phase"] = current_phase
+                print("  >>> Phase advanced after reaching iteration cap "
+                      f"without hitting solve-rate threshold ({solve_rate:.3f} < "
+                      f"{PHASE_SOLVE_RATE_THRESHOLD})")
 
         state["stop_reason"] = stop_reason
         state["llm_cost_summary"] = cost_logger.summary()

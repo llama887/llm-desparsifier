@@ -56,6 +56,23 @@ def test_synthesize_heuristic_wraps_three_argument_contract(monkeypatch):
     assert fn({"value": 3}) == 5.0
 
 
+def test_phase_gepa_max_metric_calls_is_cumulative():
+    run_puzzlescript_batch = _load_run_puzzlescript_batch()
+
+    assert run_puzzlescript_batch._phase_gepa_max_metric_calls(
+        phase_iteration=1,
+        trainset_size=29,
+    ) == 87
+    assert run_puzzlescript_batch._phase_gepa_max_metric_calls(
+        phase_iteration=2,
+        trainset_size=29,
+    ) == 174
+    assert run_puzzlescript_batch._phase_gepa_max_metric_calls(
+        phase_iteration=20,
+        trainset_size=29,
+    ) == 1740
+
+
 def test_evaluate_prompt_per_game_synthesizes_with_each_env_description(monkeypatch):
     run_puzzlescript_batch = _load_run_puzzlescript_batch()
     synthesis_calls = []

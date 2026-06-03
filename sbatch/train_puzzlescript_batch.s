@@ -84,7 +84,7 @@ fi
 "$SD_PATH/.venv/bin/python" scripts/run_puzzlescript_batch.py \
     --env-grid configs/gepa_puzzlescript_envs.yaml \
     --state-root "$BASE_STATE_ROOT" \
-    --max-phase-iterations 10 \
+    --max-phase-iterations "${MAX_PHASE_ITERATIONS:-20}" \
     --max-expansions 50000 \
     --levels-per-game "${LEVELS_PER_GAME:-3}" \
     --gepa-num-threads "${GEPA_NUM_THREADS:-4}" \
