@@ -194,6 +194,16 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher
 
 
+def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:
+    launcher = Path("sbatch/evaluate_puzzlescript_search_array.s").read_text(encoding="utf-8")
+
+    assert "runtime_ready()" in launcher
+    assert "ensure_runtime()" in launcher
+    assert "if runtime_ready; then" in launcher
+    assert "[setup] using existing PuzzleScript runtime" in launcher
+    assert "else\n    ensure_runtime\nfi" in launcher
+
+
 def test_evaluate_search_task_with_wall_timeout_terminates_stuck_worker(tmp_path: Path) -> None:
     task = {
         "task_id": 7,

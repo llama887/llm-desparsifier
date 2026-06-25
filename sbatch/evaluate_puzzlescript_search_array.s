@@ -31,48 +31,65 @@ NODE_DIR="/scratch/fyy2003/node-v20.18.0-linux-x64"
 NODE_VERSION="v20.18.0"
 SETUP_LOCK="$SLURM_SUBMIT_DIR/sbatch/logs/puzzlescript_setup.lock"
 
-(
-    flock 9
+runtime_ready() {
+    [ -x "$NODE_DIR/bin/node" ] || return 1
+    [ -x "$SD_PATH/.venv/bin/python" ] || return 1
+    [ -d "$SD_PATH/PuzzleScript" ] || return 1
+    ls "$SD_PATH"/puzzlescript_cpp/_puzzlescript_cpp*.so &>/dev/null || return 1
+}
 
-    if [ ! -f "$NODE_DIR/bin/node" ]; then
-        echo "[setup] Downloading Node.js $NODE_VERSION..."
-        curl -sL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz" \
-            | tar -xJ -C "$(dirname "$NODE_DIR")"
-    fi
+ensure_runtime() {
+    (
+        flock 9
+
+        if [ ! -f "$NODE_DIR/bin/node" ]; then
+            echo "[setup] Downloading Node.js $NODE_VERSION..."
+            curl -sL "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz" \
+                | tar -xJ -C "$(dirname "$NODE_DIR")"
+        fi
+        export PATH="$NODE_DIR/bin:$PATH"
+        echo "[setup] Node.js: $(node --version)"
+
+        if [ ! -d "$SD_PATH" ]; then
+            echo "[setup] Cloning script-doctor..."
+            git clone https://github.com/smearle/script-doctor.git "$SD_PATH"
+        fi
+
+        if [ ! -d "$SD_PATH/PuzzleScript" ]; then
+            echo "[setup] Cloning PuzzleScript engine source..."
+            git clone https://github.com/increpare/PuzzleScript.git "$SD_PATH/PuzzleScript"
+        fi
+
+        if [ ! -d "$SD_PATH/.venv" ]; then
+            echo "[setup] Creating script-doctor venv..."
+            cd "$SD_PATH"
+            uv venv --python 3.12
+            uv pip install jax lark numpy py-cpuinfo pybind11 imageio setuptools wheel \
+                python-dotenv chex openai tiktoken einops flax hydra-core Pillow javascript pyyaml \
+                "gepa>=0.0.7"
+            cd "$SLURM_SUBMIT_DIR"
+        else
+            uv pip install --python "$SD_PATH/.venv/bin/python" "gepa>=0.0.7" openai pyyaml javascript
+        fi
+
+        if ! ls "$SD_PATH"/puzzlescript_cpp/_puzzlescript_cpp*.so &>/dev/null; then
+            echo "[setup] Building C++ PuzzleScript extension..."
+            cd "$SD_PATH"
+            .venv/bin/python setup_cpp.py build_ext --inplace
+            cd "$SLURM_SUBMIT_DIR"
+        fi
+
+        mkdir -p "$SD_PATH/data/game_trees" "$SD_PATH/data/pretty_trees" "$SD_PATH/data/simplified_games"
+    ) 9>"$SETUP_LOCK"
+}
+
+if runtime_ready; then
     export PATH="$NODE_DIR/bin:$PATH"
+    echo "[setup] using existing PuzzleScript runtime"
     echo "[setup] Node.js: $(node --version)"
-
-    if [ ! -d "$SD_PATH" ]; then
-        echo "[setup] Cloning script-doctor..."
-        git clone https://github.com/smearle/script-doctor.git "$SD_PATH"
-    fi
-
-    if [ ! -d "$SD_PATH/PuzzleScript" ]; then
-        echo "[setup] Cloning PuzzleScript engine source..."
-        git clone https://github.com/increpare/PuzzleScript.git "$SD_PATH/PuzzleScript"
-    fi
-
-    if [ ! -d "$SD_PATH/.venv" ]; then
-        echo "[setup] Creating script-doctor venv..."
-        cd "$SD_PATH"
-        uv venv --python 3.12
-        uv pip install jax lark numpy py-cpuinfo pybind11 imageio setuptools wheel \
-            python-dotenv chex openai tiktoken einops flax hydra-core Pillow javascript pyyaml \
-            "gepa>=0.0.7"
-        cd "$SLURM_SUBMIT_DIR"
-    else
-        uv pip install --python "$SD_PATH/.venv/bin/python" "gepa>=0.0.7" openai pyyaml javascript
-    fi
-
-    if ! ls "$SD_PATH"/puzzlescript_cpp/_puzzlescript_cpp*.so &>/dev/null; then
-        echo "[setup] Building C++ PuzzleScript extension..."
-        cd "$SD_PATH"
-        .venv/bin/python setup_cpp.py build_ext --inplace
-        cd "$SLURM_SUBMIT_DIR"
-    fi
-
-    mkdir -p "$SD_PATH/data/game_trees" "$SD_PATH/data/pretty_trees" "$SD_PATH/data/simplified_games"
-) 9>"$SETUP_LOCK"
+else
+    ensure_runtime
+fi
 
 export PATH="$NODE_DIR/bin:$PATH"
 export PYTHONUNBUFFERED=1
