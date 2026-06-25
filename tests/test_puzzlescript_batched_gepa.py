@@ -9,6 +9,7 @@ import pytest
 from scripts.run_puzzlescript_batched_gepa import (
     assigned_tasks,
     build_sbatch_array_command,
+    context_retry_max_tokens,
     strip_outer_markdown_fences,
     validate_heuristic_code,
 )
@@ -75,3 +76,20 @@ def test_build_sbatch_array_command_exports_manifest_and_count() -> None:
     )
     assert "--time=01:00:00" in command
     assert command[-1] == "sbatch/evaluate_puzzlescript_search_array.s"
+
+
+def test_context_retry_max_tokens_uses_reported_prompt_tokens() -> None:
+    message = (
+        "This model's maximum context length is 32768 tokens. However, you requested "
+        "8192 output tokens and your prompt contains at least 24577 input tokens, "
+        "for a total of at least 32769 tokens. (parameter=input_tokens, value=24577)"
+    )
+
+    retry_tokens = context_retry_max_tokens(
+        message,
+        current_max_tokens=8192,
+        retry_margin_tokens=64,
+        min_retry_tokens=256,
+    )
+
+    assert retry_tokens == 8127

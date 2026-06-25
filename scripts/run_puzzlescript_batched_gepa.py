@@ -53,8 +53,15 @@ DEFAULT_MAX_MODEL_TOKENS = 8192
 DEFAULT_MAX_EXPANSIONS = 50_000
 DEFAULT_MAX_GEPA_EXPANSIONS_PER_LEVEL = 10_000
 DEFAULT_ASTAR_TIMEOUT_S = 30.0
+DEFAULT_CONTEXT_RETRY_MARGIN_TOKENS = 64
+DEFAULT_MIN_RETRY_OUTPUT_TOKENS = 256
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
+_CONTEXT_LENGTH_RE = re.compile(
+    r"maximum context length is\s+(?P<context>\d+)\s+tokens.*?"
+    r"prompt contains at least\s+(?P<input>\d+)\s+input tokens",
+    re.IGNORECASE | re.DOTALL,
+)
 
 PUZZLESCRIPT_HEURISTIC_CONTRACT = """You are writing a heuristic function for A* search on one PuzzleScript grid puzzle.
 
@@ -132,6 +139,8 @@ class OpenAITextClient:
     temperature: float
     top_p: float
     timeout_s: float
+    context_retry_margin_tokens: int = DEFAULT_CONTEXT_RETRY_MARGIN_TOKENS
+    min_retry_output_tokens: int = DEFAULT_MIN_RETRY_OUTPUT_TOKENS
 
     def __post_init__(self) -> None:
         from openai import OpenAI
@@ -142,15 +151,61 @@ class OpenAITextClient:
             timeout=self.timeout_s,
         )
 
-    def complete(self, prompt: str) -> str:
+    def _complete_with_max_tokens(self, prompt: str, max_tokens: int) -> str:
         response = self._client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=self.max_tokens,
+            max_tokens=max_tokens,
             temperature=self.temperature,
             top_p=self.top_p,
         )
         return str(response.choices[0].message.content or "").strip()
+
+    def complete(self, prompt: str) -> str:
+        from openai import BadRequestError
+
+        try:
+            return self._complete_with_max_tokens(prompt, self.max_tokens)
+        except BadRequestError as exc:
+            retry_max_tokens = context_retry_max_tokens(
+                str(exc),
+                current_max_tokens=self.max_tokens,
+                retry_margin_tokens=self.context_retry_margin_tokens,
+                min_retry_tokens=self.min_retry_output_tokens,
+            )
+            if retry_max_tokens is None:
+                raise
+            print(
+                "[llm] retrying context-limited request with "
+                f"max_tokens={retry_max_tokens} after rejection at max_tokens={self.max_tokens}",
+                flush=True,
+            )
+            return self._complete_with_max_tokens(prompt, retry_max_tokens)
+
+
+def context_retry_max_tokens(
+    error_message: str,
+    *,
+    current_max_tokens: int,
+    retry_margin_tokens: int = DEFAULT_CONTEXT_RETRY_MARGIN_TOKENS,
+    min_retry_tokens: int = DEFAULT_MIN_RETRY_OUTPUT_TOKENS,
+) -> Optional[int]:
+    """Return a smaller completion budget for vLLM context-limit failures.
+
+    vLLM reports both the model context window and the prompt token count in
+    OpenAI-compatible 400 errors. GEPA reflection prompts can land close to the
+    context boundary, so retrying with the remaining token budget is preferable
+    to dropping an otherwise useful proposal.
+    """
+    match = _CONTEXT_LENGTH_RE.search(error_message)
+    if match is None:
+        return None
+    context_tokens = int(match.group("context"))
+    input_tokens = int(match.group("input"))
+    retry_tokens = context_tokens - input_tokens - max(0, retry_margin_tokens)
+    if retry_tokens < min_retry_tokens or retry_tokens >= current_max_tokens:
+        return None
+    return retry_tokens
 
 
 def safe_name(text: str) -> str:
