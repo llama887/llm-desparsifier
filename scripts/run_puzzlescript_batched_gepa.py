@@ -58,6 +58,7 @@ DEFAULT_MIN_RETRY_OUTPUT_TOKENS = 256
 DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS = 1200
 DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS = 1800
 DEFAULT_REFLECTION_FEEDBACK_CHARS = 1600
+DEFAULT_REFLECTION_MAX_RECORDS = 24
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
 _CONTEXT_LENGTH_RE = re.compile(
@@ -224,6 +225,49 @@ def truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+
+
+def _trace_level(trace: Mapping[str, Any]) -> int:
+    task = trace.get("task", {})
+    try:
+        return int(task.get("level", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def reflection_trace_priority(trace: Mapping[str, Any]) -> tuple[bool, float, str, int]:
+    """Return the ordering key used to choose compact reflection examples.
+
+    Full evaluations still contribute to scalar scores, but sending every trace
+    into GEPA's prompt can exceed the local model context. Reflection is most
+    useful on failures and weak cases, so unsolved and low-scoring traces are
+    prioritized while the final tie-breakers keep selection deterministic.
+    """
+    task = trace.get("task", {})
+    result = trace.get("result", {})
+    return (
+        bool(result.get("solved", False)),
+        float(result.get("score", 0.0)),
+        str(task.get("game", "")),
+        _trace_level(trace),
+    )
+
+
+def select_reflection_traces(
+    trajectories: Sequence[Mapping[str, Any]],
+    *,
+    max_records: int = DEFAULT_REFLECTION_MAX_RECORDS,
+) -> list[Mapping[str, Any]]:
+    """Return the bounded trace subset sent to GEPA's reflection LLM.
+
+    This differs from search evaluation, which remains exhaustive over the
+    active batch. The cap only limits how much textual evidence is placed in the
+    reflection prompt for proposal generation.
+    """
+    traces = list(trajectories)
+    if max_records <= 0 or len(traces) <= max_records:
+        return traces
+    return sorted(traces, key=reflection_trace_priority)[:max_records]
 
 
 def strip_outer_markdown_fences(code: str) -> str:
@@ -772,12 +816,26 @@ class PuzzleScriptBatchedGEPAAdapter:
         The GPU path evaluates every active level in a round, so unbounded
         PuzzleScript source, generated code, and per-level feedback can push
         GEPA's reflection prompt past the local model context window. This
-        dataset keeps all traced levels but caps the high-volume fields before
-        GEPA formats the LLM prompt.
+        dataset keeps scalar scoring exhaustive while sending GEPA a bounded
+        low-scoring trace subset with capped high-volume fields.
         """
         del candidate
+        trajectories = list(eval_batch.trajectories or [])
+        selected_traces = select_reflection_traces(trajectories)
+        if len(selected_traces) < len(trajectories):
+            print(
+                "[adapter] reflection traces selected="
+                f"{len(selected_traces)}/{len(trajectories)} "
+                f"max_records={DEFAULT_REFLECTION_MAX_RECORDS}",
+                flush=True,
+            )
         records: list[dict[str, Any]] = []
-        for trace in eval_batch.trajectories or []:
+        selection_note = (
+            f"Selected {len(selected_traces)} lowest-scoring traces out of "
+            f"{len(trajectories)} evaluated levels; all levels still contributed "
+            "to the scalar score."
+        )
+        for trace in selected_traces:
             task = trace["task"]
             result = trace["result"]
             records.append(
@@ -802,6 +860,7 @@ class PuzzleScriptBatchedGEPAAdapter:
                         str(result.get("feedback", "")),
                         DEFAULT_REFLECTION_FEEDBACK_CHARS,
                     ),
+                    "Selection": selection_note,
                     "score": float(result.get("score", 0.0)),
                     "solved": bool(result.get("solved", False)),
                 }

@@ -11,10 +11,12 @@ from scripts.run_puzzlescript_batched_gepa import (
     DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS,
     DEFAULT_REFLECTION_FEEDBACK_CHARS,
     DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
+    DEFAULT_REFLECTION_MAX_RECORDS,
     PuzzleScriptBatchedGEPAAdapter,
     assigned_tasks,
     build_sbatch_array_command,
     context_retry_max_tokens,
+    select_reflection_traces,
     strip_outer_markdown_fences,
     validate_heuristic_code,
 )
@@ -156,6 +158,23 @@ def test_make_reflective_dataset_compacts_large_trace_payloads() -> None:
     assert len(record["Generated Outputs"]["heuristic_code"]) < DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS + 80
     assert len(record["Feedback"]) < DEFAULT_REFLECTION_FEEDBACK_CHARS + 80
     assert "[truncated 100 chars]" in record["Inputs"]["env_description"]
+    assert "all levels still contributed to the scalar score" in record["Selection"]
+
+
+def test_select_reflection_traces_keeps_lowest_scoring_failures() -> None:
+    trajectories = [
+        {
+            "task": {"game": f"game-{idx:02d}", "level": idx},
+            "result": {"score": float(idx), "solved": idx % 2 == 0},
+        }
+        for idx in range(DEFAULT_REFLECTION_MAX_RECORDS + 6)
+    ]
+
+    selected = select_reflection_traces(trajectories)
+
+    assert len(selected) == DEFAULT_REFLECTION_MAX_RECORDS
+    assert [trace["task"]["level"] for trace in selected[:3]] == [1, 3, 5]
+    assert all(not trace["result"]["solved"] for trace in selected[:10])
 
 
 def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
