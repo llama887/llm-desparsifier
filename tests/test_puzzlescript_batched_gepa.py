@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scripts.run_puzzlescript_batched_gepa import (
+    DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS,
+    DEFAULT_REFLECTION_FEEDBACK_CHARS,
+    DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
+    PuzzleScriptBatchedGEPAAdapter,
     assigned_tasks,
     build_sbatch_array_command,
     context_retry_max_tokens,
@@ -109,3 +114,51 @@ def test_context_retry_max_tokens_default_keeps_headroom_for_token_recount() -> 
 
     assert context_retry_max_tokens(first_message, current_max_tokens=8192) == 7679
     assert context_retry_max_tokens(second_message, current_max_tokens=7679) == 7614
+
+
+def test_make_reflective_dataset_compacts_large_trace_payloads() -> None:
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=object(),  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    eval_batch = SimpleNamespace(
+        trajectories=[
+            {
+                "task": {
+                    "game": "large-game",
+                    "level": 0,
+                    "budget": 100,
+                    "env_description": "e" * (DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS + 100),
+                },
+                "heuristic_code": "h" * (DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS + 100),
+                "synthesis_error": None,
+                "result": {
+                    "feedback": "f" * (DEFAULT_REFLECTION_FEEDBACK_CHARS + 100),
+                    "score": 0.25,
+                    "solved": False,
+                },
+            }
+        ]
+    )
+
+    dataset = adapter.make_reflective_dataset(
+        candidate={},
+        eval_batch=eval_batch,
+        components_to_update=["heuristic_prompt"],
+    )
+
+    record = dataset["heuristic_prompt"][0]
+    assert len(record["Inputs"]["env_description"]) < DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS + 80
+    assert len(record["Generated Outputs"]["heuristic_code"]) < DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS + 80
+    assert len(record["Feedback"]) < DEFAULT_REFLECTION_FEEDBACK_CHARS + 80
+    assert "[truncated 100 chars]" in record["Inputs"]["env_description"]
+
+
+def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
+    launcher = Path("sbatch/train_puzzlescript_batched_gepa_gpu.s").read_text(encoding="utf-8")
+
+    assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher

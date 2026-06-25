@@ -152,7 +152,7 @@ if [ "${START_VLLM:-1}" = "1" ]; then
     vllm serve "$LOCAL_LLM_MODEL" \
         --host 127.0.0.1 \
         --port "$VLLM_PORT" \
-        --max-model-len "${VLLM_MAX_MODEL_LEN:-32768}" \
+        --max-model-len "${VLLM_MAX_MODEL_LEN:-65536}" \
         ${VLLM_EXTRA_ARGS:-} &
     VLLM_PID=$!
 

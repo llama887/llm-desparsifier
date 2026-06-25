@@ -16,16 +16,16 @@ optimization path and uses GEPA's adapter interface directly.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 import yaml
@@ -43,7 +43,6 @@ from puzzlescript_adapter import build_env_description, build_puzzlescript_ctx  
 from puzzlescript_astar import puzzlescript_astar  # noqa: E402
 from puzzlescript_sanitizer import sanitize_and_compile_puzzlescript_heuristic  # noqa: E402
 
-
 DEFAULT_ENV_GRID = Path("configs/gepa_puzzlescript_envs.yaml")
 DEFAULT_STATE_ROOT = Path("artifacts/gepa_puzzlescript_batched_state")
 DEFAULT_SCRIPT_DOCTOR = _PROJECT_ROOT.parent / "script-doctor"
@@ -54,8 +53,11 @@ DEFAULT_MAX_EXPANSIONS = 50_000
 DEFAULT_MAX_GEPA_EXPANSIONS_PER_LEVEL = 10_000
 DEFAULT_ASTAR_TIMEOUT_S = 30.0
 DEFAULT_CONTEXT_RETRY_MARGIN_TOKENS = 512
-DEFAULT_CONTEXT_RETRY_ATTEMPTS = 4
+DEFAULT_CONTEXT_RETRY_ATTEMPTS = 8
 DEFAULT_MIN_RETRY_OUTPUT_TOKENS = 256
+DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS = 1200
+DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS = 1800
+DEFAULT_REFLECTION_FEEDBACK_CHARS = 1600
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
 _CONTEXT_LENGTH_RE = re.compile(
@@ -765,6 +767,14 @@ class PuzzleScriptBatchedGEPAAdapter:
         eval_batch: Any,
         components_to_update: list[str],
     ) -> dict[str, list[dict[str, Any]]]:
+        """Build compact GEPA reflection records from traced search results.
+
+        The GPU path evaluates every active level in a round, so unbounded
+        PuzzleScript source, generated code, and per-level feedback can push
+        GEPA's reflection prompt past the local model context window. This
+        dataset keeps all traced levels but caps the high-volume fields before
+        GEPA formats the LLM prompt.
+        """
         del candidate
         records: list[dict[str, Any]] = []
         for trace in eval_batch.trajectories or []:
@@ -776,13 +786,22 @@ class PuzzleScriptBatchedGEPAAdapter:
                         "game": task["game"],
                         "level": task["level"],
                         "budget": task["budget"],
-                        "env_description": truncate_text(task["env_description"], 6000),
+                        "env_description": truncate_text(
+                            task["env_description"],
+                            DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS,
+                        ),
                     },
                     "Generated Outputs": {
-                        "heuristic_code": truncate_text(trace.get("heuristic_code", ""), 5000),
+                        "heuristic_code": truncate_text(
+                            trace.get("heuristic_code", ""),
+                            DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
+                        ),
                         "synthesis_error": trace.get("synthesis_error"),
                     },
-                    "Feedback": truncate_text(str(result.get("feedback", "")), 6000),
+                    "Feedback": truncate_text(
+                        str(result.get("feedback", "")),
+                        DEFAULT_REFLECTION_FEEDBACK_CHARS,
+                    ),
                     "score": float(result.get("score", 0.0)),
                     "solved": bool(result.get("solved", False)),
                 }
