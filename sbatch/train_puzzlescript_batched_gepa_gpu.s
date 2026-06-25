@@ -86,6 +86,7 @@ export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$RUN_STATE_ROOT/xdg_cache}"
 export HF_HOME="${HF_HOME:-$RUN_STATE_ROOT/hf_home}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
+export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-$RUN_STATE_ROOT/flashinfer_workspace_base}"
 export FLASHINFER_WORKSPACE_DIR="${FLASHINFER_WORKSPACE_DIR:-$RUN_STATE_ROOT/flashinfer_workspace}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$RUN_STATE_ROOT/triton_cache}"
 export TORCH_HOME="${TORCH_HOME:-$RUN_STATE_ROOT/torch_home}"
@@ -95,6 +96,7 @@ mkdir -p \
     "$HF_HOME" \
     "$HUGGINGFACE_HUB_CACHE" \
     "$TRANSFORMERS_CACHE" \
+    "$FLASHINFER_WORKSPACE_BASE" \
     "$FLASHINFER_WORKSPACE_DIR" \
     "$TRITON_CACHE_DIR" \
     "$TORCH_HOME" \
@@ -129,7 +131,9 @@ HEARTBEAT_PID=$!
 echo "[gpu] Started GPU heartbeat with PID: $HEARTBEAT_PID"
 
 export LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}"
-export VLLM_PORT="${VLLM_PORT:-8000}"
+if [ -z "${VLLM_PORT:-}" ]; then
+    export VLLM_PORT="$((20000 + (${SLURM_JOB_ID:-0} % 30000)))"
+fi
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://127.0.0.1:${VLLM_PORT}/v1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 

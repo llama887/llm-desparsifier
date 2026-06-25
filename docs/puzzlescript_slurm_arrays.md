@@ -134,9 +134,11 @@ Useful knobs:
   `MAX_GEPA_ITERATIONS`.
 - `SEARCH_EXTRA_SBATCH_ARGS`: optional extra arguments appended to the internal
   CPU-array `sbatch` call.
-- `HF_HOME`, `FLASHINFER_WORKSPACE_DIR`, `TRITON_CACHE_DIR`, and related cache
+- `HF_HOME`, `FLASHINFER_WORKSPACE_BASE`, `TRITON_CACHE_DIR`, and related cache
   variables default under `STATE_ROOT` so first-time model/JIT downloads do not
   hit home-directory quota limits.
+- `VLLM_PORT`: defaults to a job-specific high port derived from `SLURM_JOB_ID`
+  to avoid node-local collisions; set it explicitly if you need a fixed port.
 
 For local smoke tests without Slurm, omit `--submit-search-array` and point the
 controller at an already running compatible endpoint:
