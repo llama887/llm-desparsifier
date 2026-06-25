@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing as mp
 import os
 import re
 import subprocess
@@ -26,6 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from queue import Empty
 from typing import Any, Mapping, Optional, Sequence
 
 import yaml
@@ -59,6 +61,7 @@ DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS = 1200
 DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS = 1800
 DEFAULT_REFLECTION_FEEDBACK_CHARS = 1600
 DEFAULT_REFLECTION_MAX_RECORDS = 24
+DEFAULT_SEARCH_TASK_WALL_TIMEOUT_S = 120.0
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
 _CONTEXT_LENGTH_RE = re.compile(
@@ -447,6 +450,29 @@ def assigned_tasks(tasks: Sequence[Mapping[str, Any]], array_index: int, array_c
     return [dict(task) for i, task in enumerate(tasks) if i % array_count == array_index]
 
 
+def search_failure_result(task: Mapping[str, Any], *, feedback: str, error: str) -> dict[str, Any]:
+    """Return a standard failed search result for one manifest task.
+
+    The array merger expects every task result to carry the same identity and
+    score fields, regardless of whether the failure happened in validation,
+    PuzzleScript compilation, A* search, or the outer wall-clock guard.
+    """
+    code_path = Path(str(task.get("heuristic_code_path", "")))
+    return {
+        "task_id": int(task["task_id"]),
+        "game": str(task["game"]),
+        "level": int(task["level"]),
+        "score": 0.0,
+        "solved": False,
+        "expanded": 0,
+        "generated": 0,
+        "solution_length": 0,
+        "feedback": feedback,
+        "heuristic_code_path": str(code_path),
+        "error": error,
+    }
+
+
 def evaluate_search_task(
     *,
     evaluator: PuzzleScriptEvaluator,
@@ -460,19 +486,11 @@ def evaluate_search_task(
     budget = int(task["budget"])
     validation_error = validate_heuristic_code(code)
     if validation_error:
-        return {
-            "task_id": int(task["task_id"]),
-            "game": game,
-            "level": level,
-            "score": 0.0,
-            "solved": False,
-            "expanded": 0,
-            "generated": 0,
-            "solution_length": 0,
-            "feedback": f"Heuristic validation failed before search: {validation_error}",
-            "heuristic_code_path": str(code_path),
-            "error": validation_error,
-        }
+        return search_failure_result(
+            task,
+            feedback=f"Heuristic validation failed before search: {validation_error}",
+            error=validation_error,
+        )
 
     try:
         raw_fn = sanitize_and_compile_puzzlescript_heuristic(code)
@@ -521,19 +539,93 @@ def evaluate_search_task(
             "heuristic_code_path": str(code_path),
         }
     except Exception as exc:
-        return {
-            "task_id": int(task["task_id"]),
-            "game": game,
-            "level": level,
-            "score": 0.0,
-            "solved": False,
-            "expanded": 0,
-            "generated": 0,
-            "solution_length": 0,
-            "feedback": f"Search evaluation failed: {exc}",
-            "heuristic_code_path": str(code_path),
-            "error": str(exc),
-        }
+        return search_failure_result(
+            task,
+            feedback=f"Search evaluation failed: {exc}",
+            error=str(exc),
+        )
+
+
+def _search_task_worker(
+    script_doctor: str,
+    task: dict[str, Any],
+    astar_timeout_s: float,
+    result_queue: Any,
+) -> None:
+    """Evaluate one search task in a child process and return its result."""
+    try:
+        evaluator = PuzzleScriptEvaluator(Path(script_doctor))
+        result = evaluate_search_task(
+            evaluator=evaluator,
+            task=task,
+            astar_timeout_s=astar_timeout_s,
+        )
+    except BaseException as exc:  # pragma: no cover - defensive child-process boundary.
+        result = search_failure_result(
+            task,
+            feedback=f"Search evaluation worker failed: {exc}",
+            error=str(exc),
+        )
+    result_queue.put(result)
+
+
+def _multiprocessing_context() -> mp.context.BaseContext:
+    if "spawn" in mp.get_all_start_methods():
+        return mp.get_context("spawn")
+    return mp.get_context("fork")
+
+
+def evaluate_search_task_with_wall_timeout(
+    *,
+    script_doctor: Path,
+    task: Mapping[str, Any],
+    astar_timeout_s: float,
+    wall_timeout_s: float,
+    worker: Any = _search_task_worker,
+) -> dict[str, Any]:
+    """Evaluate one search task with a killable wall-clock guard.
+
+    `puzzlescript_astar` has an internal timeout, but compilation, engine calls,
+    and generated heuristic execution can still wedge inside native or JS code.
+    Running each task in a child process lets the array worker convert those
+    cases into ordinary failed results instead of blocking the whole GEPA round.
+    """
+    task_payload = dict(task)
+    timeout_s = max(1.0, wall_timeout_s)
+    ctx = _multiprocessing_context()
+    result_queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(
+        target=worker,
+        args=(str(script_doctor), task_payload, astar_timeout_s, result_queue),
+    )
+    process.start()
+    process.join(timeout_s)
+    if process.is_alive():
+        process.terminate()
+        process.join(5.0)
+        if process.is_alive():
+            process.kill()
+            process.join(5.0)
+        return search_failure_result(
+            task_payload,
+            feedback=f"Search evaluation timed out after {timeout_s:.1f}s wall time.",
+            error=f"search task wall timeout after {timeout_s:.1f}s",
+        )
+    if process.exitcode not in (0, None):
+        return search_failure_result(
+            task_payload,
+            feedback=f"Search evaluation worker exited with code {process.exitcode}.",
+            error=f"worker exit code {process.exitcode}",
+        )
+    try:
+        result = result_queue.get_nowait()
+    except Empty:
+        return search_failure_result(
+            task_payload,
+            feedback="Search evaluation worker exited without returning a result.",
+            error="missing worker result",
+        )
+    return dict(result)
 
 
 def evaluate_manifest_shard(
@@ -546,11 +638,21 @@ def evaluate_manifest_shard(
     shard_dir = Path(str(manifest["shard_dir"]))
     shard_dir.mkdir(parents=True, exist_ok=True)
     script_doctor = Path(str(manifest["script_doctor"]))
-    evaluator = PuzzleScriptEvaluator(script_doctor)
     astar_timeout_s = float(manifest["astar_timeout_s"])
+    wall_timeout_s = float(
+        manifest.get(
+            "task_wall_timeout_s",
+            max(DEFAULT_SEARCH_TASK_WALL_TIMEOUT_S, astar_timeout_s + 90.0),
+        )
+    )
     tasks = assigned_tasks(manifest["tasks"], array_index, array_count)
     results = [
-        evaluate_search_task(evaluator=evaluator, task=task, astar_timeout_s=astar_timeout_s)
+        evaluate_search_task_with_wall_timeout(
+            script_doctor=script_doctor,
+            task=task,
+            astar_timeout_s=astar_timeout_s,
+            wall_timeout_s=wall_timeout_s,
+        )
         for task in tasks
     ]
     shard_path = shard_dir / f"task-{array_index:04d}-of-{array_count:04d}.json"
@@ -700,6 +802,10 @@ class PuzzleScriptBatchedGEPAAdapter:
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "script_doctor": str(self.script_doctor),
             "astar_timeout_s": self.astar_timeout_s,
+            "task_wall_timeout_s": max(
+                DEFAULT_SEARCH_TASK_WALL_TIMEOUT_S,
+                self.astar_timeout_s + 90.0,
+            ),
             "shard_dir": str(shard_dir),
             "array_count": array_count,
             "tasks": task_rows,

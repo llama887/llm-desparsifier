@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,10 +17,20 @@ from scripts.run_puzzlescript_batched_gepa import (
     assigned_tasks,
     build_sbatch_array_command,
     context_retry_max_tokens,
+    evaluate_search_task_with_wall_timeout,
     select_reflection_traces,
     strip_outer_markdown_fences,
     validate_heuristic_code,
 )
+
+
+def _stuck_search_task_worker(
+    _script_doctor: str,
+    _task: dict[str, object],
+    _astar_timeout_s: float,
+    _result_queue: object,
+) -> None:
+    time.sleep(10.0)
 
 
 def test_strip_outer_markdown_fences_accepts_python_fence() -> None:
@@ -181,3 +192,24 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     launcher = Path("sbatch/train_puzzlescript_batched_gepa_gpu.s").read_text(encoding="utf-8")
 
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher
+
+
+def test_evaluate_search_task_with_wall_timeout_terminates_stuck_worker(tmp_path: Path) -> None:
+    task = {
+        "task_id": 7,
+        "game": "stuck-game",
+        "level": 2,
+        "heuristic_code_path": str(tmp_path / "heuristic.py"),
+    }
+
+    result = evaluate_search_task_with_wall_timeout(
+        script_doctor=tmp_path,
+        task=task,
+        astar_timeout_s=1.0,
+        wall_timeout_s=0.1,
+        worker=_stuck_search_task_worker,
+    )
+
+    assert result["task_id"] == 7
+    assert result["score"] == 0.0
+    assert "wall timeout" in str(result["error"])
