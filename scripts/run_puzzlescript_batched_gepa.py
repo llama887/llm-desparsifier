@@ -53,7 +53,8 @@ DEFAULT_MAX_MODEL_TOKENS = 8192
 DEFAULT_MAX_EXPANSIONS = 50_000
 DEFAULT_MAX_GEPA_EXPANSIONS_PER_LEVEL = 10_000
 DEFAULT_ASTAR_TIMEOUT_S = 30.0
-DEFAULT_CONTEXT_RETRY_MARGIN_TOKENS = 64
+DEFAULT_CONTEXT_RETRY_MARGIN_TOKENS = 512
+DEFAULT_CONTEXT_RETRY_ATTEMPTS = 4
 DEFAULT_MIN_RETRY_OUTPUT_TOKENS = 256
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
@@ -140,6 +141,7 @@ class OpenAITextClient:
     top_p: float
     timeout_s: float
     context_retry_margin_tokens: int = DEFAULT_CONTEXT_RETRY_MARGIN_TOKENS
+    context_retry_attempts: int = DEFAULT_CONTEXT_RETRY_ATTEMPTS
     min_retry_output_tokens: int = DEFAULT_MIN_RETRY_OUTPUT_TOKENS
 
     def __post_init__(self) -> None:
@@ -164,23 +166,27 @@ class OpenAITextClient:
     def complete(self, prompt: str) -> str:
         from openai import BadRequestError
 
-        try:
-            return self._complete_with_max_tokens(prompt, self.max_tokens)
-        except BadRequestError as exc:
-            retry_max_tokens = context_retry_max_tokens(
-                str(exc),
-                current_max_tokens=self.max_tokens,
-                retry_margin_tokens=self.context_retry_margin_tokens,
-                min_retry_tokens=self.min_retry_output_tokens,
-            )
-            if retry_max_tokens is None:
-                raise
-            print(
-                "[llm] retrying context-limited request with "
-                f"max_tokens={retry_max_tokens} after rejection at max_tokens={self.max_tokens}",
-                flush=True,
-            )
-            return self._complete_with_max_tokens(prompt, retry_max_tokens)
+        max_tokens = self.max_tokens
+        for retry_index in range(max(0, self.context_retry_attempts) + 1):
+            try:
+                return self._complete_with_max_tokens(prompt, max_tokens)
+            except BadRequestError as exc:
+                retry_max_tokens = context_retry_max_tokens(
+                    str(exc),
+                    current_max_tokens=max_tokens,
+                    retry_margin_tokens=self.context_retry_margin_tokens,
+                    min_retry_tokens=self.min_retry_output_tokens,
+                )
+                if retry_max_tokens is None or retry_index >= self.context_retry_attempts:
+                    raise
+                print(
+                    "[llm] retrying context-limited request with "
+                    f"max_tokens={retry_max_tokens} after rejection at max_tokens={max_tokens}",
+                    flush=True,
+                )
+                max_tokens = retry_max_tokens
+        raise RuntimeError("unreachable context retry loop exit")
+
 
 
 def context_retry_max_tokens(

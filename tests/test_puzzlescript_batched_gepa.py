@@ -93,3 +93,19 @@ def test_context_retry_max_tokens_uses_reported_prompt_tokens() -> None:
     )
 
     assert retry_tokens == 8127
+
+
+def test_context_retry_max_tokens_default_keeps_headroom_for_token_recount() -> None:
+    first_message = (
+        "This model's maximum context length is 32768 tokens. However, you requested "
+        "8192 output tokens and your prompt contains at least 24577 input tokens, "
+        "for a total of at least 32769 tokens."
+    )
+    second_message = (
+        "This model's maximum context length is 32768 tokens. However, you requested "
+        "7679 output tokens and your prompt contains at least 24642 input tokens, "
+        "for a total of at least 32321 tokens."
+    )
+
+    assert context_retry_max_tokens(first_message, current_max_tokens=8192) == 7679
+    assert context_retry_max_tokens(second_message, current_max_tokens=7679) == 7614
