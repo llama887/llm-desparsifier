@@ -1,14 +1,14 @@
 ```python
 def dense_reward(env_params, ts_prev, action, ts_next, ctx: dict) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
     """
-    Calculates a dense reward for moving next to the red key.
+    Calculates a dense reward for moving next to the blue key.
 
     The reward is structured to guide the agent through the following stages:
-    1.  **Exploration:** A one-time bonus is given for seeing the red key for the first time.
+    1.  **Exploration:** A one-time bonus is given for seeing the blue key for the first time.
     2.  **Navigation:** A potential-based reward encourages the agent to decrease its
-        Manhattan distance to the red key.
+        Manhattan distance to the blue key.
     3.  **Achievement:** A large, one-time bonus is awarded for becoming adjacent
-        (Manhattan distance of 1) to the red key.
+        (Manhattan distance of 1) to the blue key.
     4.  **Maintenance:** A small, continuous bonus is given for remaining adjacent to the key.
     5.  **Efficiency:** A small penalty is applied at each step to encourage completing
         the task quickly.
@@ -25,15 +25,15 @@ def dense_reward(env_params, ts_prev, action, ts_next, ctx: dict) -> tuple[jnp.n
 
     # Safely access nested dictionary for object positions
     object_positions = ctx.get("object_positions", {})
-    red_key_pos = object_positions.get("red_key", jnp.array([-1, -1], dtype=jnp.int32))
+    blue_key_pos = object_positions.get("blue_key", jnp.array([-1, -1], dtype=jnp.int32))
 
     # --- Define a validity flag for position-based rewards ---
     # This prevents calculating rewards with invalid default positions (e.g., at episode start)
-    valid_positions = jnp.all(agent_pos > -1) & jnp.all(agent_pos_prev > -1) & jnp.all(red_key_pos > -1)
+    valid_positions = jnp.all(agent_pos > -1) & jnp.all(agent_pos_prev > -1) & jnp.all(blue_key_pos > -1)
 
-    # --- 1. Potential-based reward for getting closer to the red key ---
-    dist_to_key_now = jnp.sum(jnp.abs(agent_pos - red_key_pos))
-    dist_to_key_prev = jnp.sum(jnp.abs(agent_pos_prev - red_key_pos))
+    # --- 1. Potential-based reward for getting closer to the blue key ---
+    dist_to_key_now = jnp.sum(jnp.abs(agent_pos - blue_key_pos))
+    dist_to_key_prev = jnp.sum(jnp.abs(agent_pos_prev - blue_key_pos))
 
     # Potential is the negative distance. Reward is the change in potential.
     potential_now = -dist_to_key_now.astype(jnp.float32)
@@ -57,11 +57,11 @@ def dense_reward(env_params, ts_prev, action, ts_next, ctx: dict) -> tuple[jnp.n
     # Safely access nested dictionaries for visible object positions
     visible_positions = ctx.get("visible_object_positions", {})
     visible_positions_prev = ctx.get("visible_object_positions_prev", {})
-    red_key_visible_pos = visible_positions.get("red_key", jnp.array([-1, -1], dtype=jnp.int32))
-    red_key_visible_pos_prev = visible_positions_prev.get("red_key", jnp.array([-1, -1], dtype=jnp.int32))
+    blue_key_visible_pos = visible_positions.get("blue_key", jnp.array([-1, -1], dtype=jnp.int32))
+    blue_key_visible_pos_prev = visible_positions_prev.get("blue_key", jnp.array([-1, -1], dtype=jnp.int32))
 
-    is_visible_now = jnp.all(red_key_visible_pos > -1)
-    was_visible_prev = jnp.all(red_key_visible_pos_prev > -1)
+    is_visible_now = jnp.all(blue_key_visible_pos > -1)
+    was_visible_prev = jnp.all(blue_key_visible_pos_prev > -1)
 
     # One-time bonus for spotting the key
     spotted_key_bonus = jnp.where(is_visible_now & ~was_visible_prev, 5.0, 0.0)
