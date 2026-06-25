@@ -92,3 +92,59 @@ $STATE_ROOT/baseline_shards/
 
 If cache settings change, for example `LEVELS_PER_GAME`, expansion caps, timeout,
 LLM name, or prompt contract, stale shards are ignored automatically.
+
+## Batched Local-LLM GEPA
+
+Use the batched local path when API latency or DSPy internals become the
+bottleneck. This path runs one GPU controller job for the whole GEPA run. The
+controller keeps a local OpenAI-compatible model endpoint alive, starts the GPU
+heartbeat for the entire allocation, batches heuristic synthesis across all
+active levels, waits while CPU arrays run A* search, then returns to the GPU for
+GEPA reflection/proposal.
+
+```bash
+STATE_ROOT="$PWD/artifacts/gepa_puzzlescript_batched_manual" \
+LOCAL_LLM_MODEL="Qwen/Qwen3-Coder-30B-A3B-Instruct" \
+SEARCH_ARRAY_COUNT=101 \
+SEARCH_ARRAY_CONCURRENCY=64 \
+LLM_CONCURRENCY=16 \
+sbatch sbatch/train_puzzlescript_batched_gepa_gpu.s
+```
+
+The GPU job submits `sbatch/evaluate_puzzlescript_search_array.s` internally for
+each GEPA evaluation batch. Each CPU array task reads the manifest written under
+`$STATE_ROOT/candidate_evals/.../search_manifest.json`, evaluates its assigned
+level slice, and writes a shard under that evaluation directory. The controller
+merges those shards before returning scores and text feedback to standalone
+`gepa.optimize`.
+
+Useful knobs:
+
+- `START_VLLM`: defaults to `1`. Set to `0` if you already launched an
+  OpenAI-compatible endpoint and only want the controller to call it.
+- `INSTALL_VLLM`: defaults to `1` when `START_VLLM=1` and `vllm` is not already
+  on `PATH`.
+- `VLLM_MAX_MODEL_LEN`: defaults to `32768`, which is safer for single-H100
+  smoke runs than the model's full context window.
+- `VLLM_EXTRA_ARGS`: appended to `vllm serve`, for example tensor-parallel or
+  quantization flags.
+- `REFLECTION_MINIBATCH_SIZE`: defaults to `0`, meaning every GEPA reflection
+  round evaluates all active levels as one batch.
+- `MAX_METRIC_CALLS`: defaults to a budget derived from the number of levels and
+  `MAX_GEPA_ITERATIONS`.
+- `SEARCH_EXTRA_SBATCH_ARGS`: optional extra arguments appended to the internal
+  CPU-array `sbatch` call.
+
+For local smoke tests without Slurm, omit `--submit-search-array` and point the
+controller at an already running compatible endpoint:
+
+```bash
+OPENAI_BASE_URL=http://127.0.0.1:8000/v1 \
+OPENAI_API_KEY=EMPTY \
+uv run python scripts/run_puzzlescript_batched_gepa.py \
+  --state-root artifacts/gepa_puzzlescript_batched_smoke \
+  --script-doctor ../script-doctor \
+  --levels-per-game 1 \
+  --max-gepa-iterations 1 \
+  --search-array-count 4
+```
