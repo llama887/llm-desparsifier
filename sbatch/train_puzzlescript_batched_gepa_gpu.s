@@ -79,6 +79,27 @@ else
 fi
 mkdir -p "$RUN_STATE_ROOT"
 
+# Keep model and JIT caches off the home filesystem. vLLM/FlashInfer/Triton can
+# write large compiled artifacts during startup, and home quotas are too small
+# for first-time H100 model launches.
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$RUN_STATE_ROOT/xdg_cache}"
+export HF_HOME="${HF_HOME:-$RUN_STATE_ROOT/hf_home}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
+export FLASHINFER_WORKSPACE_DIR="${FLASHINFER_WORKSPACE_DIR:-$RUN_STATE_ROOT/flashinfer_workspace}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$RUN_STATE_ROOT/triton_cache}"
+export TORCH_HOME="${TORCH_HOME:-$RUN_STATE_ROOT/torch_home}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$RUN_STATE_ROOT/torchinductor_cache}"
+mkdir -p \
+    "$XDG_CACHE_HOME" \
+    "$HF_HOME" \
+    "$HUGGINGFACE_HUB_CACHE" \
+    "$TRANSFORMERS_CACHE" \
+    "$FLASHINFER_WORKSPACE_DIR" \
+    "$TRITON_CACHE_DIR" \
+    "$TORCH_HOME" \
+    "$TORCHINDUCTOR_CACHE_DIR"
+
 # Low-priority top-up work. These defaults follow the Puffer-Soccer heartbeat
 # pattern and keep the device visibly active while CPU arrays are running.
 export GPU_HEARTBEAT_TARGET_UTILIZATION="${GPU_HEARTBEAT_TARGET_UTILIZATION:-70}"

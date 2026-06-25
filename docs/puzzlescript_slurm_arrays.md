@@ -134,6 +134,9 @@ Useful knobs:
   `MAX_GEPA_ITERATIONS`.
 - `SEARCH_EXTRA_SBATCH_ARGS`: optional extra arguments appended to the internal
   CPU-array `sbatch` call.
+- `HF_HOME`, `FLASHINFER_WORKSPACE_DIR`, `TRITON_CACHE_DIR`, and related cache
+  variables default under `STATE_ROOT` so first-time model/JIT downloads do not
+  hit home-directory quota limits.
 
 For local smoke tests without Slurm, omit `--submit-search-array` and point the
 controller at an already running compatible endpoint:
