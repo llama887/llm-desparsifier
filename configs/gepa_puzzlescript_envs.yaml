@@ -1,5 +1,5 @@
 # PuzzleScript environments for GEPA curriculum.
-# Curriculum phases: first 5 jobs, first 10 jobs, then all jobs.
+# Curriculum phases: first 10 jobs, first 15 jobs, then all jobs.
 # Eval jobs are held out for validation.
 
 jobs:
@@ -7,22 +7,10 @@ jobs:
   levels: 2
   objects: 5
   grid: "6x7"
-- name: Broken_Leg_Sokoban
-  levels: 20
-  objects: 6
-  grid: "6x7"
-- name: Collapsable_Sokoban
-  levels: 7
-  objects: 5
-  grid: "10x10"
 - name: Pulling_Box_Sokoban
   levels: 21
   objects: 5
   grid: "6x8"
-- name: Swap_Sokoban
-  levels: 21
-  objects: 5
-  grid: "6x7"
 - name: Sokoban_Flipped
   levels: 21
   objects: 5
@@ -39,14 +27,34 @@ jobs:
   levels: 7
   objects: 8
   grid: "7x7"
-- name: Ultimate_Sokoban_Supreme
-  levels: 22
-  objects: 6
-  grid: "8x9"
 - name: Beams_and_Flowers
   levels: 20
   objects: 6
   grid: "10x10"
+- name: Heroes_of_Sokoban
+  levels: 31
+  objects: 0
+  grid: ""
+- name: IceCrates
+  levels: 13
+  objects: 32
+  grid: "7x7"
+- name: Ultimate_Sokoban_Supreme
+  levels: 22
+  objects: 6
+  grid: "8x9"
+- name: Broken_Leg_Sokoban
+  levels: 20
+  objects: 6
+  grid: "6x7"
+- name: Collapsable_Sokoban
+  levels: 7
+  objects: 5
+  grid: "10x10"
+- name: Swap_Sokoban
+  levels: 21
+  objects: 5
+  grid: "6x7"
 - name: Crate_Rotate
   levels: 11
   objects: 12
@@ -55,30 +63,22 @@ jobs:
   levels: 16
   objects: 32
   grid: "7x8"
-- name: IceCrates
-  levels: 13
-  objects: 32
-  grid: "7x7"
-- name: Laser
-  levels: 13
-  objects: 36
-  grid: "10x8"
 - name: Merge_and_Swap
   levels: 8
   objects: 7
   grid: "9x7"
-- name: Power_Block
-  levels: 32
-  objects: 32
-  grid: "10x3"
-- name: SwapBot
-  levels: 21
-  objects: 59
-  grid: "6x6"
-- name: ___Hey_you!_Stop_blocking_the_laser!
-  levels: 30
-  objects: 28
-  grid: "7x4"
+- name: Isle_of_Sokoban
+  levels: 17
+  objects: 0
+  grid: ""
+- name: Nethack_Sokoban
+  levels: 38
+  objects: 0
+  grid: ""
+- name: Push_-_A_-_Crate
+  levels: 28
+  objects: 0
+  grid: ""
 
 eval_jobs:
 - name: sokoban_sanity
@@ -141,26 +141,26 @@ eval_jobs:
   levels: 74
   objects: 65
   grid: "10x10"
-- name: PrograMaze
-  levels: 14
-  objects: 33
-  grid: "13x10"
+- name: Sokoban_Dungeon
+  levels: 6
+  objects: 0
+  grid: ""
 - name: All_These_Damn_Crates
   levels: 20
   objects: 6
   grid: "10x10"
-- name: Boxes_&_Balloons
-  levels: 45
-  objects: 29
-  grid: "10x9"
-- name: Lawn-Mowing_Robot
-  levels: 20
-  objects: 20
-  grid: "8x6"
-- name: Robot_Repairs_1.2
-  levels: 44
-  objects: 30
-  grid: "10x10"
+- name: Sokobot
+  levels: 15
+  objects: 0
+  grid: ""
+- name: Sokocross
+  levels: 28
+  objects: 0
+  grid: ""
+- name: Sasquatch_Sokoban
+  levels: 38
+  objects: 0
+  grid: ""
 - name: where_did_all_this_ice_come_from_
   levels: 30
   objects: 11

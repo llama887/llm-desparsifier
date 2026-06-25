@@ -20,7 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+from dspy_cache_control import configure_dspy_cache, prepare_dspy_import
+
+prepare_dspy_import("run_heuristic_batch")
 import dspy
+configure_dspy_cache(dspy, "run_heuristic_batch")
 import yaml
 from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 

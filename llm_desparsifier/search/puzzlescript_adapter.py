@@ -143,31 +143,69 @@ def build_puzzlescript_ctx(
     }
 
 
+_PUZZLESCRIPT_SECTION_HEADERS = {
+    "OBJECTS",
+    "LEGEND",
+    "SOUNDS",
+    "COLLISIONLAYERS",
+    "RULES",
+    "WINCONDITIONS",
+    "LEVELS",
+}
+
+_MAX_SOURCE_CHARS_IN_DESCRIPTION = 60_000
+
+
+def _clean_section_line(line: str) -> str:
+    clean = line.strip()
+    if not clean:
+        return ""
+    if clean.startswith("(") or clean == "======" or all(c == "=" for c in clean):
+        return ""
+    return clean
+
+
+def extract_section_text(game_text: str, section_name: str) -> str:
+    """Extract a named PuzzleScript source section with comments stripped."""
+
+    lines = []
+    in_section = False
+    wanted = section_name.strip().upper()
+    for line in game_text.split("\n"):
+        stripped = line.strip().upper()
+        if stripped == wanted:
+            in_section = True
+            continue
+        if in_section and stripped in _PUZZLESCRIPT_SECTION_HEADERS:
+            break
+        if in_section:
+            clean = _clean_section_line(line)
+            if clean:
+                lines.append(clean)
+    return "\n".join(lines)
+
+
+def _source_excerpt(game_text: str) -> str:
+    if not game_text:
+        return "(source not available)"
+    if len(game_text) <= _MAX_SOURCE_CHARS_IN_DESCRIPTION:
+        return game_text.strip()
+    half = _MAX_SOURCE_CHARS_IN_DESCRIPTION // 2
+    omitted = len(game_text) - (2 * half)
+    return (
+        game_text[:half].rstrip()
+        + f"\n\n... [{omitted} source characters omitted] ...\n\n"
+        + game_text[-half:].lstrip()
+    )
+
+
 def extract_rules_text(game_text: str) -> str:
     """Extract the RULES section from raw PuzzleScript source.
 
     PuzzleScript rules are the core mechanic — they define how objects
     interact (pushing, swapping, gravity, collapse, teleportation, etc.).
     """
-    lines = []
-    in_rules = False
-    stop_sections = {
-        "WINCONDITIONS", "LEVELS", "SOUNDS", "COLLISIONLAYERS", "LEGEND",
-    }
-    for line in game_text.split("\n"):
-        stripped = line.strip().upper()
-        if stripped == "RULES":
-            in_rules = True
-            continue
-        if in_rules and stripped in stop_sections:
-            break
-        if in_rules:
-            clean = line.strip()
-            # Skip comments and decoration
-            if clean and not clean.startswith("(") and clean != "======" \
-                    and not all(c == "=" for c in clean):
-                lines.append(clean)
-    return "\n".join(lines)
+    return extract_section_text(game_text, "RULES")
 
 
 def build_env_description(
@@ -204,7 +242,10 @@ def build_env_description(
             desc = f"All {', '.join(mask1_objs)} must be on {', '.join(mask2_objs)}"
         wc_texts.append(desc)
 
-    rules_text = extract_rules_text(game_text) if game_text else "(rules not available)"
+    legend_text = extract_section_text(game_text, "LEGEND") if game_text else ""
+    collision_text = extract_section_text(game_text, "COLLISIONLAYERS") if game_text else ""
+    rules_text = extract_rules_text(game_text) if game_text else ""
+    winconditions_source = extract_section_text(game_text, "WINCONDITIONS") if game_text else ""
 
     lines = [
         f"Game: {title}",
@@ -212,15 +253,30 @@ def build_env_description(
         f"Actions: up(0), left(1), down(2), right(3), action(4)",
         f"Win conditions: {'; '.join(wc_texts)}",
         "",
+        "PuzzleScript Legend (object aliases and composite objects):",
+        legend_text or "(legend not available)",
+        "",
+        "PuzzleScript CollisionLayers (objects on the same layer cannot overlap):",
+        collision_text or "(collision layers not available)",
+        "",
         "PuzzleScript Rules (these define the unique mechanics of this game):",
-        rules_text,
+        rules_text or "(rules not available)",
+        "",
+        "PuzzleScript WinConditions source:",
+        winconditions_source or "(win conditions source not available)",
+        "",
+        "Raw PuzzleScript source for reference:",
+        _source_excerpt(game_text),
         "",
         "The ctx dict contains:",
         "  ctx['object_positions']: dict mapping object names to lists of (x,y) positions",
         "  ctx['grid_width'], ctx['grid_height']: grid dimensions",
         "  ctx['win_conditions_text']: human-readable win conditions",
         "  ctx['ascii_state']: text rendering of current state",
+        "  ctx['score']: engine heuristic score, lower is closer to solved",
+        "  ctx['score_normalized']: engine progress signal in [0,1], higher is closer to solved",
         "  ctx['is_winning']: whether the current state is a win",
         "  ctx['object_names']: list of all object type names",
+        "  ctx['action_names']: dict mapping action ids to names",
     ]
     return "\n".join(lines)

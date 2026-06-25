@@ -5,23 +5,31 @@ Uses DSPy GEPA to optimize a prompt that causes an LLM to emit a Python
 heuristic function. The heuristic guides A* search on PuzzleScript games
 using the C++ engine for fast state transitions.
 
-Curriculum: 5 games -> 10 games, mirroring the XLand pipeline.
+Curriculum: 10 games -> 15 games -> full training set.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import math
-import os
+import re
 import statistics
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
+
+from dspy_cache_control import configure_dspy_cache, prepare_dspy_import
+
+prepare_dspy_import("run_puzzlescript_batch")
+import dspy
+configure_dspy_cache(dspy, "run_puzzlescript_batch")
+import yaml
+from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -29,19 +37,19 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 # Direct imports to avoid heavy __init__.py chains
 sys.path.insert(0, str(_PROJECT_ROOT / "llm_desparsifier" / "search"))
-from puzzle_evaluator import PuzzleScriptEvaluator
-from puzzlescript_adapter import build_env_description, build_puzzlescript_ctx
-from puzzlescript_astar import (
+from puzzle_evaluator import PuzzleScriptEvaluator  # noqa: E402
+from puzzlescript_adapter import (  # noqa: E402
+    build_env_description,
+    build_puzzlescript_ctx,
+    extract_section_text,
+)
+from puzzlescript_astar import (  # noqa: E402
     PuzzleScriptSearchResult,
     blind_heuristic,
     builtin_heuristic,
     puzzlescript_astar,
 )
-from puzzlescript_sanitizer import sanitize_and_compile_puzzlescript_heuristic
-
-import dspy
-from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
-import yaml
+from puzzlescript_sanitizer import sanitize_and_compile_puzzlescript_heuristic  # noqa: E402
 
 try:
     from dotenv import load_dotenv
@@ -82,78 +90,100 @@ SCRIPT_DOCTOR_PATH = _PROJECT_ROOT.parent / "script-doctor"
 DEFAULT_ENV_GRID = Path("configs/gepa_puzzlescript_envs.yaml")
 DEFAULT_STATE_ROOT = Path("artifacts/gepa_puzzlescript_state")
 
-CURRICULUM_PHASE_GAME_COUNTS = (5, 10)
-PHASE_SOLVE_RATE_THRESHOLD = 0.80
-PHASE_EARLY_STOP_PATIENCE = 20
-DEFAULT_MAX_PHASE_ITERATIONS = 20
+# The 5-game warmup advanced immediately in practice and spent budget on an
+# easy slice. Start with a broader phase, then expand once before the full set.
+CURRICULUM_PHASE_GAME_COUNTS = (10, 15)
+PHASE_SOLVE_RATE_THRESHOLD = 0.60
+PHASE_NEAR_THRESHOLD = 0.55
+PHASE_NEAR_THRESHOLD_PATIENCE = 3
+PHASE_EARLY_STOP_PATIENCE = 8
+DEFAULT_MAX_PHASE_ITERATIONS = 10
 DEFAULT_ASTAR_MAX_EXPANSIONS = 50_000
+DEFAULT_MAX_GEPA_EXPANSIONS_PER_LEVEL = 10_000
+DEFAULT_ASTAR_TIMEOUT_S = 30.0
 DEFAULT_LLM = "deepseek/deepseek-v4-pro"
-DEFAULT_LLM_MAX_TOKENS = 32_000
-DEFAULT_LEVELS_PER_GAME = 3
+DEFAULT_LLM_MAX_TOKENS = 384_000
+DEFAULT_LEVELS_PER_GAME = 0
 DEFAULT_GEPA_NUM_THREADS = 1
+BASELINE_CACHE_VERSION = 1
+GEPA_MAX_METRIC_CALLS_MULTIPLIER = 12
+PAIRWISE_SOLVE_BASE_BOTH_SOLVE = 0.85
+PAIRWISE_SOLVE_BASE_BOTH_FAIL = 0.02
+PAIRWISE_LOST_SOLVE_PENALTY = 1.0
+PAIRWISE_EFFICIENCY_WEIGHT = 0.10
+PAIRWISE_SPEEDUP_WEIGHT = 0.05
+PAIRWISE_REGRESSION_WEIGHT = 0.10
+BEST_PROMPT_MIN_SCORE_DELTA = 0.005
+BEST_PROMPT_SCORE_BACKOFF_FOR_SOLVE_GAIN = 0.010
 
 
 def _phase_gepa_max_metric_calls(*, phase_iteration: int, trainset_size: int) -> int:
-    """Return the cumulative GEPA metric-call cap for one resumed phase run."""
+    """Return the capped cumulative GEPA metric-call cap for one phase run."""
 
     if phase_iteration <= 0:
         raise ValueError("phase_iteration must be > 0")
     if trainset_size <= 0:
         raise ValueError("trainset_size must be > 0")
-    return phase_iteration * trainset_size * 3
+    uncapped = phase_iteration * trainset_size * 3
+    cap = trainset_size * GEPA_MAX_METRIC_CALLS_MULTIPLIER
+    return min(uncapped, cap)
 
 
-PUZZLESCRIPT_HEURISTIC_CONTRACT = """You are writing a heuristic function for A* search on a PuzzleScript grid puzzle.
+def build_curriculum_phase_schedule(train_jobs: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Build curriculum phases, ending with the complete training split."""
 
-Function signature: def heuristic_cost_to_go(ts, env_params, ctx) -> float
+    phase_schedule: list[list[dict[str, Any]]] = []
+    for count in CURRICULUM_PHASE_GAME_COUNTS:
+        phase_schedule.append(train_jobs[:count])
+    if len(train_jobs) > CURRICULUM_PHASE_GAME_COUNTS[-1]:
+        phase_schedule.append(train_jobs)
+    return phase_schedule
 
-For PuzzleScript games, ts and env_params are None. Use only ctx.
-ctx is a dict with these keys:
+
+PUZZLESCRIPT_HEURISTIC_CONTRACT = """You are writing a heuristic function for A* search on one PuzzleScript grid puzzle.
+
+Output exactly Python code defining:
+def heuristic_cost_to_go(ts, env_params, ctx) -> float
+
+Do not output markdown fences, backticks, prose, imports, print, exec, eval, open,
+or file/network access. For PuzzleScript games, ts and env_params are None; the
+function must use only ctx plus constants you derive from the prompt-time game
+source. The full source, LEGEND, COLLISIONLAYERS, RULES, WINCONDITIONS, and
+initial level state may be present in the prompt for analysis, but they are not
+runtime inputs except through ctx.
+
+Runtime ctx keys include:
+  ctx.get('game_title'): title string
   ctx.get('object_positions'): dict mapping object name -> list of (x,y) tuples
-  ctx.get('grid_width'): int, grid width
-  ctx.get('grid_height'): int, grid height
-  ctx.get('win_conditions_text'): str describing what must happen to win
-  ctx.get('ascii_state'): str, text grid of current state
-  ctx.get('is_winning'): bool, True if state is already won
+  ctx.get('grid_width'), ctx.get('grid_height'): grid dimensions
+  ctx.get('win_conditions_text'): human-readable win conditions
+  ctx.get('ascii_state'): text grid of current state
+  ctx.get('score'): engine score, lower is closer to solved
+  ctx.get('score_normalized'): engine progress in [0,1], higher is closer
+  ctx.get('is_winning'): True if state is already won
   ctx.get('object_names'): list of all object type names
+  ctx.get('action_names'): action id/name mapping
 
-IMPORTANT - read the game's PuzzleScript rules carefully. Each game has unique
-mechanics (gravity, swapping, collapsing floors, teleportation, pulling, etc.)
-that make naive distance heuristics INEFFECTIVE. Your heuristic must reason
-about the SPECIFIC mechanics of THIS game, not just measure distances.
+Read the actual PuzzleScript mechanics before choosing features. Do not assume
+the objective is crate-on-target or even Sokoban-like just because object names
+look familiar. Derive the main progress terms from WINCONDITIONS, then use RULES
+and COLLISIONLAYERS to decide whether distances, reachability, ordering,
+alignment, terrain consumption, swapping, pulling, sliding, teleportation,
+gravity, beams, or one-way effects matter.
 
-Think about:
-- What do the rules actually DO? (e.g. swap, collapse, gravity)
-- What structural patterns make a state good or bad? (deadlocks, blocking)
-- What game-specific features matter? (remaining safe tiles, vertical position)
-- Are there configurations that are provably unsolvable?
-
-DO NOT just compute Manhattan distances. That is the baseline and it performs
-poorly on games with interesting mechanics. Encode game-specific insight.
-
-Rules:
-- Return a non-negative float (lower = closer to goal, 0.0 = already won)
-- Return 0.0 if ctx.get('is_winning') is True
-- No imports, no print, no exec, no open
-- Only math builtins available (abs, min, max, sum, len, etc.)
-
-=== WHAT NOT TO DO (negative example) ===
-
-The following "blind heuristic" returns 0 for every state:
-
-    def heuristic_cost_to_go(ts, env_params, ctx):
-        return 0.0
-
-This is equivalent to BFS (breadth-first search) -- it provides NO guidance to
-A*. With this heuristic, A* degrades to uninformed search and wastes its
-expansion budget exploring states blindly. Your heuristic is evaluated with a
-budget TIGHTER than what blind search needs, so returning 0 (or any constant)
-will FAIL. You MUST return values that meaningfully distinguish states closer
-to the goal from states farther away.
-
-Similarly, a heuristic that returns a constant or near-constant value for all
-states (e.g., always returning grid_width + grid_height) is equally useless.
-The heuristic must vary based on the actual game state.
+Heuristic requirements:
+- Return a non-negative float; lower means closer to a win.
+- Return 0.0 when ctx.get('is_winning') is True.
+- Produce varied values across plausible successor states; constant heuristics
+  turn A* into blind search.
+- Prefer conservative, finite penalties. Only use very large deadlock penalties
+  for conditions that are provably impossible under this game's rules.
+- Use ctx['score_normalized'] or ctx['score'] as a small fallback or tie-breaker
+  when the game-specific features are uncertain; do not make them the only
+  signal unless there is no reliable object-level signal.
+- If unsure, build a finite fallback from win_conditions_text, object names,
+  object counts, player-to-interaction distance, and score_normalized instead
+  of hard-coding a Sokoban template.
 """
 
 
@@ -358,12 +388,33 @@ def build_level_env_description(
 
     engine.load_level(level_i)
     ctx = build_puzzlescript_ctx(engine, compiled)
+    object_positions = {
+        str(name): [[int(x), int(y)] for x, y in positions]
+        for name, positions in sorted(ctx.get("object_positions", {}).items())
+        if str(name).lower() != "background"
+    }
+    object_counts = {
+        name: len(positions)
+        for name, positions in object_positions.items()
+    }
+    root_summary = {
+        "grid_width": ctx.get("grid_width"),
+        "grid_height": ctx.get("grid_height"),
+        "win_conditions_text": ctx.get("win_conditions_text"),
+        "score": ctx.get("score"),
+        "score_normalized": ctx.get("score_normalized"),
+        "object_counts": object_counts,
+        "object_positions": object_positions,
+    }
     return (
         base_env_description
         + "\n\n"
         + f"Level of interest: {level_i}\n"
         + "Initial state for this level:\n"
         + str(ctx.get("ascii_state", ""))
+        + "\n\n"
+        + "Initial root ctx summary:\n"
+        + json.dumps(root_summary, indent=2, sort_keys=True)
         + "\n\n"
         + "Write the heuristic for this specific level while still using the rules above."
     )
@@ -375,33 +426,690 @@ def gepa_score(solved: bool, expanded: int, max_expansions: int) -> float:
     return ((n + 1) - s) / (n + 1)
 
 
-def _extract_mechanics_hints(game_text: str) -> list[str]:
-    """Return lightweight mechanic hints inferred from the raw PuzzleScript.
+def select_level_indices(n_levels: int, requested_levels: int, levels_per_game: int) -> list[int]:
+    """Select levels for GEPA.
 
-    Feedback should point the optimizer toward specific rule families when the
-    heuristic behaves poorly. We keep the detection intentionally cheap and
-    keyword-based because it runs inside GEPA evaluation.
+    `levels_per_game <= 0` means use every loadable level except the final level,
+    which is often a credits/thanks or very small terminal level in PuzzleScript
+    games. If a game only exposes one level, keep that level.
     """
 
-    lowered = game_text.lower()
-    hints: list[str] = []
-    keyword_hints = [
-        ("pull", "pull interactions"),
-        ("swap", "swap or permutation mechanics"),
-        ("teleport", "teleport or relocation rules"),
-        ("beam", "beam-style movement or transport rules"),
-        ("mud", "terrain that changes movement cost or safety"),
-        ("collapse", "collapsing or disappearing terrain"),
-        ("fall", "gravity or falling behavior"),
-        ("slide", "sliding or inertial movement"),
-        ("ice", "slippery movement constraints"),
-        ("again", "forced multi-step transitions"),
-        ("no ", "negative rule clauses or exclusion constraints"),
-    ]
-    for keyword, hint in keyword_hints:
-        if keyword in lowered and hint not in hints:
-            hints.append(hint)
-    return hints
+    if n_levels <= 0:
+        return []
+    capped = min(n_levels, max(1, requested_levels))
+    if levels_per_game > 0:
+        capped = min(capped, levels_per_game)
+        return list(range(capped))
+    if capped <= 1:
+        return [0]
+    return list(range(capped - 1))
+
+
+def filter_loadable_level_indices(
+    engine: Any,
+    level_indices: list[int],
+    game_name: str,
+) -> list[int]:
+    """Return only selected level indices that the PuzzleScript engine can load."""
+
+    loadable: list[int] = []
+    for level_i in level_indices:
+        try:
+            engine.load_level(level_i)
+        except Exception as e:
+            print(f"  [WARN] Skipping {game_name} level={level_i}: {e}")
+            continue
+        loadable.append(level_i)
+    return loadable
+
+
+def prepare_puzzlescript_inputs(
+    evaluator: PuzzleScriptEvaluator,
+    train_jobs: list[dict[str, Any]],
+    eval_jobs: list[dict[str, Any]],
+    sd_path: Path,
+    levels_per_game: int,
+) -> tuple[
+    dict[str, str],
+    dict[str, str],
+    dict[str, dict[int, str]],
+    dict[str, list[int]],
+]:
+    """Compile selected games and build per-level prompt descriptions."""
+
+    all_game_texts: dict[str, str] = {}
+    all_env_descs: dict[str, str] = {}
+    all_level_env_descs: dict[str, dict[int, str]] = {}
+    level_indices_by_game: dict[str, list[int]] = {}
+    for entry in train_jobs + eval_jobs:
+        name = str(entry["name"])
+        if name in all_game_texts:
+            continue
+        text = load_game_text(name, sd_path)
+        if text:
+            try:
+                json_str = evaluator.compile_game(text)
+                compiled = json.loads(json_str)
+                engine = evaluator.load_engine(json_str)
+                engine.load_level(0)
+                n_levels = engine.get_num_levels()
+                requested_levels = max(1, int(entry.get("levels", n_levels) or n_levels))
+                selected_level_indices = select_level_indices(
+                    n_levels=n_levels,
+                    requested_levels=requested_levels,
+                    levels_per_game=levels_per_game,
+                )
+                loadable_level_indices = filter_loadable_level_indices(
+                    engine=engine,
+                    level_indices=selected_level_indices,
+                    game_name=name,
+                )
+                if not loadable_level_indices:
+                    print(f"  [WARN] Skipping {name}: no selected levels were loadable")
+                    continue
+                all_game_texts[name] = text
+                level_indices_by_game[name] = loadable_level_indices
+                base_desc = build_env_description(compiled, engine.get_id_dict(), text)
+                all_env_descs[name] = base_desc
+                all_level_env_descs[name] = {
+                    level_i: build_level_env_description(base_desc, engine, compiled, level_i)
+                    for level_i in level_indices_by_game[name]
+                }
+            except Exception as e:
+                print(f"  [WARN] Could not compile {name}: {e}")
+
+    return all_game_texts, all_env_descs, all_level_env_descs, level_indices_by_game
+
+
+def build_training_level_examples(
+    train_jobs: list[dict[str, Any]],
+    all_game_texts: Mapping[str, str],
+    level_indices_by_game: Mapping[str, list[int]],
+) -> list[dict[str, int | str]]:
+    """Return selected train game/level examples in stable grid order."""
+
+    examples: list[dict[str, int | str]] = []
+    for entry in train_jobs:
+        name = str(entry["name"])
+        if name not in all_game_texts:
+            continue
+        for level_i in level_indices_by_game.get(name, [0]):
+            examples.append({"game": name, "level": int(level_i)})
+    return examples
+
+
+def _baseline_cache_path(state_root: Path) -> Path:
+    return state_root / "puzzlescript_baselines.json"
+
+
+def _baseline_shard_dir(state_root: Path) -> Path:
+    return state_root / "baseline_shards"
+
+
+def build_baseline_cache_signature(
+    *,
+    train_jobs: list[dict[str, Any]],
+    level_indices_by_game: Mapping[str, list[int]],
+    max_expansions: int,
+    max_gepa_expansions_per_level: int,
+    astar_timeout_s: float,
+    levels_per_game: int,
+    llm_name: str,
+    llm_max_tokens: int,
+) -> dict[str, Any]:
+    """Build the compatibility key for baseline caches and array shards."""
+
+    train_levels = {
+        str(entry["name"]): [
+            int(level_i) for level_i in level_indices_by_game.get(str(entry["name"]), [])
+        ]
+        for entry in train_jobs
+        if str(entry["name"]) in level_indices_by_game
+    }
+    contract_sha16 = hashlib.sha256(
+        PUZZLESCRIPT_HEURISTIC_CONTRACT.encode("utf-8")
+    ).hexdigest()[:16]
+    return {
+        "version": BASELINE_CACHE_VERSION,
+        "train_levels": train_levels,
+        "max_expansions": int(max_expansions),
+        "max_gepa_expansions_per_level": int(max_gepa_expansions_per_level),
+        "astar_timeout_s": float(astar_timeout_s),
+        "levels_per_game": int(levels_per_game),
+        "llm_name": str(llm_name),
+        "llm_max_tokens": int(llm_max_tokens),
+        "base_prompt_sha16": contract_sha16,
+    }
+
+
+def _level_key_to_int(level_key: Any) -> int:
+    text = str(level_key)
+    if text.startswith("level-"):
+        text = text.split("-", 1)[1]
+    return int(text)
+
+
+def _normalize_baseline_map(raw: Any) -> dict[str, dict[int, dict[str, Any]]]:
+    normalized: dict[str, dict[int, dict[str, Any]]] = {}
+    if not isinstance(raw, Mapping):
+        return normalized
+    for game, levels in raw.items():
+        if not isinstance(levels, Mapping):
+            continue
+        game_key = str(game)
+        for level_key, payload in levels.items():
+            if not isinstance(payload, Mapping):
+                continue
+            try:
+                level_i = _level_key_to_int(level_key)
+            except (TypeError, ValueError):
+                continue
+            normalized.setdefault(game_key, {})[level_i] = dict(payload)
+    return normalized
+
+
+def _normalize_budget_map(raw: Any) -> dict[str, dict[int, int]]:
+    normalized: dict[str, dict[int, int]] = {}
+    if not isinstance(raw, Mapping):
+        return normalized
+    for game, levels in raw.items():
+        if not isinstance(levels, Mapping):
+            continue
+        game_key = str(game)
+        for level_key, budget in levels.items():
+            try:
+                level_i = _level_key_to_int(level_key)
+                normalized.setdefault(game_key, {})[level_i] = int(budget)
+            except (TypeError, ValueError):
+                continue
+    return normalized
+
+
+def _jsonable_nested_map(
+    mapping: Mapping[str, Mapping[int, Any]],
+) -> dict[str, dict[str, Any]]:
+    return {
+        str(game): {str(int(level_i)): value for level_i, value in sorted(levels.items())}
+        for game, levels in sorted(mapping.items())
+    }
+
+
+def _merge_nested_map(
+    target: dict[str, dict[int, Any]],
+    incoming: Mapping[str, Mapping[int, Any]],
+) -> None:
+    for game, levels in incoming.items():
+        target.setdefault(str(game), {}).update(
+            {int(level_i): value for level_i, value in levels.items()}
+        )
+
+
+def load_cached_puzzlescript_baselines(
+    state_root: Path,
+    signature: Mapping[str, Any],
+) -> tuple[
+    dict[str, dict[int, dict[str, Any]]],
+    dict[str, dict[int, dict[str, Any]]],
+    dict[str, dict[int, dict[str, Any]]],
+    dict[str, dict[int, int]],
+    list[Path],
+]:
+    """Load matching canonical baseline cache and any completed array shards."""
+
+    blind_baselines: dict[str, dict[int, dict[str, Any]]] = {}
+    builtin_baselines: dict[str, dict[int, dict[str, Any]]] = {}
+    base_prompt_baselines: dict[str, dict[int, dict[str, Any]]] = {}
+    per_game_budgets: dict[str, dict[int, int]] = {}
+    loaded_paths: list[Path] = []
+    candidate_paths = [_baseline_cache_path(state_root)]
+    shard_dir = _baseline_shard_dir(state_root)
+    if shard_dir.exists():
+        candidate_paths.extend(sorted(shard_dir.glob("*.json")))
+
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(f"  [baseline-cache] ignoring unreadable {path}: {exc}")
+            continue
+        if payload.get("signature") != dict(signature):
+            print(f"  [baseline-cache] ignoring stale {path}")
+            continue
+        _merge_nested_map(
+            blind_baselines,
+            _normalize_baseline_map(payload.get("blind_baselines")),
+        )
+        _merge_nested_map(
+            builtin_baselines,
+            _normalize_baseline_map(payload.get("builtin_baselines")),
+        )
+        _merge_nested_map(
+            base_prompt_baselines,
+            _normalize_baseline_map(payload.get("base_prompt_baselines")),
+        )
+        _merge_nested_map(
+            per_game_budgets,
+            _normalize_budget_map(payload.get("per_game_budgets")),
+        )
+        loaded_paths.append(path)
+    return (
+        blind_baselines,
+        builtin_baselines,
+        base_prompt_baselines,
+        per_game_budgets,
+        loaded_paths,
+    )
+
+
+def _baseline_payload(
+    *,
+    signature: Mapping[str, Any],
+    blind_baselines: Mapping[str, Mapping[int, dict[str, Any]]],
+    builtin_baselines: Mapping[str, Mapping[int, dict[str, Any]]],
+    base_prompt_baselines: Mapping[str, Mapping[int, dict[str, Any]]],
+    per_game_budgets: Mapping[str, Mapping[int, int]],
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    payload = {
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "signature": dict(signature),
+        "blind_baselines": _jsonable_nested_map(blind_baselines),
+        "builtin_baselines": _jsonable_nested_map(builtin_baselines),
+        "base_prompt_baselines": _jsonable_nested_map(base_prompt_baselines),
+        "per_game_budgets": _jsonable_nested_map(per_game_budgets),
+    }
+    if metadata:
+        payload["metadata"] = dict(metadata)
+    return payload
+
+
+def save_puzzlescript_baseline_cache(
+    state_root: Path,
+    *,
+    signature: Mapping[str, Any],
+    blind_baselines: Mapping[str, Mapping[int, dict[str, Any]]],
+    builtin_baselines: Mapping[str, Mapping[int, dict[str, Any]]],
+    base_prompt_baselines: Mapping[str, Mapping[int, dict[str, Any]]],
+    per_game_budgets: Mapping[str, Mapping[int, int]],
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Path:
+    """Write the merged canonical baseline cache atomically."""
+
+    state_root.mkdir(parents=True, exist_ok=True)
+    path = _baseline_cache_path(state_root)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(
+            _baseline_payload(
+                signature=signature,
+                blind_baselines=blind_baselines,
+                builtin_baselines=builtin_baselines,
+                base_prompt_baselines=base_prompt_baselines,
+                per_game_budgets=per_game_budgets,
+                metadata=metadata,
+            ),
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+    return path
+
+
+def save_puzzlescript_baseline_shard(
+    state_root: Path,
+    shard_name: str,
+    *,
+    signature: Mapping[str, Any],
+    blind_baselines: Mapping[str, Mapping[int, dict[str, Any]]],
+    builtin_baselines: Mapping[str, Mapping[int, dict[str, Any]]],
+    base_prompt_baselines: Mapping[str, Mapping[int, dict[str, Any]]],
+    per_game_budgets: Mapping[str, Mapping[int, int]],
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Path:
+    """Write one Slurm array task's baseline shard."""
+
+    shard_dir = _baseline_shard_dir(state_root)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", shard_name).strip("_") or "task"
+    path = shard_dir / f"{safe_name}.json"
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(
+            _baseline_payload(
+                signature=signature,
+                blind_baselines=blind_baselines,
+                builtin_baselines=builtin_baselines,
+                base_prompt_baselines=base_prompt_baselines,
+                per_game_budgets=per_game_budgets,
+                metadata=metadata,
+            ),
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+    return path
+
+
+def missing_puzzlescript_baseline_examples(
+    examples: list[Mapping[str, Any]],
+    *,
+    blind_baselines: Mapping[str, Mapping[int, Any]],
+    builtin_baselines: Mapping[str, Mapping[int, Any]],
+    base_prompt_baselines: Mapping[str, Mapping[int, Any]],
+    per_game_budgets: Mapping[str, Mapping[int, int]],
+) -> list[dict[str, int | str]]:
+    """Return examples that do not have all three baseline families cached."""
+
+    missing: list[dict[str, int | str]] = []
+    for example in examples:
+        game = str(example["game"])
+        level_i = int(example["level"])
+        if (
+            level_i not in blind_baselines.get(game, {})
+            or level_i not in builtin_baselines.get(game, {})
+            or level_i not in base_prompt_baselines.get(game, {})
+            or level_i not in per_game_budgets.get(game, {})
+        ):
+            missing.append({"game": game, "level": level_i})
+    return missing
+
+
+def compute_puzzlescript_baselines_for_examples(
+    *,
+    evaluator: PuzzleScriptEvaluator,
+    examples: list[Mapping[str, Any]],
+    all_game_texts: Mapping[str, str],
+    all_level_env_descs: Mapping[str, Mapping[int, str]],
+    all_env_descs: Mapping[str, str],
+    max_expansions: int,
+    max_gepa_expansions_per_level: int,
+    astar_timeout_s: float,
+    lm: Any,
+) -> tuple[
+    dict[str, dict[int, dict[str, Any]]],
+    dict[str, dict[int, dict[str, Any]]],
+    dict[str, dict[int, dict[str, Any]]],
+    dict[str, dict[int, int]],
+]:
+    """Compute blind, built-in, and base-prompt baselines for game/level examples."""
+
+    blind_baselines: dict[str, dict[int, dict[str, Any]]] = {}
+    builtin_baselines: dict[str, dict[int, dict[str, Any]]] = {}
+    base_prompt_baselines: dict[str, dict[int, dict[str, Any]]] = {}
+    per_game_budgets: dict[str, dict[int, int]] = {}
+
+    for example in examples:
+        name = str(example["game"])
+        level_i = int(example["level"])
+        if name not in all_game_texts:
+            continue
+        print(f"  [baseline] {name} level={level_i}: blind A*")
+        blind_result = evaluate_one_game(
+            evaluator,
+            name,
+            all_game_texts[name],
+            blind_heuristic,
+            max_expansions,
+            level_i=level_i,
+            astar_timeout_s=astar_timeout_s,
+        )
+        blind_baselines.setdefault(name, {})[level_i] = blind_result
+        if blind_result["solved"] and blind_result["expanded"] > 0:
+            calibrated_budget = max(math.floor(0.95 * blind_result["expanded"]), 1)
+        else:
+            calibrated_budget = max_expansions
+        budget = min(calibrated_budget, max_gepa_expansions_per_level)
+        per_game_budgets.setdefault(name, {})[level_i] = budget
+        print(
+            f"    blind solved={blind_result['solved']} expanded={blind_result['expanded']} "
+            f"score={blind_result['score']:.4f} -> gepa_budget={budget}"
+        )
+
+        print(f"  [baseline] {name} level={level_i}: built-in heuristic")
+        builtin_result = evaluate_one_game(
+            evaluator,
+            name,
+            all_game_texts[name],
+            builtin_heuristic,
+            budget,
+            level_i=level_i,
+            astar_timeout_s=astar_timeout_s,
+        )
+        builtin_baselines.setdefault(name, {})[level_i] = builtin_result
+        print(
+            f"    builtin solved={builtin_result['solved']} "
+            f"expanded={builtin_result['expanded']} score={builtin_result['score']:.4f}"
+        )
+
+        print(f"  [baseline] {name} level={level_i}: base-prompt LLM heuristic")
+        env_desc = all_level_env_descs.get(name, {}).get(level_i, all_env_descs.get(name, name))
+        heuristic_fn, code, error = synthesize_heuristic_from_prompt(
+            PUZZLESCRIPT_HEURISTIC_CONTRACT,
+            env_desc,
+            lm,
+            preflight_evaluator=evaluator,
+            preflight_game_text=all_game_texts[name],
+            preflight_level_i=level_i,
+        )
+        if error:
+            print(f"    base-prompt synthesis error: {error[:160]}")
+            heuristic_fn = builtin_heuristic
+            code = f"# FALLBACK: {error[:200]}"
+        base_result = evaluate_one_game(
+            evaluator,
+            name,
+            all_game_texts[name],
+            heuristic_fn,
+            budget,
+            level_i=level_i,
+            blind_baseline=blind_result,
+            builtin_baseline=builtin_result,
+            env_description=env_desc,
+            heuristic_code=code,
+            astar_timeout_s=astar_timeout_s,
+        )
+        base_result["heuristic_code"] = code
+        base_prompt_baselines.setdefault(name, {})[level_i] = base_result
+        print(
+            f"    base_prompt solved={base_result['solved']} "
+            f"expanded={base_result['expanded']} score={base_result['score']:.4f}"
+        )
+
+    return blind_baselines, builtin_baselines, base_prompt_baselines, per_game_budgets
+
+
+def _pairwise_gepa_metric(
+    *,
+    candidate: PuzzleScriptSearchResult | Mapping[str, Any],
+    base_prompt_baseline: Optional[Mapping[str, Any]],
+    max_expansions: int,
+) -> dict[str, Any]:
+    """Return one scalar metric plus a detailed base-prompt comparison."""
+
+    cand_solved = bool(
+        candidate.solved if isinstance(candidate, PuzzleScriptSearchResult)
+        else candidate.get("solved", False)
+    )
+    cand_expanded = int(
+        candidate.expanded_states if isinstance(candidate, PuzzleScriptSearchResult)
+        else candidate.get("expanded", max_expansions)
+    )
+    if base_prompt_baseline is None:
+        fallback = gepa_score(cand_solved, cand_expanded, max_expansions)
+        return {
+            "metric": fallback,
+            "raw_metric": fallback,
+            "outcome_class": "no_base_prompt_baseline",
+            "base_solved": None,
+            "base_expanded": None,
+            "candidate_solved": cand_solved,
+            "candidate_expanded": cand_expanded,
+            "efficiency_gain_pct": None,
+            "solve_component": fallback,
+            "efficiency_component": 0.0,
+            "speedup_component": 0.0,
+            "regression_penalty": 0.0,
+        }
+
+    base_solved = bool(base_prompt_baseline.get("solved", False))
+    base_expanded = int(base_prompt_baseline.get("expanded", max_expansions))
+    if cand_solved and not base_solved:
+        solve_component = 1.0
+        outcome_class = "new_solve"
+    elif cand_solved and base_solved:
+        solve_component = PAIRWISE_SOLVE_BASE_BOTH_SOLVE
+        outcome_class = "preserved_solve"
+    elif not cand_solved and not base_solved:
+        solve_component = PAIRWISE_SOLVE_BASE_BOTH_FAIL
+        outcome_class = "both_failed"
+    else:
+        solve_component = -PAIRWISE_LOST_SOLVE_PENALTY
+        outcome_class = "lost_solve"
+
+    if cand_solved:
+        efficiency_component = max(0.0, 1.0 - cand_expanded / max(max_expansions, 1))
+    else:
+        efficiency_component = 0.0
+
+    speedup_component = 0.0
+    if cand_solved and base_solved:
+        denom = max(base_expanded, 1)
+        regression_penalty = max(0.0, cand_expanded - base_expanded) / denom
+        efficiency_gain_pct = 100.0 * (base_expanded - cand_expanded) / denom
+        speedup_component = max(
+            -1.0,
+            min(1.0, math.log((base_expanded + 1) / max(cand_expanded + 1, 1))),
+        )
+        if cand_expanded < base_expanded:
+            outcome_class = "preserved_solve_faster"
+        elif cand_expanded > base_expanded:
+            outcome_class = "preserved_solve_slower"
+        else:
+            outcome_class = "preserved_solve_same_expansions"
+    elif base_solved and not cand_solved:
+        regression_penalty = 1.0
+        efficiency_gain_pct = 100.0 * (base_expanded - cand_expanded) / max(base_expanded, 1)
+    elif base_expanded > 0:
+        regression_penalty = 0.0
+        efficiency_gain_pct = 100.0 * (base_expanded - cand_expanded) / base_expanded
+    else:
+        regression_penalty = 0.0
+        efficiency_gain_pct = None
+
+    raw_metric = (
+        solve_component
+        + PAIRWISE_EFFICIENCY_WEIGHT * efficiency_component
+        + PAIRWISE_SPEEDUP_WEIGHT * speedup_component
+        - PAIRWISE_REGRESSION_WEIGHT * regression_penalty
+    )
+    metric = max(-1.0, min(1.0, raw_metric))
+    return {
+        "metric": metric,
+        "raw_metric": raw_metric,
+        "outcome_class": outcome_class,
+        "base_solved": base_solved,
+        "base_expanded": base_expanded,
+        "candidate_solved": cand_solved,
+        "candidate_expanded": cand_expanded,
+        "efficiency_gain_pct": efficiency_gain_pct,
+        "solve_component": solve_component,
+        "efficiency_component": efficiency_component,
+        "speedup_component": speedup_component,
+        "regression_penalty": regression_penalty,
+    }
+
+
+def _object_counts_from_ctx(root_ctx: Optional[Mapping[str, Any]]) -> dict[str, int]:
+    if not root_ctx:
+        return {}
+    counts: dict[str, int] = {}
+    for name, positions in (root_ctx.get("object_positions") or {}).items():
+        if str(name).lower() == "background":
+            continue
+        try:
+            count = len(positions)
+        except TypeError:
+            continue
+        if count:
+            counts[str(name)] = int(count)
+    return dict(sorted(counts.items()))
+
+
+def _relevant_object_names(root_ctx: Optional[Mapping[str, Any]]) -> set[str]:
+    if not root_ctx:
+        return set()
+    names = {str(name) for name in (root_ctx.get("object_positions") or {})}
+    win_text = str(root_ctx.get("win_conditions_text", "")).lower()
+    object_names = [str(name) for name in root_ctx.get("object_names", [])]
+    for name in object_names:
+        if name.lower() in win_text:
+            names.add(name)
+    return {name for name in names if name and name.lower() != "background"}
+
+
+def _extract_relevant_rule_snippets(
+    game_text: str,
+    root_ctx: Optional[Mapping[str, Any]],
+    *,
+    limit: int = 8,
+) -> list[str]:
+    """Return source-grounded rule lines mentioning current or win-condition objects."""
+
+    rules_text = extract_section_text(game_text, "RULES")
+    rule_lines = [line.strip() for line in rules_text.splitlines() if line.strip()]
+    if not rule_lines:
+        return []
+
+    object_names = sorted(_relevant_object_names(root_ctx), key=len, reverse=True)
+    relevant: list[str] = []
+    for line in rule_lines:
+        lowered = line.lower()
+        if any(re.search(rf"\b{re.escape(name.lower())}\b", lowered) for name in object_names):
+            relevant.append(line)
+        if len(relevant) >= limit:
+            break
+    if relevant:
+        return relevant
+    return rule_lines[:limit]
+
+
+def _source_context_feedback(
+    *,
+    game_text: str,
+    root_ctx: Optional[Mapping[str, Any]],
+) -> list[str]:
+    lines: list[str] = []
+    if root_ctx:
+        win_text = str(root_ctx.get("win_conditions_text", "unknown"))
+        lines.append(f"Runtime win_conditions_text: {win_text}")
+        counts = _object_counts_from_ctx(root_ctx)
+        if counts:
+            lines.append("Initial object counts: " + json.dumps(counts, sort_keys=True))
+        score = root_ctx.get("score")
+        score_norm = root_ctx.get("score_normalized")
+        lines.append(f"Initial engine progress: score={score} score_normalized={score_norm}")
+
+    winconditions_source = extract_section_text(game_text, "WINCONDITIONS")
+    if winconditions_source:
+        compact_win = " | ".join(winconditions_source.splitlines()[:4])
+        lines.append(f"WINCONDITIONS source: {compact_win}")
+
+    snippets = _extract_relevant_rule_snippets(game_text, root_ctx)
+    if snippets:
+        lines.append("Relevant RULES snippets: " + " | ".join(snippets))
+    else:
+        lines.append("No RULES snippets were available; rely on win conditions and runtime ctx.")
+    return lines
 
 
 def _sample_local_heuristic_diagnostics(
@@ -419,11 +1127,16 @@ def _sample_local_heuristic_diagnostics(
 
     initial_backup = engine.backup_level()
     root_ctx = build_puzzlescript_ctx(engine, compiled_json)
-    try:
-        root_h = float(heuristic_fn(root_ctx))
-    except Exception:
-        root_h = 0.0
-    root_h = max(0.0, root_h)
+    def _safe_heuristic_value(ctx: Mapping[str, Any]) -> float:
+        try:
+            value = float(heuristic_fn(ctx))
+        except Exception:
+            return 0.0
+        if not math.isfinite(value):
+            return 0.0
+        return max(0.0, value)
+
+    root_h = _safe_heuristic_value(root_ctx)
 
     has_action = not engine.has_metadata("noaction") if hasattr(engine, "has_metadata") else True
     n_actions = 5 if has_action else 4
@@ -434,11 +1147,7 @@ def _sample_local_heuristic_diagnostics(
         if not _process_action_with_again(engine, action):
             continue
         ctx = build_puzzlescript_ctx(engine, compiled_json)
-        try:
-            h_val = float(heuristic_fn(ctx))
-        except Exception:
-            h_val = 0.0
-        h_val = max(0.0, h_val)
+        h_val = _safe_heuristic_value(ctx)
         successors.append(
             {
                 "action": action,
@@ -493,8 +1202,11 @@ def _build_feedback_report(
     result: PuzzleScriptSearchResult,
     max_expansions: int,
     diagnostics: dict[str, Any],
+    root_ctx: Optional[Mapping[str, Any]] = None,
     blind_baseline: Optional[dict[str, Any]] = None,
     builtin_baseline: Optional[dict[str, Any]] = None,
+    base_prompt_baseline: Optional[dict[str, Any]] = None,
+    metric_breakdown: Optional[dict[str, Any]] = None,
 ) -> str:
     """Build structured feedback for GEPA reflection.
 
@@ -503,9 +1215,13 @@ def _build_feedback_report(
     likely mechanic families that deserve attention.
     """
 
+    metric_breakdown = metric_breakdown or {}
     outcome_lines = [
         f"Game: {game_name}",
-        f"Outcome: solved={result.solved} score={result.score:.4f}",
+        (
+            f"Outcome: solved={result.solved} raw_search_score={result.score:.4f} "
+            f"metric={float(metric_breakdown.get('metric', result.score)):.4f}"
+        ),
         (
             "Search stats: "
             f"expanded={result.expanded_states}/{max_expansions} "
@@ -513,6 +1229,25 @@ def _build_feedback_report(
             f"solution_length={result.solution_length}"
         ),
     ]
+    if base_prompt_baseline is not None:
+        base_expanded = int(base_prompt_baseline.get("expanded", max_expansions))
+        base_solved = bool(base_prompt_baseline.get("solved", False))
+        gain = metric_breakdown.get("efficiency_gain_pct")
+        gain_text = "n/a" if gain is None else f"{float(gain):+.1f}%"
+        outcome_lines.append(
+            "Base-prompt comparison: "
+            f"outcome={metric_breakdown.get('outcome_class', 'unknown')} "
+            f"base_solved={base_solved} candidate_solved={result.solved} "
+            f"base_expanded={base_expanded} candidate_expanded={result.expanded_states} "
+            f"efficiency_gain={gain_text}"
+        )
+        outcome_lines.append(
+            "Metric components: "
+            f"solve={float(metric_breakdown.get('solve_component', 0.0)):.3f} "
+            f"efficiency={float(metric_breakdown.get('efficiency_component', 0.0)):.3f} "
+            f"speedup={float(metric_breakdown.get('speedup_component', 0.0)):.3f} "
+            f"regression_penalty={float(metric_breakdown.get('regression_penalty', 0.0)):.3f}"
+        )
 
     if blind_baseline is not None:
         blind_expanded = int(blind_baseline.get("expanded", 0))
@@ -535,7 +1270,6 @@ def _build_feedback_report(
 
     observed_issues: list[str] = []
     counterexamples: list[str] = []
-    mechanics_hints = _extract_mechanics_hints(game_text)
 
     expansion_ratio = result.expanded_states / max(max_expansions, 1)
     if not result.solved:
@@ -575,20 +1309,47 @@ def _build_feedback_report(
         if blind_expanded > 0 and result.expanded_states >= blind_expanded:
             observed_issues.append("This solved run does not outperform blind search on expansion count, so the heuristic is adding little value.")
 
+    outcome_class = metric_breakdown.get("outcome_class")
+    if outcome_class == "new_solve":
+        observed_issues.append(
+            "This is a new solve relative to the base prompt; preserve the mechanic-specific idea that made the level solvable."
+        )
+        counterexamples.append(
+            "Prompt repair: identify which rule family enabled the new solve and make that rule-analysis step explicit in the rewritten prompt."
+        )
+    elif outcome_class == "preserved_solve_faster":
+        observed_issues.append(
+            "The candidate preserves the base solve and improves expansion efficiency; keep the ranking features that reduced search."
+        )
+        counterexamples.append(
+            "Prompt repair: strengthen this style of successor ranking and tie-breaking for similar games."
+        )
+    elif outcome_class == "preserved_solve_slower":
+        observed_issues.append(
+            "The candidate preserves solvability but is slower than the base prompt, so the prompt likely weakened local ranking or introduced broad plateaus."
+        )
+        counterexamples.append(
+            "Prompt repair: add finer tie-breakers such as player-to-interaction distance, object progress, and small penalties for reversible wandering; avoid broad constant values."
+        )
+    elif outcome_class == "lost_solve":
+        observed_issues.append(
+            "The candidate lost a level that the base prompt solved, suggesting an over-specific assumption, wrong object mapping, or unjustified deadlock penalty."
+        )
+        counterexamples.append(
+            "Prompt repair: require a conservative fallback based directly on win_conditions_text and object names before adding hard deadlocks or Sokoban-specific assumptions."
+        )
+    elif outcome_class == "both_failed":
+        observed_issues.append(
+            "Both candidate and base failed, so the prompt likely needs a new game-mechanic abstraction rather than small distance tuning."
+        )
+        counterexamples.append(
+            "Prompt repair: derive subgoals from the actual win condition and rules; if the objective is not object-on-target, do not force a crate-target heuristic."
+        )
+
     if not observed_issues:
         observed_issues.append("The run solved the game cleanly; focus on sharper mechanic-specific ranking to cut expansions further.")
 
-    mechanics_lines: list[str] = []
-    if mechanics_hints:
-        mechanics_lines.append(
-            "Rules appear to include "
-            + ", ".join(mechanics_hints)
-            + "; make sure the heuristic reasons about these mechanics explicitly."
-        )
-    else:
-        mechanics_lines.append(
-            "Focus on the game's win-condition objects, irreversible deadlocks, and movement constraints instead of generic distance only."
-        )
+    source_context_lines = _source_context_feedback(game_text=game_text, root_ctx=root_ctx)
 
     profile_line = (
         "Local heuristic profile: "
@@ -602,7 +1363,7 @@ def _build_feedback_report(
         "\n".join(outcome_lines),
         "Observed issues:\n- " + "\n- ".join(observed_issues),
         profile_line,
-        "Mechanics hypothesis:\n- " + "\n- ".join(mechanics_lines),
+        "Source-grounded mechanics context:\n- " + "\n- ".join(source_context_lines),
     ]
     if counterexamples:
         sections.append("Counterexamples:\n- " + "\n- ".join(counterexamples))
@@ -725,21 +1486,30 @@ def evaluate_one_game(
     level_i: int = 0,
     blind_baseline: Optional[dict[str, Any]] = None,
     builtin_baseline: Optional[dict[str, Any]] = None,
+    base_prompt_baseline: Optional[dict[str, Any]] = None,
     env_description: Optional[str] = None,
     heuristic_code: Optional[str] = None,
     reflection_lm: Any = None,
+    astar_timeout_s: float = DEFAULT_ASTAR_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Compile game, run A* on one level, return result dict with feedback."""
     json_str = evaluator.compile_game(game_text)
     compiled = json.loads(json_str)
     engine = evaluator.load_engine(json_str)
     engine.load_level(level_i)
+    root_ctx = build_puzzlescript_ctx(engine, compiled)
     diagnostics = _sample_local_heuristic_diagnostics(engine, compiled, heuristic_fn)
     engine.load_level(level_i)
 
     result = puzzlescript_astar(
         engine=engine, compiled_json=compiled,
         heuristic_fn=heuristic_fn, max_expansions=max_expansions,
+        timeout_s=astar_timeout_s,
+    )
+    metric_breakdown = _pairwise_gepa_metric(
+        candidate=result,
+        base_prompt_baseline=base_prompt_baseline,
+        max_expansions=max_expansions,
     )
 
     deterministic_feedback = _build_feedback_report(
@@ -748,8 +1518,11 @@ def evaluate_one_game(
         result=result,
         max_expansions=max_expansions,
         diagnostics=diagnostics,
+        root_ctx=root_ctx,
         blind_baseline=blind_baseline,
         builtin_baseline=builtin_baseline,
+        base_prompt_baseline=base_prompt_baseline,
+        metric_breakdown=metric_breakdown,
     )
     feedback = _reflect_with_llm(
         env_description=env_description,
@@ -766,7 +1539,12 @@ def evaluate_one_game(
             "expanded": result.expanded_states,
             "generated": result.generated_states,
             "solution_length": result.solution_length,
-            "score": result.score, "time_s": result.time_s,
+            "score": metric_breakdown["metric"],
+            "raw_search_score": result.score,
+            "time_s": result.time_s,
+            "max_expansions": max_expansions,
+            "astar_timeout_s": astar_timeout_s,
+            "metric_breakdown": metric_breakdown,
             "feedback_diagnostics": diagnostics,
             "trace_summary": result.trace_summary,
             "deterministic_feedback": deterministic_feedback,
@@ -774,7 +1552,8 @@ def evaluate_one_game(
         }, indent=2))
 
     return {
-        "score": result.score,
+        "score": metric_breakdown["metric"],
+        "raw_search_score": result.score,
         "level": level_i,
         "solved": result.solved,
         "expanded": result.expanded_states,
@@ -784,6 +1563,7 @@ def evaluate_one_game(
         "deterministic_feedback": deterministic_feedback,
         "feedback_diagnostics": diagnostics,
         "trace_summary": result.trace_summary,
+        "metric_breakdown": metric_breakdown,
     }
 
 
@@ -850,6 +1630,30 @@ def _aggregate_level_results(
     return payload
 
 
+def _should_accept_prompt_candidate(
+    *,
+    mean_score: float,
+    solve_rate: float,
+    best_mean_score: Optional[float],
+    best_solve_rate: Optional[float],
+) -> tuple[bool, str]:
+    """Gate champion updates so a scalar gain cannot silently lose solves."""
+
+    if best_mean_score is None or best_solve_rate is None:
+        return True, "first_candidate"
+
+    score_delta = mean_score - float(best_mean_score)
+    solve_delta = solve_rate - float(best_solve_rate)
+    if solve_delta >= 0.0 and score_delta > BEST_PROMPT_MIN_SCORE_DELTA:
+        return True, "score_gain_without_solve_regression"
+    if solve_delta > 0.0 and mean_score >= float(best_mean_score) - BEST_PROMPT_SCORE_BACKOFF_FOR_SOLVE_GAIN:
+        return True, "solve_rate_gain_with_small_score_backoff"
+    return False, (
+        f"rejected: score_delta={score_delta:+.4f}, "
+        f"solve_delta={solve_delta:+.4f}"
+    )
+
+
 def evaluate_game_levels(
     evaluator: PuzzleScriptEvaluator,
     game_name: str,
@@ -859,9 +1663,11 @@ def evaluate_game_levels(
     output_dir: Optional[Path] = None,
     blind_baselines: Optional[Mapping[int, dict[str, Any]]] = None,
     builtin_baselines: Optional[Mapping[int, dict[str, Any]]] = None,
+    base_prompt_baselines: Optional[Mapping[int, dict[str, Any]]] = None,
     env_description: Optional[str] = None,
     heuristic_code: Optional[str] = None,
     reflection_lm: Any = None,
+    astar_timeout_s: float = DEFAULT_ASTAR_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Evaluate one heuristic on several levels and average their scores."""
 
@@ -879,9 +1685,11 @@ def evaluate_game_levels(
                 output_dir=level_output,
                 blind_baseline=(blind_baselines or {}).get(level_i),
                 builtin_baseline=(builtin_baselines or {}).get(level_i),
+                base_prompt_baseline=(base_prompt_baselines or {}).get(level_i),
                 env_description=env_description,
                 heuristic_code=heuristic_code,
                 reflection_lm=reflection_lm,
+                astar_timeout_s=astar_timeout_s,
             )
         )
     return _aggregate_level_results(
@@ -894,30 +1702,185 @@ def evaluate_game_levels(
 # ---------------------------------------------------------------------------
 # Synthesize heuristic from prompt text
 # ---------------------------------------------------------------------------
-def synthesize_heuristic_from_prompt(
+def _invoke_heuristic_predictor(
+    *,
     prompt_text: str,
     env_description: str,
     lm: Any,
-) -> tuple[Optional[Callable], str, Optional[str]]:
-    """Use the (GEPA-optimized) prompt to synthesize a heuristic."""
+) -> tuple[str, Optional[str]]:
     try:
         with dspy.context(lm=lm):
             pred = _heuristic_predictor(
                 synthesis_prompt=prompt_text,
-                env_description=env_description)
-        code = pred.heuristic_code
+                env_description=env_description,
+            )
+        return str(pred.heuristic_code), None
     except Exception as e:
-        return None, "", f"LLM call failed: {e}"
+        return "", f"LLM call failed: {e}"
 
+
+def _strip_outer_markdown_fences(code: str) -> str:
+    cleaned = re.sub(r"^```(?:python)?\s*\n?", "", code.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+    return cleaned.strip()
+
+
+def _compile_synthesized_heuristic(code: str) -> tuple[Optional[Callable], Optional[str]]:
     try:
         raw_fn = sanitize_and_compile_puzzlescript_heuristic(code)
 
         def heuristic_from_ctx(ctx: dict[str, Any]) -> float:
             return float(raw_fn(None, None, ctx))
 
-        return heuristic_from_ctx, code, None
+        return heuristic_from_ctx, None
     except Exception as e:
-        return None, code, f"Sanitization failed: {e}"
+        return None, f"Sanitization failed: {e}"
+
+
+def _constant_return_issue(code: str) -> bool:
+    try:
+        tree = ast.parse(_strip_outer_markdown_fences(code))
+    except SyntaxError:
+        return False
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "heuristic_cost_to_go":
+            executable = [
+                child for child in node.body
+                if not isinstance(child, (ast.Expr, ast.Pass))
+            ]
+            return (
+                len(executable) == 1
+                and isinstance(executable[0], ast.Return)
+                and isinstance(executable[0].value, ast.Constant)
+                and isinstance(executable[0].value.value, (int, float))
+            )
+    return False
+
+
+def _static_synthesis_issues(code: str, compile_error: Optional[str]) -> list[str]:
+    issues: list[str] = []
+    if compile_error:
+        issues.append(compile_error)
+    if "```" in code:
+        issues.append("Output contains markdown fences/backticks; return plain Python code only.")
+    if re.search(r"^\s*(from\s+\S+\s+import|import\s+\S+)", code, flags=re.MULTILINE):
+        issues.append("Output contains imports; imports are not allowed.")
+    if "def heuristic_cost_to_go" not in code:
+        issues.append("Output does not define heuristic_cost_to_go.")
+    if _constant_return_issue(code):
+        issues.append("Function returns a single constant and provides no A* guidance.")
+    for match in re.finditer(r"(?<![\w.])-?\d+(?:\.\d+)?", code):
+        try:
+            if abs(float(match.group(0))) >= 100_000:
+                issues.append("Output uses very large numeric constants; avoid huge penalties unless proven safe.")
+                break
+        except ValueError:
+            continue
+    return issues
+
+
+def _preflight_synthesis_issues(
+    *,
+    evaluator: Optional[PuzzleScriptEvaluator],
+    game_text: Optional[str],
+    level_i: int,
+    heuristic_fn: Optional[Callable],
+) -> list[str]:
+    if evaluator is None or not game_text or heuristic_fn is None:
+        return []
+    try:
+        json_str = evaluator.compile_game(game_text)
+        compiled = json.loads(json_str)
+        engine = evaluator.load_engine(json_str)
+        engine.load_level(level_i)
+        root_ctx = build_puzzlescript_ctx(engine, compiled)
+        diagnostics = _sample_local_heuristic_diagnostics(engine, compiled, heuristic_fn)
+    except Exception as exc:
+        return [f"Preflight diagnostics failed before A*: {exc}"]
+
+    issues: list[str] = []
+    if (
+        not bool(root_ctx.get("is_winning", False))
+        and float(diagnostics.get("root_heuristic", 0.0)) == 0.0
+    ):
+        issues.append("Root state is non-winning but heuristic returns 0.0.")
+    if diagnostics.get("constant_like") and int(diagnostics.get("n_successors", 0)) >= 2:
+        issues.append("Immediate successors receive constant or near-constant values.")
+    if diagnostics.get("penalty_dominated"):
+        issues.append("Local successor values are dominated by huge penalties.")
+    return issues
+
+
+def _repair_prompt_text(prompt_text: str, issues: list[str]) -> str:
+    return (
+        prompt_text
+        + "\n\nREPAIR MODE:\n"
+        + "The previous heuristic output failed validation or preflight. Rewrite it once.\n"
+        + "Output exactly one plain Python heuristic_cost_to_go function. No markdown, no imports, no prose.\n"
+        + "Keep the function finite and state-varying. Use win_conditions_text, object_positions, "
+        + "object counts, player-to-interaction distance, and score_normalized as conservative "
+        + "fallbacks when mechanics are uncertain.\n"
+        + "Issues to fix:\n- "
+        + "\n- ".join(issues)
+    )
+
+
+def _repair_env_description(env_description: str, bad_code: str) -> str:
+    return (
+        env_description
+        + "\n\nPrevious heuristic output that must be repaired:\n"
+        + _strip_outer_markdown_fences(bad_code)[:12_000]
+    )
+
+
+def synthesize_heuristic_from_prompt(
+    prompt_text: str,
+    env_description: str,
+    lm: Any,
+    *,
+    preflight_evaluator: Optional[PuzzleScriptEvaluator] = None,
+    preflight_game_text: Optional[str] = None,
+    preflight_level_i: int = 0,
+) -> tuple[Optional[Callable], str, Optional[str]]:
+    """Use the (GEPA-optimized) prompt to synthesize a heuristic."""
+    code, call_error = _invoke_heuristic_predictor(
+        prompt_text=prompt_text,
+        env_description=env_description,
+        lm=lm,
+    )
+    if call_error:
+        return None, "", call_error
+
+    heuristic_fn, compile_error = _compile_synthesized_heuristic(code)
+    issues = _static_synthesis_issues(code, compile_error)
+    if not issues:
+        issues = _preflight_synthesis_issues(
+            evaluator=preflight_evaluator,
+            game_text=preflight_game_text,
+            level_i=preflight_level_i,
+            heuristic_fn=heuristic_fn,
+        )
+    if not issues:
+        return heuristic_fn, _strip_outer_markdown_fences(code), None
+
+    repair_code, repair_call_error = _invoke_heuristic_predictor(
+        prompt_text=_repair_prompt_text(prompt_text, issues),
+        env_description=_repair_env_description(env_description, code),
+        lm=lm,
+    )
+    if repair_call_error:
+        if heuristic_fn is not None and compile_error is None:
+            return heuristic_fn, _strip_outer_markdown_fences(code), None
+        return None, code, repair_call_error
+
+    repaired_fn, repaired_compile_error = _compile_synthesized_heuristic(repair_code)
+    repaired_issues = _static_synthesis_issues(repair_code, repaired_compile_error)
+    if not repaired_issues:
+        return repaired_fn, _strip_outer_markdown_fences(repair_code), None
+
+    if heuristic_fn is not None and compile_error is None:
+        return heuristic_fn, _strip_outer_markdown_fences(code), None
+    return None, repair_code, "; ".join(repaired_issues)
 
 
 def evaluate_prompt_per_game(
@@ -932,8 +1895,10 @@ def evaluate_prompt_per_game(
     lm: Any,
     blind_baselines: Optional[Mapping[str, Mapping[int, dict[str, Any]]]] = None,
     builtin_baselines: Optional[Mapping[str, Mapping[int, dict[str, Any]]]] = None,
+    base_prompt_baselines: Optional[Mapping[str, Mapping[int, dict[str, Any]]]] = None,
     output_dir: Optional[Path] = None,
     reflection_lm: Any = None,
+    astar_timeout_s: float = DEFAULT_ASTAR_TIMEOUT_S,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Synthesize and evaluate one heuristic per game from a shared prompt."""
 
@@ -947,6 +1912,9 @@ def evaluate_prompt_per_game(
             prompt_text,
             env_desc,
             lm,
+            preflight_evaluator=evaluator,
+            preflight_game_text=all_game_texts[name],
+            preflight_level_i=level_indices_by_game.get(name, [0])[0],
         )
         if error:
             print(f"    [{name}] final synthesis error: {error[:200]}")
@@ -974,9 +1942,11 @@ def evaluate_prompt_per_game(
             output_dir=game_output_dir,
             blind_baselines=(blind_baselines or {}).get(name),
             builtin_baselines=(builtin_baselines or {}).get(name),
+            base_prompt_baselines=(base_prompt_baselines or {}).get(name),
             env_description=env_desc,
             heuristic_code=code,
             reflection_lm=reflection_lm,
+            astar_timeout_s=astar_timeout_s,
         )
         result["game"] = name
         results.append(result)
@@ -994,8 +1964,10 @@ def evaluate_prompt_per_level(
     lm: Any,
     blind_baselines: Optional[Mapping[str, Mapping[int, dict[str, Any]]]] = None,
     builtin_baselines: Optional[Mapping[str, Mapping[int, dict[str, Any]]]] = None,
+    base_prompt_baselines: Optional[Mapping[str, Mapping[int, dict[str, Any]]]] = None,
     output_dir: Optional[Path] = None,
     reflection_lm: Any = None,
+    astar_timeout_s: float = DEFAULT_ASTAR_TIMEOUT_S,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Synthesize and evaluate one heuristic per game level."""
 
@@ -1012,6 +1984,9 @@ def evaluate_prompt_per_level(
             prompt_text,
             env_desc,
             lm,
+            preflight_evaluator=evaluator,
+            preflight_game_text=all_game_texts[name],
+            preflight_level_i=level_i,
         )
         level_key = f"{name}::level-{level_i:02d}"
         if error:
@@ -1038,9 +2013,11 @@ def evaluate_prompt_per_level(
                 level_i=level_i,
                 blind_baseline=(blind_baselines or {}).get(name, {}).get(level_i),
                 builtin_baseline=(builtin_baselines or {}).get(name, {}).get(level_i),
+                base_prompt_baseline=(base_prompt_baselines or {}).get(name, {}).get(level_i),
                 env_description=env_desc,
                 heuristic_code=code,
                 reflection_lm=reflection_lm,
+                astar_timeout_s=astar_timeout_s,
             )
         except RuntimeError as e:
             if "Level index out of range" in str(e):
@@ -1063,17 +2040,22 @@ def run_curriculum(
     eval_jobs: list[dict],
     sd_path: Path,
     state_root: Path,
+    baseline_root: Optional[Path],
     max_phase_iterations: int,
     max_expansions: int,
     llm_name: str,
     llm_max_tokens: int,
     levels_per_game: int,
     gepa_num_threads: int,
+    max_gepa_expansions_per_level: int,
+    astar_timeout_s: float,
 ) -> None:
     state_root.mkdir(parents=True, exist_ok=True)
     logs_root = state_root / "runs"
     logs_root.mkdir(parents=True, exist_ok=True)
     state_path = state_root / "curriculum_state.json"
+    baseline_state_root = (baseline_root or state_root).expanduser().resolve()
+    baseline_state_root.mkdir(parents=True, exist_ok=True)
 
     # Configure LLM
     lm = dspy.LM(llm_name, max_tokens=llm_max_tokens)
@@ -1082,39 +2064,18 @@ def run_curriculum(
     print(f"LLM: {llm_name} max_tokens={llm_max_tokens}")
 
     # Pre-compile all game texts and env descriptions
-    all_game_texts: dict[str, str] = {}
-    all_env_descs: dict[str, str] = {}
-    all_level_env_descs: dict[str, dict[int, str]] = {}
-    level_indices_by_game: dict[str, list[int]] = {}
-    for entry in train_jobs + eval_jobs:
-        name = entry["name"]
-        text = load_game_text(name, sd_path)
-        if text:
-            all_game_texts[name] = text
-            try:
-                json_str = evaluator.compile_game(text)
-                compiled = json.loads(json_str)
-                engine = evaluator.load_engine(json_str)
-                engine.load_level(0)
-                n_levels = engine.get_num_levels()
-                requested_levels = max(1, int(entry.get("levels", n_levels) or n_levels))
-                level_count = min(n_levels, requested_levels, max(1, levels_per_game))
-                level_indices_by_game[name] = list(range(level_count))
-                base_desc = build_env_description(compiled, engine.get_id_dict(), text)
-                all_env_descs[name] = base_desc
-                all_level_env_descs[name] = {
-                    level_i: build_level_env_description(base_desc, engine, compiled, level_i)
-                    for level_i in level_indices_by_game[name]
-                }
-            except Exception as e:
-                print(f"  [WARN] Could not compile {name}: {e}")
+    all_game_texts, all_env_descs, all_level_env_descs, level_indices_by_game = (
+        prepare_puzzlescript_inputs(
+            evaluator=evaluator,
+            train_jobs=train_jobs,
+            eval_jobs=eval_jobs,
+            sd_path=sd_path,
+            levels_per_game=levels_per_game,
+        )
+    )
 
     # Phase schedule
-    phase_schedule: list[list[dict]] = []
-    for count in CURRICULUM_PHASE_GAME_COUNTS:
-        phase_schedule.append(train_jobs[:count])
-    if len(train_jobs) > CURRICULUM_PHASE_GAME_COUNTS[-1]:
-        phase_schedule.append(train_jobs)
+    phase_schedule = build_curriculum_phase_schedule(train_jobs)
     total_phases = len(phase_schedule)
 
     # Load or init state
@@ -1133,51 +2094,96 @@ def run_curriculum(
             "best_prompt_state": None,
         }
 
-    # Run blind baseline on ALL training levels and compute per-level GEPA budgets.
-    # Budget = floor(0.95 * blind_expanded) so that a heuristic matching blind
-    # search will exceed its budget and score 0, forcing GEPA to improve.
-    print("\n--- Blind A* baseline (h=0) on ALL training levels ---")
-    all_train_names = [e["name"] for e in train_jobs if e["name"] in all_game_texts]
-    blind_baselines: dict[str, dict[int, dict[str, Any]]] = {}
-    builtin_baselines: dict[str, dict[int, dict[str, Any]]] = {}
-    per_game_budgets: dict[str, dict[int, int]] = {}
+    # Load or compute baselines on ALL training levels. Budget =
+    # floor(0.95 * blind_expanded) so a heuristic matching blind search exceeds
+    # its GEPA budget and scores 0, forcing useful guidance.
+    print("\n--- Training baselines (cache + shards) ---")
+    print(f"  Baseline root: {baseline_state_root}")
+    all_train_names = [str(e["name"]) for e in train_jobs if str(e["name"]) in all_game_texts]
+    all_train_examples = build_training_level_examples(
+        train_jobs,
+        all_game_texts,
+        level_indices_by_game,
+    )
+    baseline_signature = build_baseline_cache_signature(
+        train_jobs=train_jobs,
+        level_indices_by_game=level_indices_by_game,
+        max_expansions=max_expansions,
+        max_gepa_expansions_per_level=max_gepa_expansions_per_level,
+        astar_timeout_s=astar_timeout_s,
+        levels_per_game=levels_per_game,
+        llm_name=llm_name,
+        llm_max_tokens=llm_max_tokens,
+    )
+    (
+        blind_baselines,
+        builtin_baselines,
+        base_prompt_baselines,
+        per_game_budgets,
+        loaded_baseline_paths,
+    ) = load_cached_puzzlescript_baselines(baseline_state_root, baseline_signature)
+    if loaded_baseline_paths:
+        print(f"  Loaded {len(loaded_baseline_paths)} matching baseline cache/shard files.")
 
-    for name in all_train_names:
-        blind_baselines[name] = {}
-        per_game_budgets[name] = {}
-        for level_i in level_indices_by_game.get(name, [0]):
-            r = evaluate_one_game(
-                evaluator, name, all_game_texts[name],
-                blind_heuristic, max_expansions, level_i=level_i,
-            )
-            blind_baselines[name][level_i] = r
-            if r["solved"] and r["expanded"] > 0:
-                per_game_budgets[name][level_i] = max(math.floor(0.95 * r["expanded"]), 1)
-            else:
-                # Blind didn't solve -- keep global max as fallback
-                per_game_budgets[name][level_i] = max_expansions
-            print(
-                f"  {name} level={level_i}: solved={r['solved']} expanded={r['expanded']} "
-                f"score={r['score']:.4f} -> gepa_budget={per_game_budgets[name][level_i]}"
-            )
+    missing_baseline_examples = missing_puzzlescript_baseline_examples(
+        all_train_examples,
+        blind_baselines=blind_baselines,
+        builtin_baselines=builtin_baselines,
+        base_prompt_baselines=base_prompt_baselines,
+        per_game_budgets=per_game_budgets,
+    )
+    computed_missing_count = len(missing_baseline_examples)
+    if missing_baseline_examples:
+        print(f"  Computing {computed_missing_count} missing baseline level(s) locally.")
+        (
+            new_blind_baselines,
+            new_builtin_baselines,
+            new_base_prompt_baselines,
+            new_per_game_budgets,
+        ) = compute_puzzlescript_baselines_for_examples(
+            evaluator=evaluator,
+            examples=missing_baseline_examples,
+            all_game_texts=all_game_texts,
+            all_level_env_descs=all_level_env_descs,
+            all_env_descs=all_env_descs,
+            max_expansions=max_expansions,
+            max_gepa_expansions_per_level=max_gepa_expansions_per_level,
+            astar_timeout_s=astar_timeout_s,
+            lm=lm,
+        )
+        _merge_nested_map(blind_baselines, new_blind_baselines)
+        _merge_nested_map(builtin_baselines, new_builtin_baselines)
+        _merge_nested_map(base_prompt_baselines, new_base_prompt_baselines)
+        _merge_nested_map(per_game_budgets, new_per_game_budgets)
+    else:
+        print("  All training baselines were loaded from cache/shards.")
+
+    baseline_cache_path = save_puzzlescript_baseline_cache(
+        baseline_state_root,
+        signature=baseline_signature,
+        blind_baselines=blind_baselines,
+        builtin_baselines=builtin_baselines,
+        base_prompt_baselines=base_prompt_baselines,
+        per_game_budgets=per_game_budgets,
+        metadata={
+            "n_loaded_files": len(loaded_baseline_paths),
+            "n_missing_computed": computed_missing_count,
+        },
+    )
+    print(f"  Merged baseline cache: {baseline_cache_path}")
 
     state["per_game_budgets"] = per_game_budgets
     state["level_indices_by_game"] = level_indices_by_game
 
-    print("\n--- Built-in heuristic baseline on training levels ---")
-    for name in all_train_names:
-        builtin_baselines[name] = {}
-        for level_i in level_indices_by_game.get(name, [0]):
-            budget = per_game_budgets.get(name, {}).get(level_i, max_expansions)
-            r = evaluate_one_game(
-                evaluator, name, all_game_texts[name],
-                builtin_heuristic, budget, level_i=level_i,
-            )
-            builtin_baselines[name][level_i] = r
-            print(
-                f"  {name} level={level_i}: solved={r['solved']} "
-                f"expanded={r['expanded']} score={r['score']:.4f}"
-            )
+    cost_logger.sync(
+        "base_prompt_training_baseline",
+        {
+            "n_games": len(all_train_names),
+            "n_level_examples": sum(len(level_indices_by_game.get(n, [])) for n in all_train_names),
+            "n_loaded_baseline_files": len(loaded_baseline_paths),
+            "n_missing_baselines_computed": computed_missing_count,
+        },
+    )
 
     current_phase = state["current_phase"]
     global_iteration = state["global_iteration"]
@@ -1192,7 +2198,17 @@ def run_curriculum(
     print("GEPA PuzzleScript Heuristic Optimization")
     print(f"  Phases: {[len(p) for p in phase_schedule]} games")
     print(f"  Threshold: {PHASE_SOLVE_RATE_THRESHOLD}, Patience: {PHASE_EARLY_STOP_PATIENCE}")
+    print(
+        f"  Near-threshold advance: solve_rate >= {PHASE_NEAR_THRESHOLD} "
+        f"after {PHASE_NEAR_THRESHOLD_PATIENCE} non-improving iterations"
+    )
+    print(
+        "  GEPA metric-call cap: "
+        f"min(iteration * trainset * 3, trainset * {GEPA_MAX_METRIC_CALLS_MULTIPLIER})"
+    )
     print(f"  Max expansions (global): {max_expansions}, Max iters/phase: {max_phase_iterations}")
+    print(f"  Max GEPA expansions per level: {max_gepa_expansions_per_level}")
+    print(f"  A* timeout per level: {astar_timeout_s:.1f}s")
     print(f"  Levels per game: {levels_per_game}")
     print(f"  GEPA threads: {gepa_num_threads}")
     print(f"  Per-game/level GEPA budgets: {per_game_budgets}")
@@ -1219,6 +2235,7 @@ def run_curriculum(
         if phase_key not in records:
             records[phase_key] = {
                 "n_games": n_games, "n_examples": n_examples, "best_solve_rate": None,
+                "max_observed_solve_rate": 0.0,
                 "best_mean_score": None, "non_improving_streak": 0,
                 "iterations": 0, "advanced": False, "completed": False,
                 "stop_reason": None, "iteration_results": [],
@@ -1283,7 +2300,13 @@ def run_curriculum(
                 all_env_descs.get(game_name, game_name),
             )
             heuristic_fn, code, error = synthesize_heuristic_from_prompt(
-                prompt_text, env_desc, lm)
+                prompt_text,
+                env_desc,
+                lm,
+                preflight_evaluator=evaluator,
+                preflight_game_text=all_game_texts[game_name],
+                preflight_level_i=level_i,
+            )
 
             with metric_lock:
                 local_run_counter = run_counter
@@ -1310,9 +2333,11 @@ def run_curriculum(
                     level_i=level_i,
                     blind_baseline=blind_baselines.get(game_name, {}).get(level_i),
                     builtin_baseline=builtin_baselines.get(game_name, {}).get(level_i),
+                    base_prompt_baseline=base_prompt_baselines.get(game_name, {}).get(level_i),
                     env_description=env_desc,
                     heuristic_code=code,
                     reflection_lm=lm,
+                    astar_timeout_s=astar_timeout_s,
                 )
             except Exception as e:
                 result = {"score": 0.0, "feedback": f"Eval error: {e}",
@@ -1361,8 +2386,9 @@ def run_curriculum(
         )
 
         print(f"  Running GEPA (max_metric_calls={max_metric_calls})...")
+        calls_before_compile = int(cost_logger.summary().get("total_calls", 0))
         optimized = compiler.compile(program, trainset=trainset)
-        cost_logger.sync(
+        compile_summary = cost_logger.sync(
             "gepa_compile",
             {
                 "phase": current_phase,
@@ -1371,6 +2397,43 @@ def run_curriculum(
                 "max_metric_calls": max_metric_calls,
             },
         )
+        compile_new_calls = int(compile_summary.get("total_calls", 0)) - calls_before_compile
+
+        if compile_new_calls == 0:
+            rec["iterations"] += 1
+            rec["non_improving_streak"] += 1
+            phase_iter = rec["iterations"]
+            global_iteration += 1
+            state["global_iteration"] = global_iteration
+            rec["iteration_results"].append({
+                "iteration": phase_iter,
+                "mean_score": rec.get("best_mean_score") or 0.0,
+                "solve_rate": rec.get("best_solve_rate") or 0.0,
+                "n_solved": None,
+                "improved": False,
+                "skipped_final_eval": True,
+                "reason": "gepa_metric_call_cap_reached",
+            })
+
+            if not is_final:
+                rec["advanced"] = True
+                rec["completed"] = True
+                rec["stop_reason"] = "advanced_after_gepa_metric_call_cap"
+                if current_phase not in state["completed_phases"]:
+                    state["completed_phases"].append(current_phase)
+                current_phase += 1
+                state["current_phase"] = current_phase
+                print("  >>> Phase advanced because GEPA produced no new metric calls at the cap.")
+            elif phase_iter >= max_phase_iterations:
+                rec["completed"] = True
+                rec["stop_reason"] = "phase_iteration_cap"
+                stop_reason = "phase_iteration_cap"
+
+            state["stop_reason"] = stop_reason
+            state["llm_cost_summary"] = cost_logger.summary()
+            with open(state_path, "w") as f:
+                json.dump(state, f, indent=2)
+            continue
 
         # Extract optimized prompt
         optimized_prompt_state = optimized.prompt_generator.dump_state()
@@ -1393,8 +2456,10 @@ def run_curriculum(
             lm=lm,
             blind_baselines=blind_baselines,
             builtin_baselines=builtin_baselines,
+            base_prompt_baselines=base_prompt_baselines,
             output_dir=final_eval_dir,
             reflection_lm=lm,
+            astar_timeout_s=astar_timeout_s,
         )
         cost_logger.sync(
             "final_per_level_eval",
@@ -1422,11 +2487,22 @@ def run_curriculum(
         print(f"\n  Phase result: score={mean_score:.4f} solve_rate={solve_rate:.3f}")
 
         # Track improvement
-        improved = False
         best = rec["best_mean_score"]
-        if best is None or mean_score > best:
+        best_solve = rec.get("best_solve_rate")
+        improved, selection_reason = _should_accept_prompt_candidate(
+            mean_score=mean_score,
+            solve_rate=solve_rate,
+            best_mean_score=best,
+            best_solve_rate=best_solve,
+        )
+        rec["max_observed_solve_rate"] = max(
+            float(rec.get("max_observed_solve_rate") or 0.0),
+            solve_rate,
+        )
+        if improved:
             improved = True
             rec["best_mean_score"] = mean_score
+            rec["best_solve_rate"] = solve_rate
             rec["non_improving_streak"] = 0
             best_codes_by_game = dict(final_codes_by_level)
             best_code = None
@@ -1436,11 +2512,15 @@ def run_curriculum(
             state["best_heuristic_codes"] = best_codes_by_game
             state["best_prompt_text"] = optimized_prompt_text
             state["best_prompt_state"] = optimized_prompt_state
+            state["best_prompt_selection"] = {
+                "phase": current_phase,
+                "iteration": phase_iter + 1,
+                "mean_score": mean_score,
+                "solve_rate": solve_rate,
+                "reason": selection_reason,
+            }
         else:
             rec["non_improving_streak"] += 1
-
-        if rec["best_solve_rate"] is None or solve_rate > rec["best_solve_rate"]:
-            rec["best_solve_rate"] = solve_rate
 
         rec["iterations"] += 1
         phase_iter = rec["iterations"]
@@ -1450,7 +2530,14 @@ def run_curriculum(
             "iteration": phase_iter, "mean_score": mean_score,
             "solve_rate": solve_rate, "n_solved": n_solved,
             "improved": improved,
+            "selection_reason": selection_reason,
         })
+
+        near_threshold_plateau = (
+            not is_final
+            and solve_rate >= PHASE_NEAR_THRESHOLD
+            and rec["non_improving_streak"] >= PHASE_NEAR_THRESHOLD_PATIENCE
+        )
 
         # Phase advancement
         if not is_final and solve_rate >= PHASE_SOLVE_RATE_THRESHOLD:
@@ -1463,6 +2550,20 @@ def run_curriculum(
             state["current_phase"] = current_phase
             print(f"  >>> Phase advanced! solve_rate={solve_rate:.3f} >= "
                   f"{PHASE_SOLVE_RATE_THRESHOLD}")
+        elif near_threshold_plateau:
+            rec["advanced"] = True
+            rec["completed"] = True
+            rec["stop_reason"] = "advanced_after_near_threshold_plateau"
+            if current_phase not in state["completed_phases"]:
+                state["completed_phases"].append(current_phase)
+            current_phase += 1
+            state["current_phase"] = current_phase
+            print(
+                "  >>> Phase advanced after near-threshold plateau: "
+                f"solve_rate={solve_rate:.3f} >= {PHASE_NEAR_THRESHOLD} and "
+                f"non_improving_streak={rec['non_improving_streak']} >= "
+                f"{PHASE_NEAR_THRESHOLD_PATIENCE}"
+            )
         elif is_final and phase_iter >= max_phase_iterations:
             rec["completed"] = True
             rec["stop_reason"] = "phase_iteration_cap"
@@ -1542,6 +2643,27 @@ def run_curriculum(
             for name in holdout_names
             for level_i in level_indices_by_game.get(name, [0])
         ]
+        print("  Evaluating base prompt on holdout for pairwise comparison...")
+        holdout_base_results, _holdout_base_codes = evaluate_prompt_per_level(
+            evaluator=evaluator,
+            prompt_text=PUZZLESCRIPT_HEURISTIC_CONTRACT,
+            examples=holdout_examples,
+            all_game_texts=all_game_texts,
+            all_level_env_descs=all_level_env_descs,
+            max_expansions=max_expansions,
+            lm=lm,
+            output_dir=state_root / "holdout_base_prompt",
+            astar_timeout_s=astar_timeout_s,
+        )
+        holdout_base_baselines: dict[str, dict[int, dict[str, Any]]] = {}
+        for row in holdout_base_results:
+            holdout_base_baselines.setdefault(str(row["game"]), {})[int(row["level"])] = row
+        cost_logger.sync(
+            "holdout_base_prompt_eval",
+            {"n_games": len(holdout_names), "n_level_examples": len(holdout_examples)},
+        )
+
+        print("  Evaluating best prompt on holdout against base prompt...")
         holdout_results, _holdout_codes = evaluate_prompt_per_level(
             evaluator=evaluator,
             prompt_text=best_prompt_text,
@@ -1550,7 +2672,9 @@ def run_curriculum(
             all_level_env_descs=all_level_env_descs,
             max_expansions=max_expansions,
             lm=lm,
+            base_prompt_baselines=holdout_base_baselines,
             output_dir=state_root / "holdout_heuristics",
+            astar_timeout_s=astar_timeout_s,
         )
         cost_logger.sync(
             "holdout_per_level_eval",
@@ -1573,10 +2697,24 @@ def main() -> None:
         description="GEPA PuzzleScript heuristic optimization")
     parser.add_argument("--env-grid", type=Path, default=DEFAULT_ENV_GRID)
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
+    parser.add_argument(
+        "--baseline-root",
+        type=Path,
+        default=None,
+        help=(
+            "Directory containing shared baseline shards/cache. Defaults to "
+            "--state-root. Use this for GEPA replica arrays so each replica has "
+            "isolated optimizer state but reuses the same baselines."
+        ),
+    )
     parser.add_argument("--max-phase-iterations", type=int,
                         default=DEFAULT_MAX_PHASE_ITERATIONS)
     parser.add_argument("--max-expansions", type=int,
                         default=DEFAULT_ASTAR_MAX_EXPANSIONS)
+    parser.add_argument("--max-gepa-expansions-per-level", type=int,
+                        default=DEFAULT_MAX_GEPA_EXPANSIONS_PER_LEVEL)
+    parser.add_argument("--astar-timeout-s", type=float,
+                        default=DEFAULT_ASTAR_TIMEOUT_S)
     parser.add_argument("--llm", type=str, default=DEFAULT_LLM)
     parser.add_argument("--llm-max-tokens", type=int,
                         default=DEFAULT_LLM_MAX_TOKENS)
@@ -1594,11 +2732,14 @@ def main() -> None:
     run_curriculum(
         evaluator=evaluator, train_jobs=train_jobs, eval_jobs=eval_jobs,
         sd_path=args.script_doctor, state_root=args.state_root,
+        baseline_root=args.baseline_root,
         max_phase_iterations=args.max_phase_iterations,
         max_expansions=args.max_expansions, llm_name=args.llm,
         llm_max_tokens=args.llm_max_tokens,
         levels_per_game=args.levels_per_game,
         gepa_num_threads=max(1, args.gepa_num_threads),
+        max_gepa_expansions_per_level=max(1, args.max_gepa_expansions_per_level),
+        astar_timeout_s=max(1.0, args.astar_timeout_s),
     )
 
 

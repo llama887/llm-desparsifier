@@ -3,7 +3,7 @@
 #SBATCH --job-name=llm-desparsifier
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=96G
 #SBATCH --time=48:00:00
 #SBATCH --account=torch_pr_45_tandon_advanced
 #SBATCH --mail-type=END,FAIL
@@ -71,6 +71,7 @@ mkdir -p "$SD_PATH/data/game_trees" "$SD_PATH/data/pretty_trees" "$SD_PATH/data/
 
 echo "[setup] Done."
 echo ""
+export PYTHONUNBUFFERED=1
 
 # --- 6. Run GEPA PuzzleScript curriculum ---
 if [ -n "${STATE_ROOT:-}" ]; then
@@ -81,13 +82,28 @@ else
     echo "[run] Using fresh STATE_ROOT=$BASE_STATE_ROOT"
 fi
 
+export DSPY_CACHEDIR="${DSPY_CACHEDIR:-$BASE_STATE_ROOT/dspy_cache}"
+export DSPY_DISABLE_DISK_CACHE="${DSPY_DISABLE_DISK_CACHE:-1}"
+mkdir -p "$DSPY_CACHEDIR"
+echo "[run] DSPy cache: $DSPY_CACHEDIR"
+echo "[run] DSPY_DISABLE_DISK_CACHE=$DSPY_DISABLE_DISK_CACHE"
+
+BASELINE_ARGS=()
+if [ -n "${BASELINE_ROOT:-}" ]; then
+    echo "[run] Using shared BASELINE_ROOT=$BASELINE_ROOT"
+    BASELINE_ARGS=(--baseline-root "$BASELINE_ROOT")
+fi
+
 "$SD_PATH/.venv/bin/python" scripts/run_puzzlescript_batch.py \
     --env-grid configs/gepa_puzzlescript_envs.yaml \
     --state-root "$BASE_STATE_ROOT" \
-    --max-phase-iterations "${MAX_PHASE_ITERATIONS:-20}" \
+    "${BASELINE_ARGS[@]}" \
+    --max-phase-iterations "${MAX_PHASE_ITERATIONS:-10}" \
     --max-expansions 50000 \
-    --levels-per-game "${LEVELS_PER_GAME:-3}" \
+    --max-gepa-expansions-per-level "${MAX_GEPA_EXPANSIONS_PER_LEVEL:-10000}" \
+    --astar-timeout-s "${ASTAR_TIMEOUT_S:-30}" \
+    --levels-per-game "${LEVELS_PER_GAME:-0}" \
     --gepa-num-threads "${GEPA_NUM_THREADS:-4}" \
     --llm "deepseek/deepseek-v4-pro" \
-    --llm-max-tokens "${LLM_MAX_TOKENS:-32000}" \
+    --llm-max-tokens "${LLM_MAX_TOKENS:-384000}" \
     --script-doctor "$SD_PATH"

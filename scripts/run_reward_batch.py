@@ -22,7 +22,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple
 
+from dspy_cache_control import configure_dspy_cache, prepare_dspy_import
+
+prepare_dspy_import("run_reward_batch")
 import dspy
+configure_dspy_cache(dspy, "run_reward_batch")
 import numpy as np
 import yaml
 from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback

@@ -12,8 +12,14 @@ from typing import Any, Callable
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+if str(_PROJECT_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT / "scripts"))
 
+from dspy_cache_control import configure_dspy_cache, prepare_dspy_import
+
+prepare_dspy_import("evaluate_puzzlescript_best_prompt")
 import dspy
+configure_dspy_cache(dspy, "evaluate_puzzlescript_best_prompt")
 import matplotlib.pyplot as plt
 
 from run_puzzlescript_batch import (
@@ -130,6 +136,7 @@ def _evaluate_policy(
     max_expansions: int,
     output_dir: Path,
     heuristic_factory: Callable[[str, int], tuple[Callable, str, str | None]],
+    baseline_by_example: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for example in examples:
@@ -156,6 +163,7 @@ def _evaluate_policy(
             level_i=level_i,
             env_description=level_env_descs.get(name, {}).get(level_i),
             heuristic_code=code,
+            base_prompt_baseline=(baseline_by_example or {}).get(key),
         )
         row = {
             "policy": label,
@@ -234,55 +242,21 @@ def _plot_aggregate(summary: dict[str, Any], output_path: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
     bars = ax.bar(policies, rates, color=colors)
-    ax.set_ylim(0, 1)
-    ax.set_ylabel("Solve rate")
-    ax.set_title("Holdout Solve Rate")
-    ax.grid(axis="y", alpha=0.25)
-    for bar, value in zip(bars, rates):
-        ax.text(bar.get_x() + bar.get_width() / 2, value + 0.02, f"{value:.0%}", ha="center")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def _plot_by_game(summary: dict[str, Any], output_path: Path) -> None:
-    games = sorted(summary["by_game"])
-    policies = [
-        p
-        for p in ("best_prompt", "base_prompt", "builtin", "blind")
-        if any(p in summary["by_game"][g] for g in games)
-    ]
-    width = 0.24
-    x = list(range(len(games)))
-    colors = {
-        "best_prompt": "#2f6f73",
-        "base_prompt": "#7c3aed",
-        "builtin": "#8b6f47",
-        "blind": "#6b7280",
-    }
-
-    fig_w = max(12.0, len(games) * 0.55)
-    fig, ax = plt.subplots(figsize=(fig_w, 5.5))
-    for i, policy in enumerate(policies):
-        offset = (i - (len(policies) - 1) / 2) * width
-        values = [summary["by_game"][game].get(policy, {}).get("solve_rate", 0.0) for game in games]
-        ax.bar([v + offset for v in x], values, width=width, label=policy, color=colors.get(policy))
-    all_values = [
-        summary["by_game"][game].get(policy, {}).get("solve_rate", 0.0)
-        for game in games
-        for policy in policies
-    ]
-    if all_values and min(all_values) >= 0.5:
-        lower = max(0.0, min(all_values) - 0.08)
+    if rates and min(rates) >= 0.5:
+        lower = max(0.0, min(rates) - 0.03)
     else:
         lower = 0.0
-    ax.set_ylim(lower, 1.01)
+    ax.set_ylim(lower, 1.0)
     ax.set_ylabel("Solve rate")
-    ax.set_title("Holdout Solve Rate by Game")
-    ax.set_xticks(x)
-    ax.set_xticklabels(games, rotation=45, ha="right")
-    ax.legend()
+    ax.set_title("Holdout Solve Rate (Zoomed)")
     ax.grid(axis="y", alpha=0.25)
+    for bar, value in zip(bars, rates):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            min(0.998, value + 0.003),
+            f"{value:.1%}",
+            ha="center",
+        )
     if lower > 0.0:
         ax.text(
             0.0,
@@ -297,7 +271,7 @@ def _plot_by_game(summary: dict[str, Any], output_path: Path) -> None:
     plt.close(fig)
 
 
-def _plot_by_game_failure_log(summary: dict[str, Any], output_path: Path) -> None:
+def _plot_by_game_score(summary: dict[str, Any], output_path: Path) -> None:
     games = sorted(summary["by_game"])
     policies = [
         p
@@ -315,32 +289,107 @@ def _plot_by_game_failure_log(summary: dict[str, Any], output_path: Path) -> Non
 
     fig_w = max(12.0, len(games) * 0.55)
     fig, ax = plt.subplots(figsize=(fig_w, 5.5))
-    min_visible = 0.01
+    for i, policy in enumerate(policies):
+        offset = (i - (len(policies) - 1) / 2) * width
+        values = [summary["by_game"][game].get(policy, {}).get("mean_score", 0.0) for game in games]
+        ax.bar([v + offset for v in x], values, width=width, label=policy, color=colors.get(policy))
+    all_values = [
+        summary["by_game"][game].get(policy, {}).get("mean_score", 0.0)
+        for game in games
+        for policy in policies
+    ]
+    positive_values = [value for value in all_values if value > 0.0]
+    if positive_values:
+        lower = max(0.0, min(positive_values) - 0.03)
+    else:
+        lower = 0.0
+    ax.set_ylim(lower, 1.01)
+    ax.set_ylabel("Mean GEPA score")
+    ax.set_title("")
+    ax.set_xticks(x)
+    ax.set_xticklabels(games, rotation=45, ha="right")
+    ax.grid(axis="y", alpha=0.25)
+    for i, policy in enumerate(policies):
+        offset = (i - (len(policies) - 1) / 2) * width
+        zero_x = [
+            v + offset
+            for v, game in zip(x, games)
+            if summary["by_game"][game].get(policy, {}).get("mean_score", 0.0) == 0.0
+        ]
+        if zero_x:
+            ax.scatter(
+                zero_x,
+                [lower + 0.004] * len(zero_x),
+                marker="v",
+                s=26,
+                color=colors.get(policy),
+                edgecolor="black",
+                linewidth=0.3,
+                zorder=5,
+            )
+    if lower > 0.0:
+        fig.text(
+            0.99,
+            0.91,
+            f"y starts at {lower:.2f}; triangles mark zero-score failures",
+            fontsize=9,
+            ha="right",
+            va="top",
+        )
+    handles, labels = ax.get_legend_handles_labels()
+    fig.suptitle("Holdout Mean Score by Game (Zoomed)", y=0.98)
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=len(policies))
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_by_game_score_loss_log(summary: dict[str, Any], output_path: Path) -> None:
+    games = sorted(summary["by_game"])
+    policies = [
+        p
+        for p in ("best_prompt", "base_prompt", "builtin", "blind")
+        if any(p in summary["by_game"][g] for g in games)
+    ]
+    width = 0.24
+    x = list(range(len(games)))
+    colors = {
+        "best_prompt": "#2f6f73",
+        "base_prompt": "#7c3aed",
+        "builtin": "#8b6f47",
+        "blind": "#6b7280",
+    }
+
+    fig_w = max(12.0, len(games) * 0.55)
+    fig, ax = plt.subplots(figsize=(fig_w, 5.5))
+    min_visible = 0.0001
     for i, policy in enumerate(policies):
         offset = (i - (len(policies) - 1) / 2) * width
         values = []
         for game in games:
             row = summary["by_game"][game].get(policy, {})
-            solve_rate = float(row.get("solve_rate", 0.0))
-            values.append(max(1.0 - solve_rate, min_visible))
+            mean_score = float(row.get("mean_score", 0.0))
+            values.append(max(1.0 - mean_score, min_visible))
         ax.bar([v + offset for v in x], values, width=width, label=policy, color=colors.get(policy))
     ax.set_yscale("log")
     ax.set_ylim(min_visible, 1.0)
-    ax.set_ylabel("Failure rate, log scale")
-    ax.set_title("Holdout Failure Rate by Game (Lower Is Better)")
+    ax.set_ylabel("Score loss = 1 - mean score, log scale")
+    ax.set_title("")
     ax.set_xticks(x)
     ax.set_xticklabels(games, rotation=45, ha="right")
-    ax.legend()
     ax.grid(axis="y", which="both", alpha=0.25)
-    ax.text(
-        0.0,
-        1.02,
-        f"Solved-all bars are clipped to {min_visible:.2f} for log display",
-        transform=ax.transAxes,
+    fig.text(
+        0.99,
+        0.91,
+        f"perfect scores clipped to {min_visible:g}",
         fontsize=9,
-        va="bottom",
+        ha="right",
+        va="top",
     )
-    fig.tight_layout()
+    handles, labels = ax.get_legend_handles_labels()
+    fig.suptitle("Holdout Score Loss by Game (Lower Is Better)", y=0.98)
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=len(policies))
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
@@ -385,6 +434,9 @@ def main() -> None:
             prompt_text,
             level_env_descs[name][level_i],
             lm,
+            preflight_evaluator=evaluator,
+            preflight_game_text=game_texts[name],
+            preflight_level_i=level_i,
         )
         if heuristic_fn is None:
             return builtin_heuristic, code, error
@@ -395,12 +447,38 @@ def main() -> None:
             PUZZLESCRIPT_HEURISTIC_CONTRACT,
             level_env_descs[name][level_i],
             lm,
+            preflight_evaluator=evaluator,
+            preflight_game_text=game_texts[name],
+            preflight_level_i=level_i,
         )
         if heuristic_fn is None:
             return builtin_heuristic, code, error
         return heuristic_fn, code, None
 
     rows: list[dict[str, Any]] = []
+    base_rows = _evaluate_policy(
+        label="base_prompt",
+        evaluator=evaluator,
+        examples=examples,
+        game_texts=game_texts,
+        level_env_descs=level_env_descs,
+        max_expansions=args.max_expansions,
+        output_dir=output_dir,
+        heuristic_factory=base_prompt_factory,
+    )
+    rows.extend(base_rows)
+    base_baselines = {
+        str(row["example"]): {
+            "solved": bool(row["solved"]),
+            "expanded": int(row["expanded"]),
+            "generated": int(row["generated"]),
+            "solution_length": int(row["solution_length"]),
+            "score": float(row["result_score"]),
+        }
+        for row in base_rows
+    }
+    cost_logger.sync("base_prompt_eval", {"n_examples": len(examples), "split": args.split})
+
     rows.extend(
         _evaluate_policy(
             label="best_prompt",
@@ -411,22 +489,10 @@ def main() -> None:
             max_expansions=args.max_expansions,
             output_dir=output_dir,
             heuristic_factory=best_prompt_factory,
+            baseline_by_example=base_baselines,
         )
     )
     cost_logger.sync("best_prompt_eval", {"n_examples": len(examples), "split": args.split})
-    rows.extend(
-        _evaluate_policy(
-            label="base_prompt",
-            evaluator=evaluator,
-            examples=examples,
-            game_texts=game_texts,
-            level_env_descs=level_env_descs,
-            max_expansions=args.max_expansions,
-            output_dir=output_dir,
-            heuristic_factory=base_prompt_factory,
-        )
-    )
-    cost_logger.sync("base_prompt_eval", {"n_examples": len(examples), "split": args.split})
 
     rows.extend(
         _evaluate_policy(
@@ -468,8 +534,8 @@ def main() -> None:
         encoding="utf-8",
     )
     _plot_aggregate(summary, output_dir / "holdout_comparison_aggregate.png")
-    _plot_by_game(summary, output_dir / "holdout_comparison_by_env.png")
-    _plot_by_game_failure_log(summary, output_dir / "holdout_comparison_by_env_failure_log.png")
+    _plot_by_game_score(summary, output_dir / "holdout_comparison_by_env.png")
+    _plot_by_game_score_loss_log(summary, output_dir / "holdout_comparison_by_env_score_loss_log.png")
     cost_logger.sync("run_complete")
 
     print("\nSummary:")
