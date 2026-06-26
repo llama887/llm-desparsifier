@@ -7,11 +7,16 @@ import argparse
 import csv
 import json
 import os
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from scripts.run_puzzlescript_batched_gepa import (
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from scripts.run_puzzlescript_batched_gepa import (  # noqa: E402
     DEFAULT_ASTAR_TIMEOUT_S,
     DEFAULT_BASE_URL,
     DEFAULT_ENV_GRID,
