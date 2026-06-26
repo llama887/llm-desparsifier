@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.compare_puzzlescript_batched_prompts import compare_prompt_outputs
 from scripts.run_puzzlescript_batched_gepa import (
     DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS,
     DEFAULT_REFLECTION_FEEDBACK_CHARS,
@@ -223,3 +224,32 @@ def test_evaluate_search_task_with_wall_timeout_terminates_stuck_worker(tmp_path
     assert result["task_id"] == 7
     assert result["score"] == 0.0
     assert "wall timeout" in str(result["error"])
+
+
+def test_compare_prompt_outputs_reports_holdout_deltas() -> None:
+    base_outputs = [
+        {"task_id": 0, "game": "a", "level": 0, "score": 0.2, "solved": False, "expanded": 10},
+        {"task_id": 1, "game": "a", "level": 1, "score": 0.8, "solved": True, "expanded": 2},
+        {"task_id": 2, "game": "b", "level": 0, "score": 0.4, "solved": False, "expanded": 9},
+    ]
+    optimized_outputs = [
+        {"task_id": 0, "game": "a", "level": 0, "score": 0.5, "solved": True, "expanded": 4},
+        {"task_id": 1, "game": "a", "level": 1, "score": 0.7, "solved": True, "expanded": 3},
+        {"task_id": 2, "game": "b", "level": 0, "score": 0.1, "solved": False, "expanded": 12},
+    ]
+
+    aggregate, per_level, per_game = compare_prompt_outputs(
+        base_outputs=base_outputs,
+        optimized_outputs=optimized_outputs,
+    )
+
+    assert aggregate["base"]["solved"] == 1
+    assert aggregate["optimized"]["solved"] == 2
+    assert aggregate["new_solve_count"] == 1
+    assert aggregate["lost_solve_count"] == 0
+    assert aggregate["better_score_count"] == 1
+    assert aggregate["worse_score_count"] == 2
+    assert aggregate["solved_delta"] == 1
+    assert per_level[0]["score_delta"] == pytest.approx(0.3)
+    assert per_game[0]["game"] == "a"
+    assert per_game[0]["solved_delta"] == 1
