@@ -53,10 +53,10 @@ SETUP_LOCK="$SLURM_SUBMIT_DIR/sbatch/logs/puzzlescript_setup.lock"
         uv venv --python 3.12
         uv pip install jax lark numpy py-cpuinfo pybind11 imageio setuptools wheel \
             python-dotenv chex openai tiktoken einops flax hydra-core Pillow javascript pyyaml \
-            "gepa>=0.0.7" torch
+            matplotlib "gepa>=0.0.7" torch
         cd "$SLURM_SUBMIT_DIR"
     else
-        uv pip install --python "$SD_PATH/.venv/bin/python" "gepa>=0.0.7" openai pyyaml javascript torch
+        uv pip install --python "$SD_PATH/.venv/bin/python" "gepa>=0.0.7" openai pyyaml javascript matplotlib torch
     fi
 
     if ! ls "$SD_PATH"/puzzlescript_cpp/_puzzlescript_cpp*.so &>/dev/null; then

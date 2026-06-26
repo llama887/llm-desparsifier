@@ -20,15 +20,16 @@ import hashlib
 import json
 import multiprocessing as mp
 import os
+import random
 import re
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from queue import Empty
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence, cast
 
 import yaml
 
@@ -62,6 +63,10 @@ DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS = 1800
 DEFAULT_REFLECTION_FEEDBACK_CHARS = 1600
 DEFAULT_REFLECTION_MAX_RECORDS = 24
 DEFAULT_SEARCH_TASK_WALL_TIMEOUT_S = 120.0
+DEFAULT_DEV_FRACTION = 0.25
+DEFAULT_MAX_GEPA_ITERATIONS = 16
+DEFAULT_LOST_SOLVE_PENALTY = 0.02
+DEFAULT_CANDIDATE_ERROR_PENALTY = 0.01
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
 _CONTEXT_LENGTH_RE = re.compile(
@@ -250,7 +255,7 @@ def reflection_trace_priority(trace: Mapping[str, Any]) -> tuple[bool, float, st
     result = trace.get("result", {})
     return (
         bool(result.get("solved", False)),
-        float(result.get("score", 0.0)),
+        float(result.get("adjusted_score", result.get("score", 0.0))),
         str(task.get("game", "")),
         _trace_level(trace),
     )
@@ -288,6 +293,186 @@ def heuristic_score(solved: bool, expanded: int, max_expansions: int) -> float:
 def load_env_grid(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     return list(payload.get("jobs", [])), list(payload.get("eval_jobs", []))
+
+
+def split_train_dev_jobs(
+    jobs: Sequence[Mapping[str, Any]],
+    *,
+    dev_fraction: float = DEFAULT_DEV_FRACTION,
+    seed: int = 0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split training jobs into deterministic train and development subsets.
+
+    The split happens at game/job granularity, not level granularity, so a
+    validation level cannot leak mechanics from the same game into training.
+    At least one training job is kept whenever two or more jobs are available.
+    """
+    rows = [dict(job) for job in jobs]
+    if not rows:
+        return [], []
+    if not 0.0 < dev_fraction < 1.0:
+        raise ValueError("dev_fraction must be between 0 and 1")
+    if len(rows) == 1:
+        return rows, []
+
+    n_dev = int(round(len(rows) * dev_fraction))
+    n_dev = min(len(rows) - 1, max(1, n_dev))
+    indices = list(range(len(rows)))
+    random.Random(seed).shuffle(indices)
+    dev_indices = set(indices[:n_dev])
+    train = [row for index, row in enumerate(rows) if index not in dev_indices]
+    dev = [row for index, row in enumerate(rows) if index in dev_indices]
+    return train, dev
+
+
+def _task_game(task: Any) -> str:
+    if isinstance(task, Mapping):
+        return str(task["game"])
+    return str(getattr(task, "game"))
+
+
+def _task_level(task: Any) -> int:
+    if isinstance(task, Mapping):
+        return int(task["level"])
+    return int(getattr(task, "level"))
+
+
+def task_key(task: Any) -> tuple[str, int]:
+    """Return the stable cross-evaluation identity for a PuzzleScript task."""
+    return _task_game(task), _task_level(task)
+
+
+def _with_task_id(task: Any, task_id: int) -> Any:
+    if is_dataclass(task):
+        return replace(task, task_id=task_id)
+    if isinstance(task, Mapping):
+        row = dict(task)
+        row["task_id"] = task_id
+        return row
+    if hasattr(task, "__dict__"):
+        clone = type(task)(**vars(task))
+        setattr(clone, "task_id", task_id)
+        return clone
+    raise TypeError(f"Cannot reassign task_id for task type {type(task)!r}")
+
+
+def reassign_task_ids(tasks: Sequence[Any]) -> list[Any]:
+    """Return tasks with dense ids starting at zero while preserving order."""
+    return [_with_task_id(task, index) for index, task in enumerate(tasks)]
+
+
+def build_train_dev_tasks(
+    tasks: Sequence[Any],
+    *,
+    dev_fraction: float = DEFAULT_DEV_FRACTION,
+    seed: int = 0,
+) -> tuple[list[Any], list[Any]]:
+    """Split materialized level tasks into game-disjoint train/dev batches.
+
+    This helper differs from `split_train_dev_jobs` by operating after task
+    materialization. It is useful when some configured jobs fail to load; the
+    held-out split then reflects only tasks that can actually be evaluated.
+    """
+    games = list(dict.fromkeys(_task_game(task) for task in tasks))
+    train_jobs, dev_jobs = split_train_dev_jobs(
+        [{"name": game} for game in games],
+        dev_fraction=dev_fraction,
+        seed=seed,
+    )
+    train_games = {str(job["name"]) for job in train_jobs}
+    dev_games = {str(job["name"]) for job in dev_jobs}
+    train_tasks = [task for task in tasks if _task_game(task) in train_games]
+    dev_tasks = [task for task in tasks if _task_game(task) in dev_games]
+    return reassign_task_ids(train_tasks), reassign_task_ids(dev_tasks)
+
+
+def unique_tasks_by_key(tasks: Sequence[PuzzleScriptLevelTask]) -> list[PuzzleScriptLevelTask]:
+    """Return the first task for each `(game, level)` identity in order."""
+    seen: set[tuple[str, int]] = set()
+    unique: list[PuzzleScriptLevelTask] = []
+    for task in tasks:
+        key = task_key(task)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(task)
+    return unique
+
+
+def _is_game_compile_error(error: object) -> bool:
+    if error is None:
+        return False
+    text = str(error).lower()
+    return "game compilation failed" in text or "compiling game" in text
+
+
+def is_candidate_error(output: Mapping[str, Any]) -> bool:
+    """Return whether a failed result should count against the generated code.
+
+    PuzzleScript source compilation failures can be properties of the configured
+    game rather than the synthesized heuristic. Validation, synthesis, timeout,
+    and runtime search failures are candidate-facing and should be discouraged
+    by GEPA's scalar objective.
+    """
+    if output.get("synthesis_error") is not None:
+        return True
+    error = output.get("error")
+    return error is not None and not _is_game_compile_error(error)
+
+
+def candidate_score(
+    outputs: Sequence[Mapping[str, Any]],
+    *,
+    lost_solve_penalty: float = DEFAULT_LOST_SOLVE_PENALTY,
+    error_penalty: float = DEFAULT_CANDIDATE_ERROR_PENALTY,
+) -> float:
+    """Return a regression-aware aggregate score for one candidate.
+
+    Raw A* scores reward cheaper solves, while the penalties make GEPA less
+    willing to trade away levels that the base prompt already solved or to
+    emit invalid heuristic code. Penalties are aggregate-level constants rather
+    than per-task averages, so each lost solve remains visible in large batches.
+    """
+    rows = list(outputs)
+    if not rows:
+        return 0.0
+    raw_mean = sum(float(row.get("score", 0.0)) for row in rows) / len(rows)
+    lost_solves = sum(
+        1
+        for row in rows
+        if bool(row.get("baseline_solved", False)) and not bool(row.get("solved", False))
+    )
+    candidate_errors = sum(1 for row in rows if is_candidate_error(row))
+    return (
+        raw_mean
+        - max(0.0, lost_solve_penalty) * lost_solves
+        - max(0.0, error_penalty) * candidate_errors
+    )
+
+
+def adjusted_candidate_scores(
+    outputs: Sequence[Mapping[str, Any]],
+    *,
+    lost_solve_penalty: float = DEFAULT_LOST_SOLVE_PENALTY,
+    error_penalty: float = DEFAULT_CANDIDATE_ERROR_PENALTY,
+) -> list[float]:
+    """Return per-task scores whose mean equals `candidate_score`.
+
+    GEPA consumes a list of per-instance scores and averages them internally.
+    Multiplying each aggregate penalty by the batch size before assigning it to
+    the offending instance preserves the intended aggregate objective.
+    """
+    rows = list(outputs)
+    n_rows = max(1, len(rows))
+    scores: list[float] = []
+    for row in rows:
+        score = float(row.get("score", 0.0))
+        if bool(row.get("baseline_solved", False)) and not bool(row.get("solved", False)):
+            score -= max(0.0, lost_solve_penalty) * n_rows
+        if is_candidate_error(row):
+            score -= max(0.0, error_penalty) * n_rows
+        scores.append(score)
+    return scores
 
 
 def find_game_text_path(name: str, script_doctor: Path) -> Optional[Path]:
@@ -736,6 +921,8 @@ class PuzzleScriptBatchedGEPAAdapter:
         search_config: SearchArrayConfig,
         llm_concurrency: int,
         astar_timeout_s: float,
+        lost_solve_penalty: float = DEFAULT_LOST_SOLVE_PENALTY,
+        candidate_error_penalty: float = DEFAULT_CANDIDATE_ERROR_PENALTY,
     ) -> None:
         self.llm = llm
         self.state_root = state_root
@@ -743,8 +930,26 @@ class PuzzleScriptBatchedGEPAAdapter:
         self.search_config = search_config
         self.llm_concurrency = max(1, llm_concurrency)
         self.astar_timeout_s = astar_timeout_s
+        self.lost_solve_penalty = max(0.0, lost_solve_penalty)
+        self.candidate_error_penalty = max(0.0, candidate_error_penalty)
+        self.baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
         self.eval_counter = 0
         self.propose_new_texts = None
+
+    def set_baseline_outputs(self, outputs: Sequence[Mapping[str, Any]]) -> None:
+        """Store base-prompt outcomes used to penalize solve regressions."""
+        self.baseline_by_key = {
+            (str(row["game"]), int(row["level"])): dict(row)
+            for row in outputs
+        }
+
+    def _attach_baseline_metadata(self, result: dict[str, Any]) -> None:
+        baseline = self.baseline_by_key.get((str(result["game"]), int(result["level"])))
+        if baseline is None:
+            return
+        result["baseline_score"] = float(baseline.get("score", 0.0))
+        result["baseline_solved"] = bool(baseline.get("solved", False))
+        result["baseline_error"] = baseline.get("error")
 
     def _next_eval_dir(self, candidate: Mapping[str, str], batch: Sequence[PuzzleScriptLevelTask]) -> Path:
         self.eval_counter += 1
@@ -882,10 +1087,13 @@ class PuzzleScriptBatchedGEPAAdapter:
                     "score": 0.0,
                     "solved": False,
                     "feedback": "Missing search result shard output.",
+                    "error": "missing search result shard output",
                 },
             )
+            result = dict(result)
+            result["synthesis_error"] = task_row.get("synthesis_error")
+            self._attach_baseline_metadata(result)
             outputs.append(result)
-            scores.append(float(result.get("score", 0.0)))
             if capture_traces:
                 trajectories.append(
                     {
@@ -899,10 +1107,34 @@ class PuzzleScriptBatchedGEPAAdapter:
                     }
                 )
 
+        scores = adjusted_candidate_scores(
+            outputs,
+            lost_solve_penalty=self.lost_solve_penalty,
+            error_penalty=self.candidate_error_penalty,
+        )
+        for output, adjusted_score in zip(outputs, scores, strict=True):
+            output["adjusted_score"] = adjusted_score
+        (eval_dir / "scored_results.json").write_text(
+            json.dumps(outputs, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
         aggregate = sum(scores) / len(scores) if scores else 0.0
+        raw_aggregate = (
+            sum(float(output.get("score", 0.0)) for output in outputs) / len(outputs)
+            if outputs
+            else 0.0
+        )
         solved = sum(1 for output in outputs if output.get("solved"))
+        lost_solves = sum(
+            1
+            for output in outputs
+            if bool(output.get("baseline_solved", False)) and not bool(output.get("solved", False))
+        )
+        candidate_errors = sum(1 for output in outputs if is_candidate_error(output))
         print(
-            f"[adapter] merged score={aggregate:.4f}, solved={solved}/{len(outputs)}",
+            f"[adapter] merged adjusted_score={aggregate:.4f} raw_score={raw_aggregate:.4f}, "
+            f"solved={solved}/{len(outputs)} lost_solves={lost_solves} "
+            f"candidate_errors={candidate_errors}",
             flush=True,
         )
         return EvaluationBatch(
@@ -967,7 +1199,8 @@ class PuzzleScriptBatchedGEPAAdapter:
                         DEFAULT_REFLECTION_FEEDBACK_CHARS,
                     ),
                     "Selection": selection_note,
-                    "score": float(result.get("score", 0.0)),
+                    "score": float(result.get("adjusted_score", result.get("score", 0.0))),
+                    "raw_score": float(result.get("score", 0.0)),
                     "solved": bool(result.get("solved", False)),
                 }
             )
@@ -990,25 +1223,49 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
 
     evaluator = PuzzleScriptEvaluator(args.script_doctor)
     train_jobs, eval_jobs = load_env_grid(args.env_grid)
-    train_tasks = build_level_tasks(
+    all_train_tasks = build_level_tasks(
         evaluator=evaluator,
         jobs=train_jobs,
         script_doctor=args.script_doctor,
         levels_per_game=args.levels_per_game,
         budget=max(1, args.max_gepa_expansions_per_level),
     )
-    val_tasks = train_tasks if args.val_split == "train" else build_level_tasks(
-        evaluator=evaluator,
-        jobs=eval_jobs,
-        script_doctor=args.script_doctor,
-        levels_per_game=args.levels_per_game,
-        budget=max(1, args.max_expansions),
-    )
+    if args.val_split == "dev":
+        split_train_tasks, split_val_tasks = build_train_dev_tasks(
+            all_train_tasks,
+            dev_fraction=args.dev_fraction,
+            seed=args.seed,
+        )
+        train_tasks = [cast(PuzzleScriptLevelTask, task) for task in split_train_tasks]
+        val_tasks = [cast(PuzzleScriptLevelTask, task) for task in split_val_tasks]
+    else:
+        train_tasks = all_train_tasks
+        val_tasks = train_tasks if args.val_split == "train" else build_level_tasks(
+            evaluator=evaluator,
+            jobs=eval_jobs,
+            script_doctor=args.script_doctor,
+            levels_per_game=args.levels_per_game,
+            budget=max(1, args.max_expansions),
+        )
     if not train_tasks:
         raise RuntimeError("No train tasks were loadable.")
     if not val_tasks:
         raise RuntimeError("No validation tasks were loadable.")
 
+    input_split = {
+        "val_split": args.val_split,
+        "dev_fraction": args.dev_fraction if args.val_split == "dev" else None,
+        "seed": args.seed,
+        "all_train_games": sorted({task.game for task in all_train_tasks}),
+        "train_games": sorted({task.game for task in train_tasks}),
+        "val_games": sorted({task.game for task in val_tasks}),
+        "train_task_count": len(train_tasks),
+        "val_task_count": len(val_tasks),
+    }
+    (state_root / "input_split.json").write_text(
+        json.dumps(input_split, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
     (state_root / "train_tasks.json").write_text(
         json.dumps([asdict(task) for task in train_tasks], indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1041,6 +1298,8 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         ),
         llm_concurrency=args.llm_concurrency,
         astar_timeout_s=max(1.0, args.astar_timeout_s),
+        lost_solve_penalty=args.lost_solve_penalty,
+        candidate_error_penalty=args.candidate_error_penalty,
     )
 
     import gepa
@@ -1054,9 +1313,51 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         else len(val_tasks) + args.max_gepa_iterations * len(train_tasks) * 2
     )
     seed_candidate = {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
+    baseline_tasks = [
+        cast(PuzzleScriptLevelTask, task)
+        for task in reassign_task_ids(unique_tasks_by_key([*train_tasks, *val_tasks]))
+    ]
+    print(
+        "[gepa] evaluating base prompt baseline for regression scoring: "
+        f"tasks={len(baseline_tasks)} lost_solve_penalty={args.lost_solve_penalty} "
+        f"candidate_error_penalty={args.candidate_error_penalty}",
+        flush=True,
+    )
+    baseline_batch = adapter.evaluate(
+        batch=baseline_tasks,
+        candidate=seed_candidate,
+        capture_traces=False,
+    )
+    baseline_outputs = [dict(row) for row in baseline_batch.outputs]
+    adapter.set_baseline_outputs(baseline_outputs)
+    baseline_summary = {
+        "n": len(baseline_outputs),
+        "score_mean": (
+            sum(float(row.get("score", 0.0)) for row in baseline_outputs) / len(baseline_outputs)
+            if baseline_outputs
+            else 0.0
+        ),
+        "adjusted_score_mean": (
+            sum(float(row.get("adjusted_score", row.get("score", 0.0))) for row in baseline_outputs)
+            / len(baseline_outputs)
+            if baseline_outputs
+            else 0.0
+        ),
+        "solved": sum(1 for row in baseline_outputs if bool(row.get("solved", False))),
+        "candidate_errors": sum(1 for row in baseline_outputs if is_candidate_error(row)),
+    }
+    (state_root / "baseline_outputs.json").write_text(
+        json.dumps(baseline_outputs, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    (state_root / "baseline_summary.json").write_text(
+        json.dumps(baseline_summary, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
     print(
         "[gepa] starting standalone optimization: "
         f"train_tasks={len(train_tasks)} val_tasks={len(val_tasks)} "
+        f"val_split={args.val_split} "
         f"reflection_minibatch_size={reflection_minibatch_size} "
         f"max_metric_calls={max_metric_calls}",
         flush=True,
@@ -1131,9 +1432,16 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional whitespace-separated sbatch args appended before the array script.",
     )
-    parser.add_argument("--val-split", choices=("train", "eval"), default="train")
-    parser.add_argument("--max-gepa-iterations", type=int, default=12)
+    parser.add_argument("--val-split", choices=("train", "dev", "eval"), default="dev")
+    parser.add_argument("--dev-fraction", type=float, default=DEFAULT_DEV_FRACTION)
+    parser.add_argument("--max-gepa-iterations", type=int, default=DEFAULT_MAX_GEPA_ITERATIONS)
     parser.add_argument("--max-metric-calls", type=int, default=0)
+    parser.add_argument("--lost-solve-penalty", type=float, default=DEFAULT_LOST_SOLVE_PENALTY)
+    parser.add_argument(
+        "--candidate-error-penalty",
+        type=float,
+        default=DEFAULT_CANDIDATE_ERROR_PENALTY,
+    )
     parser.add_argument(
         "--reflection-minibatch-size",
         type=int,

@@ -161,16 +161,116 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def write_comparison_plots(
+    *,
+    output_dir: Path,
+    per_game: Sequence[Mapping[str, Any]],
+) -> list[Path]:
+    """Write PNG plots that summarize base-vs-optimized holdout behavior."""
+    rows = sorted(per_game, key=lambda row: float(row.get("score_delta", 0.0)))
+    if not rows:
+        return []
+
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    labels = [str(row["game"]) for row in rows]
+    y_positions = list(range(len(rows)))
+    colors = [
+        "#1f8a4c" if float(row.get("score_delta", 0.0)) >= 0.0 else "#b23a3a"
+        for row in rows
+    ]
+    height = max(4.5, min(18.0, 0.28 * len(rows) + 1.8))
+    plot_paths: list[Path] = []
+
+    fig, ax = plt.subplots(figsize=(10.5, height))
+    ax.barh(
+        y_positions,
+        [float(row.get("score_delta", 0.0)) for row in rows],
+        color=colors,
+    )
+    ax.axvline(0.0, color="#2f2f2f", linewidth=0.9)
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xlabel("Optimized score - base score")
+    ax.set_title("Holdout score delta by game")
+    ax.grid(axis="x", alpha=0.25)
+    fig.tight_layout()
+    score_delta_path = output_dir / "holdout_score_delta_by_game.png"
+    fig.savefig(score_delta_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    plot_paths.append(score_delta_path)
+
+    fig, ax = plt.subplots(figsize=(10.5, height))
+    ax.barh(
+        y_positions,
+        [int(row.get("solved_delta", 0)) for row in rows],
+        color=[
+            "#1f8a4c" if int(row.get("solved_delta", 0)) >= 0 else "#b23a3a"
+            for row in rows
+        ],
+    )
+    ax.axvline(0, color="#2f2f2f", linewidth=0.9)
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xlabel("Optimized solved levels - base solved levels")
+    ax.set_title("Holdout solve delta by game")
+    ax.grid(axis="x", alpha=0.25)
+    fig.tight_layout()
+    solve_delta_path = output_dir / "holdout_solve_delta_by_game.png"
+    fig.savefig(solve_delta_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    plot_paths.append(solve_delta_path)
+
+    base_scores = [float(row.get("base_score_mean", 0.0)) for row in rows]
+    optimized_scores = [float(row.get("optimized_score_mean", 0.0)) for row in rows]
+    fig, ax = plt.subplots(figsize=(7.0, 7.0))
+    ax.scatter(
+        base_scores,
+        optimized_scores,
+        s=[max(28.0, float(row.get("n", 1)) * 14.0) for row in rows],
+        c=colors,
+        alpha=0.82,
+        edgecolors="#222222",
+        linewidths=0.35,
+    )
+    low = min(base_scores + optimized_scores + [0.0])
+    high = max(base_scores + optimized_scores + [1.0])
+    pad = max(0.02, (high - low) * 0.06)
+    ax.plot([low - pad, high + pad], [low - pad, high + pad], color="#555555", linewidth=1.0)
+    ax.set_xlim(low - pad, high + pad)
+    ax.set_ylim(low - pad, high + pad)
+    ax.set_xlabel("Base score mean")
+    ax.set_ylabel("Optimized score mean")
+    ax.set_title("Holdout base vs optimized score by game")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    scatter_path = output_dir / "holdout_score_base_vs_optimized.png"
+    fig.savefig(scatter_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    plot_paths.append(scatter_path)
+
+    return plot_paths
+
+
 def write_comparison_artifacts(
     *,
     state_root: Path,
     aggregate: Mapping[str, Any],
     per_level: Sequence[Mapping[str, Any]],
     per_game: Sequence[Mapping[str, Any]],
-) -> None:
-    """Persist machine-readable and CSV comparison artifacts."""
+) -> list[Path]:
+    """Persist machine-readable, CSV, and plot comparison artifacts."""
+    plot_paths = write_comparison_plots(output_dir=state_root, per_game=per_game)
+    aggregate_payload = {
+        **dict(aggregate),
+        "plot_paths": [str(path) for path in plot_paths],
+    }
     (state_root / "comparison_summary.json").write_text(
-        json.dumps(aggregate, indent=2, sort_keys=True, default=str) + "\n",
+        json.dumps(aggregate_payload, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
     (state_root / "per_level_comparison.json").write_text(
@@ -183,6 +283,7 @@ def write_comparison_artifacts(
     )
     _write_csv(state_root / "per_level_comparison.csv", per_level)
     _write_csv(state_root / "per_game_comparison.csv", per_game)
+    return plot_paths
 
 
 def _new_eval_dir(before: set[Path], candidate_eval_root: Path) -> Path:
@@ -286,7 +387,7 @@ def run_holdout_comparison(args: argparse.Namespace) -> None:
         "optimized_eval_dir": str(optimized_dir),
         "optimized_prompt_path": str(args.optimized_prompt),
     }
-    write_comparison_artifacts(
+    plot_paths = write_comparison_artifacts(
         state_root=state_root,
         aggregate=aggregate,
         per_level=per_level,
@@ -313,6 +414,8 @@ def run_holdout_comparison(args: argparse.Namespace) -> None:
         flush=True,
     )
     print(f"[holdout] summary={state_root / 'comparison_summary.json'}", flush=True)
+    for path in plot_paths:
+        print(f"[holdout] plot={path}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:

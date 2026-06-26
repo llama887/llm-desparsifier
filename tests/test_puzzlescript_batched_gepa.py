@@ -17,9 +17,12 @@ from scripts.run_puzzlescript_batched_gepa import (
     PuzzleScriptBatchedGEPAAdapter,
     assigned_tasks,
     build_sbatch_array_command,
+    build_train_dev_tasks,
+    candidate_score,
     context_retry_max_tokens,
     evaluate_search_task_with_wall_timeout,
     select_reflection_traces,
+    split_train_dev_jobs,
     strip_outer_markdown_fences,
     validate_heuristic_code,
 )
@@ -95,6 +98,46 @@ def test_build_sbatch_array_command_exports_manifest_and_count() -> None:
     )
     assert "--time=01:00:00" in command
     assert command[-1] == "sbatch/evaluate_puzzlescript_search_array.s"
+
+
+def test_split_train_dev_jobs_is_deterministic_and_non_overlapping() -> None:
+    jobs = [{"name": f"game-{idx:02d}"} for idx in range(10)]
+
+    train_a, dev_a = split_train_dev_jobs(jobs, dev_fraction=0.3, seed=17)
+    train_b, dev_b = split_train_dev_jobs(jobs, dev_fraction=0.3, seed=17)
+
+    assert train_a == train_b
+    assert dev_a == dev_b
+    assert len(train_a) == 7
+    assert len(dev_a) == 3
+    assert {job["name"] for job in train_a}.isdisjoint({job["name"] for job in dev_a})
+    assert sorted(job["name"] for job in train_a + dev_a) == [job["name"] for job in jobs]
+
+
+def test_build_train_dev_tasks_reassigns_task_ids_after_split() -> None:
+    tasks = [
+        SimpleNamespace(task_id=idx, game=f"game-{idx}", level=0)
+        for idx in range(5)
+    ]
+
+    train_tasks, dev_tasks = build_train_dev_tasks(tasks, dev_fraction=0.4, seed=3)
+
+    assert [task.task_id for task in train_tasks] == list(range(len(train_tasks)))
+    assert [task.task_id for task in dev_tasks] == list(range(len(dev_tasks)))
+    assert {task.game for task in train_tasks}.isdisjoint({task.game for task in dev_tasks})
+
+
+def test_candidate_score_penalizes_lost_solves_and_errors() -> None:
+    outputs = [
+        {"score": 0.8, "solved": True, "baseline_solved": True, "error": None},
+        {"score": 0.9, "solved": False, "baseline_solved": True, "error": None},
+        {"score": 0.5, "solved": True, "baseline_solved": False, "error": None},
+        {"score": 1.0, "solved": False, "baseline_solved": False, "error": "exit is not allowed"},
+    ]
+
+    score = candidate_score(outputs, lost_solve_penalty=0.25, error_penalty=0.1)
+
+    assert score == pytest.approx(((0.8 + 0.9 + 0.5 + 1.0) / 4) - 0.25 - 0.1)
 
 
 def test_context_retry_max_tokens_uses_reported_prompt_tokens() -> None:
@@ -193,6 +236,10 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     launcher = Path("sbatch/train_puzzlescript_batched_gepa_gpu.s").read_text(encoding="utf-8")
 
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher
+    assert '--val-split "${VAL_SPLIT:-dev}"' in launcher
+    assert '--max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}"' in launcher
+    assert 'RUN_HOLDOUT_COMPARE:-1' in launcher
+    assert "scripts/compare_puzzlescript_batched_prompts.py" in launcher
 
 
 def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:
@@ -253,3 +300,47 @@ def test_compare_prompt_outputs_reports_holdout_deltas() -> None:
     assert per_level[0]["score_delta"] == pytest.approx(0.3)
     assert per_game[0]["game"] == "a"
     assert per_game[0]["solved_delta"] == 1
+
+
+def test_compare_prompt_outputs_can_write_plot_artifacts(tmp_path: Path) -> None:
+    from scripts.compare_puzzlescript_batched_prompts import write_comparison_plots
+
+    per_game = [
+        {
+            "game": "gain",
+            "n": 2,
+            "base_score_mean": 0.2,
+            "optimized_score_mean": 0.5,
+            "score_delta": 0.3,
+            "base_solved": 0,
+            "optimized_solved": 1,
+            "solved_delta": 1,
+            "better_score_count": 2,
+            "worse_score_count": 0,
+            "new_solve_count": 1,
+            "lost_solve_count": 0,
+        },
+        {
+            "game": "loss",
+            "n": 2,
+            "base_score_mean": 0.8,
+            "optimized_score_mean": 0.4,
+            "score_delta": -0.4,
+            "base_solved": 2,
+            "optimized_solved": 1,
+            "solved_delta": -1,
+            "better_score_count": 0,
+            "worse_score_count": 2,
+            "new_solve_count": 0,
+            "lost_solve_count": 1,
+        },
+    ]
+
+    paths = write_comparison_plots(output_dir=tmp_path, per_game=per_game)
+
+    assert {path.name for path in paths} == {
+        "holdout_score_delta_by_game.png",
+        "holdout_solve_delta_by_game.png",
+        "holdout_score_base_vs_optimized.png",
+    }
+    assert all(path.exists() and path.stat().st_size > 0 for path in paths)

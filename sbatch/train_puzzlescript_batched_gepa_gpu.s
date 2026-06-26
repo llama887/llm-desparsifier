@@ -53,10 +53,10 @@ SETUP_LOCK="$SLURM_SUBMIT_DIR/sbatch/logs/puzzlescript_setup.lock"
         uv venv --python 3.12
         uv pip install jax lark numpy py-cpuinfo pybind11 imageio setuptools wheel \
             python-dotenv chex openai tiktoken einops flax hydra-core Pillow javascript pyyaml \
-            "gepa>=0.0.7" torch
+            matplotlib "gepa>=0.0.7" torch
         cd "$SLURM_SUBMIT_DIR"
     else
-        uv pip install --python "$SD_PATH/.venv/bin/python" "gepa>=0.0.7" openai pyyaml javascript torch
+        uv pip install --python "$SD_PATH/.venv/bin/python" "gepa>=0.0.7" openai pyyaml javascript matplotlib torch
     fi
 
     if ! ls "$SD_PATH"/puzzlescript_cpp/_puzzlescript_cpp*.so &>/dev/null; then
@@ -182,6 +182,8 @@ SEARCH_ARRAY_SCRIPT="${SEARCH_ARRAY_SCRIPT:-sbatch/evaluate_puzzlescript_search_
 echo "[run] state_root=$RUN_STATE_ROOT"
 echo "[run] model=$LOCAL_LLM_MODEL base_url=$OPENAI_BASE_URL"
 echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-64}"
+echo "[run] search_extra_sbatch_args=${SEARCH_EXTRA_SBATCH_ARGS:-}"
+echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
 
 "$SD_PATH/.venv/bin/python" -u scripts/run_puzzlescript_batched_gepa.py \
     --env-grid "${ENV_GRID:-configs/gepa_puzzlescript_envs.yaml}" \
@@ -205,8 +207,45 @@ echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_A
     --search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-64}" \
     --search-poll-interval-s "${SEARCH_POLL_INTERVAL_S:-15}" \
     --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}" \
-    --val-split "${VAL_SPLIT:-train}" \
-    --max-gepa-iterations "${MAX_GEPA_ITERATIONS:-12}" \
+    --val-split "${VAL_SPLIT:-dev}" \
+    --dev-fraction "${DEV_FRACTION:-0.25}" \
+    --max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}" \
     --max-metric-calls "${MAX_METRIC_CALLS:-0}" \
+    --lost-solve-penalty "${LOST_SOLVE_PENALTY:-0.02}" \
+    --candidate-error-penalty "${CANDIDATE_ERROR_PENALTY:-0.01}" \
     --reflection-minibatch-size "${REFLECTION_MINIBATCH_SIZE:-0}" \
     --seed "${GEPA_SEED:-0}"
+
+if [ "${RUN_HOLDOUT_COMPARE:-1}" = "1" ]; then
+    BEST_PROMPT_PATH="${BEST_PROMPT_PATH:-$RUN_STATE_ROOT/best_prompt.txt}"
+    HOLDOUT_STATE_ROOT="${HOLDOUT_STATE_ROOT:-$RUN_STATE_ROOT/holdout_compare}"
+    if [ ! -s "$BEST_PROMPT_PATH" ]; then
+        echo "[holdout] missing optimized prompt at $BEST_PROMPT_PATH" >&2
+        exit 2
+    fi
+    mkdir -p "$HOLDOUT_STATE_ROOT"
+    echo "[holdout] comparing base prompt against $BEST_PROMPT_PATH"
+    echo "[holdout] state_root=$HOLDOUT_STATE_ROOT"
+    "$SD_PATH/.venv/bin/python" -u scripts/compare_puzzlescript_batched_prompts.py \
+        --env-grid "${ENV_GRID:-configs/gepa_puzzlescript_envs.yaml}" \
+        --state-root "$HOLDOUT_STATE_ROOT" \
+        --script-doctor "$SD_PATH" \
+        --optimized-prompt "$BEST_PROMPT_PATH" \
+        --levels-per-game "${HOLDOUT_LEVELS_PER_GAME:-${LEVELS_PER_GAME:-0}}" \
+        --max-expansions "${HOLDOUT_MAX_EXPANSIONS:-${MAX_EXPANSIONS:-50000}}" \
+        --astar-timeout-s "${HOLDOUT_ASTAR_TIMEOUT_S:-${ASTAR_TIMEOUT_S:-30}}" \
+        --model "$LOCAL_LLM_MODEL" \
+        --openai-base-url "$OPENAI_BASE_URL" \
+        --openai-api-key "$OPENAI_API_KEY" \
+        --max-model-tokens "${HOLDOUT_MAX_MODEL_TOKENS:-${MAX_MODEL_TOKENS:-8192}}" \
+        --temperature "${HOLDOUT_LLM_TEMPERATURE:-${LLM_TEMPERATURE:-0.2}}" \
+        --top-p "${HOLDOUT_LLM_TOP_P:-${LLM_TOP_P:-0.95}}" \
+        --llm-timeout-s "${HOLDOUT_LLM_TIMEOUT_S:-${LLM_TIMEOUT_S:-600}}" \
+        --llm-concurrency "${HOLDOUT_LLM_CONCURRENCY:-${LLM_CONCURRENCY:-16}}" \
+        --submit-search-array \
+        --search-array-script "$SEARCH_ARRAY_SCRIPT" \
+        --search-array-count "${HOLDOUT_SEARCH_ARRAY_COUNT:-${SEARCH_ARRAY_COUNT:-101}}" \
+        --search-array-concurrency "${HOLDOUT_SEARCH_ARRAY_CONCURRENCY:-${SEARCH_ARRAY_CONCURRENCY:-64}}" \
+        --search-poll-interval-s "${HOLDOUT_SEARCH_POLL_INTERVAL_S:-${SEARCH_POLL_INTERVAL_S:-15}}" \
+        --extra-sbatch-args "${HOLDOUT_SEARCH_EXTRA_SBATCH_ARGS:-${SEARCH_EXTRA_SBATCH_ARGS:-}}"
+fi
