@@ -247,6 +247,7 @@ def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:
 
     assert "runtime_ready()" in launcher
     assert "ensure_runtime()" in launcher
+    assert "#SBATCH --mem=8G" in launcher
     assert "if runtime_ready; then" in launcher
     assert "[setup] using existing PuzzleScript runtime" in launcher
     assert "else\n    ensure_runtime\nfi" in launcher
