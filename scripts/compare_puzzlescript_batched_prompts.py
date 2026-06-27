@@ -24,6 +24,7 @@ from scripts.run_puzzlescript_batched_gepa import (  # noqa: E402
     DEFAULT_MAX_MODEL_TOKENS,
     DEFAULT_MODEL,
     DEFAULT_SCRIPT_DOCTOR,
+    DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S,
     HEURISTIC_COMPONENT,
     PUZZLESCRIPT_HEURISTIC_CONTRACT,
     OpenAITextClient,
@@ -356,6 +357,7 @@ def run_holdout_comparison(args: argparse.Namespace) -> None:
             array_count=args.search_array_count,
             array_concurrency=args.search_array_concurrency,
             poll_interval_s=args.search_poll_interval_s,
+            stall_timeout_s=args.search_array_stall_timeout_s,
             extra_sbatch_args=parse_extra_sbatch_args(args.extra_sbatch_args),
         ),
         llm_concurrency=args.llm_concurrency,
@@ -454,6 +456,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-array-count", type=int, default=101)
     parser.add_argument("--search-array-concurrency", type=int, default=64)
     parser.add_argument("--search-poll-interval-s", type=float, default=15.0)
+    parser.add_argument(
+        "--search-array-stall-timeout-s",
+        type=float,
+        default=DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S,
+    )
     parser.add_argument(
         "--extra-sbatch-args",
         type=str,

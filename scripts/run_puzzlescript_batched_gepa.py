@@ -67,6 +67,7 @@ DEFAULT_DEV_FRACTION = 0.25
 DEFAULT_MAX_GEPA_ITERATIONS = 16
 DEFAULT_LOST_SOLVE_PENALTY = 0.02
 DEFAULT_CANDIDATE_ERROR_PENALTY = 0.01
+DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 300.0
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
 _CONTEXT_LENGTH_RE = re.compile(
@@ -139,6 +140,7 @@ class SearchArrayConfig:
     array_count: int
     array_concurrency: int
     poll_interval_s: float
+    stall_timeout_s: float = DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S
     extra_sbatch_args: tuple[str, ...] = ()
 
 
@@ -869,19 +871,62 @@ def build_sbatch_array_command(
     array_count: int,
     array_concurrency: int,
     extra_sbatch_args: Sequence[str] = (),
+    wait: bool = False,
 ) -> list[str]:
     if array_count <= 0:
         raise ValueError("array_count must be > 0")
     if array_concurrency <= 0:
         raise ValueError("array_concurrency must be > 0")
+    wait_args = ["--wait"] if wait else []
     return [
         "sbatch",
-        "--wait",
         "--parsable",
+        *wait_args,
         f"--array=0-{array_count - 1}%{array_concurrency}",
         f"--export=ALL,EVAL_MANIFEST={manifest_path},SEARCH_ARRAY_COUNT={array_count}",
         *extra_sbatch_args,
         str(array_script),
+    ]
+
+
+class SearchArrayStalledError(RuntimeError):
+    """Raised when no new search shards arrive before the stall timeout."""
+
+    def __init__(
+        self,
+        *,
+        missing_indices: Sequence[int],
+        present_count: int,
+        array_count: int,
+        stall_timeout_s: float,
+    ) -> None:
+        self.missing_indices = list(missing_indices)
+        self.present_count = present_count
+        self.array_count = array_count
+        self.stall_timeout_s = stall_timeout_s
+        super().__init__(
+            "Search array stalled after "
+            f"{stall_timeout_s:.1f}s with {present_count}/{array_count} shards present; "
+            f"missing={self.missing_indices[:12]}"
+        )
+
+
+def expected_shard_paths(*, shard_dir: Path, array_count: int) -> list[Path]:
+    """Return the canonical shard paths for one search manifest."""
+    return [
+        shard_dir / f"task-{idx:04d}-of-{array_count:04d}.json"
+        for idx in range(array_count)
+    ]
+
+
+def missing_shard_indices(*, shard_dir: Path, array_count: int) -> list[int]:
+    """Return array indices whose shard files have not been materialized."""
+    return [
+        index
+        for index, path in enumerate(
+            expected_shard_paths(shard_dir=shard_dir, array_count=array_count)
+        )
+        if not path.exists()
     ]
 
 
@@ -890,15 +935,28 @@ def wait_for_shards(
     shard_dir: Path,
     array_count: int,
     poll_interval_s: float,
+    stall_timeout_s: float = 0.0,
 ) -> list[Path]:
-    expected = [
-        shard_dir / f"task-{idx:04d}-of-{array_count:04d}.json"
-        for idx in range(array_count)
-    ]
+    expected = expected_shard_paths(shard_dir=shard_dir, array_count=array_count)
+    last_present_count = -1
+    last_progress_time = time.monotonic()
     while True:
         missing = [path for path in expected if not path.exists()]
         if not missing:
             return expected
+        present_count = array_count - len(missing)
+        if present_count != last_present_count:
+            last_present_count = present_count
+            last_progress_time = time.monotonic()
+        elif stall_timeout_s > 0.0 and time.monotonic() - last_progress_time >= stall_timeout_s:
+            raise SearchArrayStalledError(
+                missing_indices=[
+                    index for index, path in enumerate(expected) if not path.exists()
+                ],
+                present_count=present_count,
+                array_count=array_count,
+                stall_timeout_s=stall_timeout_s,
+            )
         print(f"[search-array] waiting for {len(missing)} shard(s)...", flush=True)
         time.sleep(poll_interval_s)
 
@@ -1020,6 +1078,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             encoding="utf-8",
         )
 
+        submitted_job_id: Optional[str] = None
         if self.search_config.submit:
             command = build_sbatch_array_command(
                 manifest_path=manifest_path,
@@ -1029,7 +1088,14 @@ class PuzzleScriptBatchedGEPAAdapter:
                 extra_sbatch_args=self.search_config.extra_sbatch_args,
             )
             print("[search-array] submitting: " + " ".join(command), flush=True)
-            subprocess.run(command, check=True)
+            completed = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            submitted_job_id = completed.stdout.strip().splitlines()[-1].strip()
+            print(f"[search-array] submitted job_id={submitted_job_id}", flush=True)
         else:
             for array_index in range(array_count):
                 evaluate_manifest_shard(
@@ -1038,11 +1104,32 @@ class PuzzleScriptBatchedGEPAAdapter:
                     array_count=array_count,
                 )
 
-        shard_paths = wait_for_shards(
-            shard_dir=shard_dir,
-            array_count=array_count,
-            poll_interval_s=self.search_config.poll_interval_s,
-        )
+        try:
+            shard_paths = wait_for_shards(
+                shard_dir=shard_dir,
+                array_count=array_count,
+                poll_interval_s=self.search_config.poll_interval_s,
+                stall_timeout_s=(
+                    self.search_config.stall_timeout_s if self.search_config.submit else 0.0
+                ),
+            )
+        except SearchArrayStalledError as exc:
+            print(f"[search-array] {exc}; falling back to local missing shards", flush=True)
+            if submitted_job_id:
+                subprocess.run(["scancel", submitted_job_id], check=False)
+                print(f"[search-array] cancelled stalled job_id={submitted_job_id}", flush=True)
+            for array_index in exc.missing_indices:
+                evaluate_manifest_shard(
+                    manifest_path=manifest_path,
+                    array_index=array_index,
+                    array_count=array_count,
+                )
+            shard_paths = wait_for_shards(
+                shard_dir=shard_dir,
+                array_count=array_count,
+                poll_interval_s=self.search_config.poll_interval_s,
+                stall_timeout_s=0.0,
+            )
         results = load_shard_results(shard_paths)
         (eval_dir / "merged_results.json").write_text(
             json.dumps(results, indent=2, sort_keys=True, default=str) + "\n",
@@ -1294,6 +1381,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
             array_count=args.search_array_count,
             array_concurrency=args.search_array_concurrency,
             poll_interval_s=args.search_poll_interval_s,
+            stall_timeout_s=args.search_array_stall_timeout_s,
             extra_sbatch_args=parse_extra_sbatch_args(args.extra_sbatch_args),
         ),
         llm_concurrency=args.llm_concurrency,
@@ -1426,6 +1514,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-array-count", type=int, default=101)
     parser.add_argument("--search-array-concurrency", type=int, default=64)
     parser.add_argument("--search-poll-interval-s", type=float, default=15.0)
+    parser.add_argument(
+        "--search-array-stall-timeout-s",
+        type=float,
+        default=DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S,
+    )
     parser.add_argument(
         "--extra-sbatch-args",
         type=str,

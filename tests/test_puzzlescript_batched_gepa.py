@@ -15,6 +15,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
     DEFAULT_REFLECTION_MAX_RECORDS,
     PuzzleScriptBatchedGEPAAdapter,
+    SearchArrayStalledError,
     assigned_tasks,
     build_sbatch_array_command,
     build_train_dev_tasks,
@@ -25,6 +26,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     split_train_dev_jobs,
     strip_outer_markdown_fences,
     validate_heuristic_code,
+    wait_for_shards,
 )
 
 
@@ -92,12 +94,28 @@ def test_build_sbatch_array_command_exports_manifest_and_count() -> None:
         extra_sbatch_args=("--time=01:00:00",),
     )
 
-    assert command[:4] == ["sbatch", "--wait", "--parsable", "--array=0-7%3"]
-    assert command[4] == (
+    assert command[:3] == ["sbatch", "--parsable", "--array=0-7%3"]
+    assert "--wait" not in command
+    assert command[3] == (
         "--export=ALL,EVAL_MANIFEST=/tmp/eval/search_manifest.json,SEARCH_ARRAY_COUNT=8"
     )
     assert "--time=01:00:00" in command
     assert command[-1] == "sbatch/evaluate_puzzlescript_search_array.s"
+
+
+def test_wait_for_shards_raises_with_missing_indices_on_stall(tmp_path: Path) -> None:
+    (tmp_path / "task-0000-of-0003.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(SearchArrayStalledError) as exc_info:
+        wait_for_shards(
+            shard_dir=tmp_path,
+            array_count=3,
+            poll_interval_s=0.01,
+            stall_timeout_s=0.01,
+        )
+
+    assert exc_info.value.present_count == 1
+    assert exc_info.value.missing_indices == [1, 2]
 
 
 def test_split_train_dev_jobs_is_deterministic_and_non_overlapping() -> None:
@@ -239,6 +257,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher
     assert '--val-split "${VAL_SPLIT:-dev}"' in launcher
     assert '--max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}"' in launcher
+    assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}"' in launcher
     assert 'RUN_HOLDOUT_COMPARE:-1' in launcher
     assert "scripts/compare_puzzlescript_batched_prompts.py" in launcher
 

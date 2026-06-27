@@ -206,6 +206,7 @@ echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
     --search-array-count "${SEARCH_ARRAY_COUNT:-101}" \
     --search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-64}" \
     --search-poll-interval-s "${SEARCH_POLL_INTERVAL_S:-15}" \
+    --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}" \
     --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}" \
     --val-split "${VAL_SPLIT:-dev}" \
     --dev-fraction "${DEV_FRACTION:-0.25}" \
@@ -247,5 +248,6 @@ if [ "${RUN_HOLDOUT_COMPARE:-1}" = "1" ]; then
         --search-array-count "${HOLDOUT_SEARCH_ARRAY_COUNT:-${SEARCH_ARRAY_COUNT:-101}}" \
         --search-array-concurrency "${HOLDOUT_SEARCH_ARRAY_CONCURRENCY:-${SEARCH_ARRAY_CONCURRENCY:-64}}" \
         --search-poll-interval-s "${HOLDOUT_SEARCH_POLL_INTERVAL_S:-${SEARCH_POLL_INTERVAL_S:-15}}" \
+        --search-array-stall-timeout-s "${HOLDOUT_SEARCH_ARRAY_STALL_TIMEOUT_S:-${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}}" \
         --extra-sbatch-args "${HOLDOUT_SEARCH_EXTRA_SBATCH_ARGS:-${SEARCH_EXTRA_SBATCH_ARGS:-}}"
 fi
