@@ -2,7 +2,7 @@
 #
 #SBATCH --job-name=puzzlescript-batched-gepa
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=128G
 #SBATCH --time=48:00:00
 #SBATCH --gres=gpu:h100:1

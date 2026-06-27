@@ -235,6 +235,7 @@ def test_select_reflection_traces_keeps_lowest_scoring_failures() -> None:
 def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     launcher = Path("sbatch/train_puzzlescript_batched_gepa_gpu.s").read_text(encoding="utf-8")
 
+    assert "#SBATCH --cpus-per-task=2" in launcher
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher
     assert '--val-split "${VAL_SPLIT:-dev}"' in launcher
     assert '--max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}"' in launcher
@@ -245,6 +246,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
 def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:
     launcher = Path("sbatch/evaluate_puzzlescript_search_array.s").read_text(encoding="utf-8")
 
+    assert "#SBATCH --cpus-per-task=1" in launcher
     assert "runtime_ready()" in launcher
     assert "ensure_runtime()" in launcher
     assert "#SBATCH --mem=8G" in launcher
