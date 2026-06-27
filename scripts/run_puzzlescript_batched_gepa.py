@@ -65,8 +65,13 @@ DEFAULT_REFLECTION_MAX_RECORDS = 24
 DEFAULT_SEARCH_TASK_WALL_TIMEOUT_S = 120.0
 DEFAULT_DEV_FRACTION = 0.25
 DEFAULT_MAX_GEPA_ITERATIONS = 16
-DEFAULT_LOST_SOLVE_PENALTY = 0.02
-DEFAULT_CANDIDATE_ERROR_PENALTY = 0.01
+DEFAULT_LOST_SOLVE_PENALTY = 4.0
+DEFAULT_NEW_SOLVE_BONUS = 1.0
+DEFAULT_CANDIDATE_ERROR_PENALTY = 2.0
+DEFAULT_SCORE_DELTA_WEIGHT = 0.25
+DEFAULT_SCORE_DELTA_CLIP = 0.5
+DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4200
+DEFAULT_REFLECTION_DATASET_CHARS = 24000
 DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 600.0
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
@@ -245,18 +250,46 @@ def _trace_level(trace: Mapping[str, Any]) -> int:
         return 0
 
 
-def reflection_trace_priority(trace: Mapping[str, Any]) -> tuple[bool, float, str, int]:
+def trace_classification(trace: Mapping[str, Any]) -> str:
+    """Classify a trace by how it changes behavior relative to the base prompt."""
+    result = trace.get("result", {})
+    solved = bool(result.get("solved", False))
+    baseline_solved = bool(result.get("baseline_solved", False))
+    raw_score = float(result.get("score", 0.0))
+    baseline_score = float(result.get("baseline_score", 0.0))
+    if is_candidate_error(result):
+        return "candidate_error"
+    if baseline_solved and not solved:
+        return "lost_baseline_solve"
+    if not baseline_solved and solved:
+        return "new_solve"
+    if baseline_solved and solved and raw_score + 0.05 < baseline_score:
+        return "solved_regression"
+    if not solved:
+        return "persistent_failure"
+    return "stable_or_improved"
+
+
+def reflection_trace_priority(trace: Mapping[str, Any]) -> tuple[int, float, str, int]:
     """Return the ordering key used to choose compact reflection examples.
 
     Full evaluations still contribute to scalar scores, but sending every trace
     into GEPA's prompt can exceed the local model context. Reflection is most
-    useful on failures and weak cases, so unsolved and low-scoring traces are
-    prioritized while the final tie-breakers keep selection deterministic.
+    useful when it can compare the base prompt to the candidate, so baseline
+    regressions and new solves are prioritized before ordinary weak cases.
     """
     task = trace.get("task", {})
     result = trace.get("result", {})
+    class_rank = {
+        "lost_baseline_solve": 0,
+        "new_solve": 1,
+        "solved_regression": 2,
+        "candidate_error": 3,
+        "persistent_failure": 4,
+        "stable_or_improved": 5,
+    }.get(trace_classification(trace), 6)
     return (
-        bool(result.get("solved", False)),
+        class_rank,
         float(result.get("adjusted_score", result.get("score", 0.0))),
         str(task.get("game", "")),
         _trace_level(trace),
@@ -277,7 +310,42 @@ def select_reflection_traces(
     traces = list(trajectories)
     if max_records <= 0 or len(traces) <= max_records:
         return traces
-    return sorted(traces, key=reflection_trace_priority)[:max_records]
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for trace in traces:
+        grouped.setdefault(trace_classification(trace), []).append(trace)
+    for values in grouped.values():
+        values.sort(key=reflection_trace_priority)
+
+    selected: list[Mapping[str, Any]] = []
+    seen_ids: set[int] = set()
+    priority_groups = (
+        "lost_baseline_solve",
+        "new_solve",
+        "solved_regression",
+        "candidate_error",
+        "persistent_failure",
+        "stable_or_improved",
+    )
+
+    # Seed reflection with one example from each high-signal category so the
+    # LLM sees both what to preserve and what the candidate gained.
+    for group_name in priority_groups:
+        group = grouped.get(group_name, [])
+        if not group:
+            continue
+        trace = group[0]
+        selected.append(trace)
+        seen_ids.add(id(trace))
+        if len(selected) >= max_records:
+            return selected
+
+    for trace in sorted(traces, key=reflection_trace_priority):
+        if id(trace) in seen_ids:
+            continue
+        selected.append(trace)
+        if len(selected) >= max_records:
+            return selected
+    return selected
 
 
 def strip_outer_markdown_fences(code: str) -> str:
@@ -422,58 +490,129 @@ def is_candidate_error(output: Mapping[str, Any]) -> bool:
     return error is not None and not _is_game_compile_error(error)
 
 
+def _clamp(value: float, limit: float) -> float:
+    bound = max(0.0, limit)
+    return max(-bound, min(bound, value))
+
+
+def _macro_game_weights(rows: Sequence[Mapping[str, Any]]) -> list[float]:
+    """Return per-row weights whose mean is one and games contribute equally."""
+    if not rows:
+        return []
+    counts: dict[str, int] = {}
+    for row in rows:
+        game = str(row.get("game", ""))
+        counts[game] = counts.get(game, 0) + 1
+    n_rows = len(rows)
+    n_games = max(1, len(counts))
+    return [n_rows / (n_games * counts[str(row.get("game", ""))]) for row in rows]
+
+
+def _has_baseline(row: Mapping[str, Any]) -> bool:
+    return "baseline_score" in row or "baseline_solved" in row
+
+
+def _base_relative_score(
+    row: Mapping[str, Any],
+    *,
+    lost_solve_penalty: float,
+    new_solve_bonus: float,
+    error_penalty: float,
+    score_delta_weight: float,
+    score_delta_clip: float,
+) -> float:
+    """Score one result by robust improvement over the stored base prompt.
+
+    GEPA only receives per-instance scores and then sums or averages them. This
+    transform therefore encodes the desired global-prompt objective locally:
+    preserve base solves first, reward new solves second, and let expansion
+    efficiency matter only as a capped tie-breaker.
+    """
+    raw_score = float(row.get("score", 0.0))
+    if not _has_baseline(row):
+        score = raw_score
+    else:
+        baseline_score = float(row.get("baseline_score", 0.0))
+        solved = bool(row.get("solved", False))
+        baseline_solved = bool(row.get("baseline_solved", False))
+        delta = _clamp(raw_score - baseline_score, score_delta_clip)
+        score = max(0.0, score_delta_weight) * delta
+        if baseline_solved and not solved:
+            score -= max(0.0, lost_solve_penalty)
+        elif not baseline_solved and solved:
+            score += max(0.0, new_solve_bonus)
+    if is_candidate_error(row):
+        score -= max(0.0, error_penalty)
+    return score
+
+
+def _result_float(row: Mapping[str, Any], key: str, default: float = 0.0) -> float:
+    """Read a numeric search-result field with a typed fallback."""
+    value = row.get(key, default)
+    if value is None:
+        return default
+    return float(value)
+
+
 def candidate_score(
     outputs: Sequence[Mapping[str, Any]],
     *,
     lost_solve_penalty: float = DEFAULT_LOST_SOLVE_PENALTY,
+    new_solve_bonus: float = DEFAULT_NEW_SOLVE_BONUS,
     error_penalty: float = DEFAULT_CANDIDATE_ERROR_PENALTY,
+    score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
+    score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
 ) -> float:
-    """Return a regression-aware aggregate score for one candidate.
+    """Return the mean GEPA score for one candidate.
 
-    Raw A* scores reward cheaper solves, while the penalties make GEPA less
-    willing to trade away levels that the base prompt already solved or to
-    emit invalid heuristic code. Penalties are aggregate-level constants rather
-    than per-task averages, so each lost solve remains visible in large batches.
+    Scores are base-relative when baseline metadata is available and fall back
+    to raw A* quality for the initial base-prompt calibration pass. The returned
+    mean matches GEPA's validation aggregate because `adjusted_candidate_scores`
+    applies the same per-game weights to each instance.
     """
     rows = list(outputs)
     if not rows:
         return 0.0
-    raw_mean = sum(float(row.get("score", 0.0)) for row in rows) / len(rows)
-    lost_solves = sum(
-        1
-        for row in rows
-        if bool(row.get("baseline_solved", False)) and not bool(row.get("solved", False))
+    scores = adjusted_candidate_scores(
+        rows,
+        lost_solve_penalty=lost_solve_penalty,
+        new_solve_bonus=new_solve_bonus,
+        error_penalty=error_penalty,
+        score_delta_weight=score_delta_weight,
+        score_delta_clip=score_delta_clip,
     )
-    candidate_errors = sum(1 for row in rows if is_candidate_error(row))
-    return (
-        raw_mean
-        - max(0.0, lost_solve_penalty) * lost_solves
-        - max(0.0, error_penalty) * candidate_errors
-    )
+    return sum(scores) / len(scores)
 
 
 def adjusted_candidate_scores(
     outputs: Sequence[Mapping[str, Any]],
     *,
     lost_solve_penalty: float = DEFAULT_LOST_SOLVE_PENALTY,
+    new_solve_bonus: float = DEFAULT_NEW_SOLVE_BONUS,
     error_penalty: float = DEFAULT_CANDIDATE_ERROR_PENALTY,
+    score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
+    score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
 ) -> list[float]:
-    """Return per-task scores whose mean equals `candidate_score`.
+    """Return macro-game-weighted per-task scores for GEPA.
 
-    GEPA consumes a list of per-instance scores and averages them internally.
-    Multiplying each aggregate penalty by the batch size before assigning it to
-    the offending instance preserves the intended aggregate objective.
+    The list is still one score per task, matching GEPA's API, but each value is
+    weighted so that the arithmetic mean is a per-game macro-average. That keeps
+    broad game generalization visible even when one game contributes many more
+    levels than another.
     """
     rows = list(outputs)
-    n_rows = max(1, len(rows))
+    weights = _macro_game_weights(rows)
     scores: list[float] = []
-    for row in rows:
-        score = float(row.get("score", 0.0))
-        if bool(row.get("baseline_solved", False)) and not bool(row.get("solved", False)):
-            score -= max(0.0, lost_solve_penalty) * n_rows
-        if is_candidate_error(row):
-            score -= max(0.0, error_penalty) * n_rows
-        scores.append(score)
+    for row, weight in zip(rows, weights, strict=True):
+        score = _base_relative_score(
+            row,
+            lost_solve_penalty=lost_solve_penalty,
+            new_solve_bonus=new_solve_bonus,
+            error_penalty=error_penalty,
+            score_delta_weight=score_delta_weight,
+            score_delta_clip=score_delta_clip,
+        )
+        scores.append(score * weight)
     return scores
 
 
@@ -969,6 +1108,129 @@ def load_shard_results(shard_paths: Sequence[Path]) -> list[dict[str, Any]]:
     return sorted(results, key=lambda row: int(row["task_id"]))
 
 
+def _read_optional_text(path_value: object, *, max_chars: int) -> str:
+    if not path_value:
+        return ""
+    try:
+        path = Path(str(path_value))
+        if not path.exists():
+            return ""
+        return truncate_text(path.read_text(encoding="utf-8"), max_chars)
+    except OSError:
+        return ""
+
+
+def _result_summary(prefix: str, result: Mapping[str, Any], *, baseline: bool = False) -> str:
+    key_prefix = "baseline_" if baseline else ""
+    return (
+        f"{prefix}: solved={bool(result.get(f'{key_prefix}solved', False))} "
+        f"score={float(result.get(f'{key_prefix}score', 0.0)):.4f} "
+        f"expanded={result.get(f'{key_prefix}expanded', 'unknown')} "
+        f"generated={result.get(f'{key_prefix}generated', 'unknown')} "
+        f"solution_length={result.get(f'{key_prefix}solution_length', 'unknown')}"
+    )
+
+
+def build_reflection_feedback(result: Mapping[str, Any], classification: str) -> str:
+    """Return targeted feedback for GEPA reflection.
+
+    Raw search traces are useful but insufficient by themselves. The reflection
+    LLM needs to know whether the candidate regressed a level solved by the base
+    prompt, found a new solve worth preserving, or simply remained stuck.
+    """
+    candidate_feedback = str(result.get("feedback", ""))
+    baseline_feedback = str(result.get("baseline_feedback", ""))
+    lines: list[str] = []
+    if classification == "lost_baseline_solve":
+        lines.extend(
+            [
+                "REGRESSION: the base prompt solved this level, but the candidate failed.",
+                _result_summary("Base result", result, baseline=True),
+                _result_summary("Candidate result", result),
+                "Reflection target: preserve the base behavior for this mechanics pattern while changing only the general rule that caused the regression.",
+            ]
+        )
+    elif classification == "new_solve":
+        lines.extend(
+            [
+                "POSITIVE EXAMPLE: the candidate solved this level while the base prompt did not.",
+                _result_summary("Base result", result, baseline=True),
+                _result_summary("Candidate result", result),
+                "Reflection target: preserve the general insight that produced this new solve without adding narrow game-specific memorization.",
+            ]
+        )
+    elif classification == "solved_regression":
+        lines.extend(
+            [
+                "EFFICIENCY REGRESSION: both prompts solved this level, but the candidate was materially worse.",
+                _result_summary("Base result", result, baseline=True),
+                _result_summary("Candidate result", result),
+                "Reflection target: keep the solve but avoid the extra search caused by the candidate heuristic.",
+            ]
+        )
+    elif classification == "candidate_error":
+        lines.extend(
+            [
+                "CANDIDATE ERROR: the generated heuristic failed validation or search execution.",
+                _result_summary("Candidate result", result),
+                "Reflection target: strengthen the global code-generation contract without overfitting to this one level.",
+            ]
+        )
+    elif classification == "persistent_failure":
+        lines.extend(
+            [
+                "PERSISTENT FAILURE: neither the base nor candidate solved this level.",
+                _result_summary("Base result", result, baseline=True),
+                _result_summary("Candidate result", result),
+                "Reflection target: propose only a general heuristic principle if the trace reveals one; otherwise avoid bloating the global prompt.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "STABLE OR IMPROVED CASE: use this as low-priority context for what already works.",
+                _result_summary("Base result", result, baseline=True),
+                _result_summary("Candidate result", result),
+            ]
+        )
+
+    if baseline_feedback:
+        lines.append("Base raw feedback:\n" + baseline_feedback)
+    if candidate_feedback:
+        lines.append("Candidate raw feedback:\n" + candidate_feedback)
+    return "\n".join(lines)
+
+
+def build_comparison_payload(result: Mapping[str, Any], classification: str) -> dict[str, Any]:
+    raw_score = float(result.get("score", 0.0))
+    baseline_score = float(result.get("baseline_score", 0.0))
+    return {
+        "classification": classification,
+        "candidate_solved": bool(result.get("solved", False)),
+        "baseline_solved": bool(result.get("baseline_solved", False)),
+        "candidate_score": raw_score,
+        "baseline_score": baseline_score,
+        "score_delta": raw_score - baseline_score,
+        "candidate_error": is_candidate_error(result),
+    }
+
+
+def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
+    cleaned = strip_outer_markdown_fences(text).strip()
+    cleaned = re.sub(
+        r"^(?:revised global prompt|new instruction|prompt)\s*:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    cutoff = cleaned.rfind("\n", 0, max_chars)
+    if cutoff < max_chars // 2:
+        cutoff = max_chars
+    return cleaned[:cutoff].rstrip()
+
+
 class PuzzleScriptBatchedGEPAAdapter:
     def __init__(
         self,
@@ -980,7 +1242,10 @@ class PuzzleScriptBatchedGEPAAdapter:
         llm_concurrency: int,
         astar_timeout_s: float,
         lost_solve_penalty: float = DEFAULT_LOST_SOLVE_PENALTY,
+        new_solve_bonus: float = DEFAULT_NEW_SOLVE_BONUS,
         candidate_error_penalty: float = DEFAULT_CANDIDATE_ERROR_PENALTY,
+        score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
+        score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
     ) -> None:
         self.llm = llm
         self.state_root = state_root
@@ -989,10 +1254,12 @@ class PuzzleScriptBatchedGEPAAdapter:
         self.llm_concurrency = max(1, llm_concurrency)
         self.astar_timeout_s = astar_timeout_s
         self.lost_solve_penalty = max(0.0, lost_solve_penalty)
+        self.new_solve_bonus = max(0.0, new_solve_bonus)
         self.candidate_error_penalty = max(0.0, candidate_error_penalty)
+        self.score_delta_weight = max(0.0, score_delta_weight)
+        self.score_delta_clip = max(0.0, score_delta_clip)
         self.baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
         self.eval_counter = 0
-        self.propose_new_texts = None
 
     def set_baseline_outputs(self, outputs: Sequence[Mapping[str, Any]]) -> None:
         """Store base-prompt outcomes used to penalize solve regressions."""
@@ -1008,6 +1275,11 @@ class PuzzleScriptBatchedGEPAAdapter:
         result["baseline_score"] = float(baseline.get("score", 0.0))
         result["baseline_solved"] = bool(baseline.get("solved", False))
         result["baseline_error"] = baseline.get("error")
+        result["baseline_expanded"] = baseline.get("expanded")
+        result["baseline_generated"] = baseline.get("generated")
+        result["baseline_solution_length"] = baseline.get("solution_length")
+        result["baseline_feedback"] = baseline.get("feedback")
+        result["baseline_heuristic_code_path"] = baseline.get("heuristic_code_path")
 
     def _next_eval_dir(self, candidate: Mapping[str, str], batch: Sequence[PuzzleScriptLevelTask]) -> Path:
         self.eval_counter += 1
@@ -1197,7 +1469,10 @@ class PuzzleScriptBatchedGEPAAdapter:
         scores = adjusted_candidate_scores(
             outputs,
             lost_solve_penalty=self.lost_solve_penalty,
+            new_solve_bonus=self.new_solve_bonus,
             error_penalty=self.candidate_error_penalty,
+            score_delta_weight=self.score_delta_weight,
+            score_delta_clip=self.score_delta_clip,
         )
         for output, adjusted_score in zip(outputs, scores, strict=True):
             output["adjusted_score"] = adjusted_score
@@ -1256,13 +1531,20 @@ class PuzzleScriptBatchedGEPAAdapter:
             )
         records: list[dict[str, Any]] = []
         selection_note = (
-            f"Selected {len(selected_traces)} lowest-scoring traces out of "
-            f"{len(trajectories)} evaluated levels; all levels still contributed "
-            "to the scalar score."
+            f"Selected {len(selected_traces)} comparison-focused traces out of "
+            f"{len(trajectories)} evaluated levels, prioritizing lost base solves, "
+            "new solves, solved regressions, candidate errors, and persistent failures; "
+            "all levels still contributed to the scalar score."
         )
         for trace in selected_traces:
             task = trace["task"]
             result = trace["result"]
+            classification = trace_classification(trace)
+            baseline_code = _read_optional_text(
+                result.get("baseline_heuristic_code_path"),
+                max_chars=DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
+            )
+            targeted_feedback = build_reflection_feedback(result, classification)
             records.append(
                 {
                     "Inputs": {
@@ -1274,6 +1556,14 @@ class PuzzleScriptBatchedGEPAAdapter:
                             DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS,
                         ),
                     },
+                    "Comparison": build_comparison_payload(result, classification),
+                    "Baseline Output": {
+                        "heuristic_code": baseline_code,
+                        "feedback": truncate_text(
+                            str(result.get("baseline_feedback", "")),
+                            DEFAULT_REFLECTION_FEEDBACK_CHARS,
+                        ),
+                    },
                     "Generated Outputs": {
                         "heuristic_code": truncate_text(
                             trace.get("heuristic_code", ""),
@@ -1282,7 +1572,7 @@ class PuzzleScriptBatchedGEPAAdapter:
                         "synthesis_error": trace.get("synthesis_error"),
                     },
                     "Feedback": truncate_text(
-                        str(result.get("feedback", "")),
+                        targeted_feedback,
                         DEFAULT_REFLECTION_FEEDBACK_CHARS,
                     ),
                     "Selection": selection_note,
@@ -1292,6 +1582,54 @@ class PuzzleScriptBatchedGEPAAdapter:
                 }
             )
         return {component: records for component in components_to_update}
+
+    def propose_new_texts(
+        self,
+        candidate: dict[str, str],
+        reflective_dataset: dict[str, list[dict[str, Any]]],
+        components_to_update: list[str],
+    ) -> dict[str, str]:
+        """Propose compact global prompt revisions from comparative feedback.
+
+        GEPA's default instruction proposer tends to append broad examples. For
+        this research path we keep one global prompt, so the reflection request
+        explicitly asks for small, generalizable edits that preserve base-solved
+        behavior and only encode lessons supported by regression/new-solve
+        evidence.
+        """
+        new_texts: dict[str, str] = {}
+        for component in components_to_update:
+            current_prompt = candidate[component]
+            records = reflective_dataset.get(component, [])
+            feedback_payload = truncate_text(
+                json.dumps(records, indent=2, sort_keys=True, default=str),
+                DEFAULT_REFLECTION_DATASET_CHARS,
+            )
+            max_chars = max(DEFAULT_PROPOSED_PROMPT_MAX_CHARS, len(PUZZLESCRIPT_HEURISTIC_CONTRACT))
+            reflection_prompt = f"""You are revising one global prompt used to generate PuzzleScript A* heuristics.
+
+The research goal is a single general prompt, not per-game routing or memorized examples.
+Revise the current prompt using only compact, general rules supported by the comparison feedback.
+
+Hard requirements:
+- Preserve the exact function contract and safety constraints.
+- Prefer small edits to the current prompt. Delete or rewrite stale wording if needed.
+- Do not append long lists of named games, levels, examples, or mechanics inventories.
+- Prioritize preventing lost base solves over small expansion-count improvements.
+- Preserve general principles that created new solves only when they do not conflict with base-solved cases.
+- Keep the final prompt under {max_chars} characters.
+- Output only the revised prompt text. Do not include markdown, commentary, or labels.
+
+Current global prompt:
+{current_prompt}
+
+Comparison-focused feedback:
+{feedback_payload}
+"""
+            proposed = self.llm.complete(reflection_prompt)
+            cleaned = _clean_proposed_prompt(proposed, max_chars=max_chars)
+            new_texts[component] = cleaned if cleaned else current_prompt
+        return new_texts
 
 
 def parse_extra_sbatch_args(values: Optional[str]) -> tuple[str, ...]:
@@ -1387,7 +1725,10 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         llm_concurrency=args.llm_concurrency,
         astar_timeout_s=max(1.0, args.astar_timeout_s),
         lost_solve_penalty=args.lost_solve_penalty,
+        new_solve_bonus=args.new_solve_bonus,
         candidate_error_penalty=args.candidate_error_penalty,
+        score_delta_weight=args.score_delta_weight,
+        score_delta_clip=args.score_delta_clip,
     )
 
     import gepa
@@ -1408,7 +1749,9 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     print(
         "[gepa] evaluating base prompt baseline for regression scoring: "
         f"tasks={len(baseline_tasks)} lost_solve_penalty={args.lost_solve_penalty} "
-        f"candidate_error_penalty={args.candidate_error_penalty}",
+        f"new_solve_bonus={args.new_solve_bonus} "
+        f"candidate_error_penalty={args.candidate_error_penalty} "
+        f"score_delta_weight={args.score_delta_weight} score_delta_clip={args.score_delta_clip}",
         flush=True,
     )
     baseline_batch = adapter.evaluate(
@@ -1418,19 +1761,24 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     )
     baseline_outputs = [dict(row) for row in baseline_batch.outputs]
     adapter.set_baseline_outputs(baseline_outputs)
+    baseline_score_mean = (
+        sum(_result_float(row, "score") for row in baseline_outputs) / len(baseline_outputs)
+        if baseline_outputs
+        else 0.0
+    )
+    baseline_adjusted_score_mean = (
+        sum(
+            _result_float(row, "adjusted_score", _result_float(row, "score"))
+            for row in baseline_outputs
+        )
+        / len(baseline_outputs)
+        if baseline_outputs
+        else 0.0
+    )
     baseline_summary = {
         "n": len(baseline_outputs),
-        "score_mean": (
-            sum(float(row.get("score", 0.0)) for row in baseline_outputs) / len(baseline_outputs)
-            if baseline_outputs
-            else 0.0
-        ),
-        "adjusted_score_mean": (
-            sum(float(row.get("adjusted_score", row.get("score", 0.0))) for row in baseline_outputs)
-            / len(baseline_outputs)
-            if baseline_outputs
-            else 0.0
-        ),
+        "score_mean": baseline_score_mean,
+        "adjusted_score_mean": baseline_adjusted_score_mean,
         "solved": sum(1 for row in baseline_outputs if bool(row.get("solved", False))),
         "candidate_errors": sum(1 for row in baseline_outputs if is_candidate_error(row)),
     }
@@ -1530,11 +1878,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-gepa-iterations", type=int, default=DEFAULT_MAX_GEPA_ITERATIONS)
     parser.add_argument("--max-metric-calls", type=int, default=0)
     parser.add_argument("--lost-solve-penalty", type=float, default=DEFAULT_LOST_SOLVE_PENALTY)
+    parser.add_argument("--new-solve-bonus", type=float, default=DEFAULT_NEW_SOLVE_BONUS)
     parser.add_argument(
         "--candidate-error-penalty",
         type=float,
         default=DEFAULT_CANDIDATE_ERROR_PENALTY,
     )
+    parser.add_argument("--score-delta-weight", type=float, default=DEFAULT_SCORE_DELTA_WEIGHT)
+    parser.add_argument("--score-delta-clip", type=float, default=DEFAULT_SCORE_DELTA_CLIP)
     parser.add_argument(
         "--reflection-minibatch-size",
         type=int,

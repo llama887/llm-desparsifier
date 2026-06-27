@@ -16,6 +16,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     DEFAULT_REFLECTION_MAX_RECORDS,
     PuzzleScriptBatchedGEPAAdapter,
     SearchArrayStalledError,
+    adjusted_candidate_scores,
     assigned_tasks,
     build_sbatch_array_command,
     build_train_dev_tasks,
@@ -37,6 +38,16 @@ def _stuck_search_task_worker(
     _result_queue: object,
 ) -> None:
     time.sleep(10.0)
+
+
+class _FakeLLM:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.prompts: list[str] = []
+
+    def complete(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.response
 
 
 def test_strip_outer_markdown_fences_accepts_python_fence() -> None:
@@ -147,15 +158,104 @@ def test_build_train_dev_tasks_reassigns_task_ids_after_split() -> None:
 
 def test_candidate_score_penalizes_lost_solves_and_errors() -> None:
     outputs = [
-        {"score": 0.8, "solved": True, "baseline_solved": True, "error": None},
-        {"score": 0.9, "solved": False, "baseline_solved": True, "error": None},
-        {"score": 0.5, "solved": True, "baseline_solved": False, "error": None},
-        {"score": 1.0, "solved": False, "baseline_solved": False, "error": "exit is not allowed"},
+        {
+            "game": "a",
+            "score": 0.9,
+            "solved": True,
+            "baseline_score": 0.8,
+            "baseline_solved": True,
+            "error": None,
+        },
+        {
+            "game": "a",
+            "score": 0.0,
+            "solved": False,
+            "baseline_score": 0.7,
+            "baseline_solved": True,
+            "error": None,
+        },
+        {
+            "game": "b",
+            "score": 0.6,
+            "solved": True,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+            "error": None,
+        },
+        {
+            "game": "b",
+            "score": 0.0,
+            "solved": False,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+            "error": "exit is not allowed",
+        },
     ]
 
-    score = candidate_score(outputs, lost_solve_penalty=0.25, error_penalty=0.1)
+    scores = adjusted_candidate_scores(
+        outputs,
+        lost_solve_penalty=4.0,
+        new_solve_bonus=1.0,
+        error_penalty=2.0,
+        score_delta_weight=0.25,
+        score_delta_clip=0.5,
+    )
+    score = candidate_score(
+        outputs,
+        lost_solve_penalty=4.0,
+        new_solve_bonus=1.0,
+        error_penalty=2.0,
+        score_delta_weight=0.25,
+        score_delta_clip=0.5,
+    )
 
-    assert score == pytest.approx(((0.8 + 0.9 + 0.5 + 1.0) / 4) - 0.25 - 0.1)
+    assert scores == pytest.approx(
+        [
+            0.25 * 0.1,
+            -4.0 + 0.25 * -0.5,
+            1.0 + 0.25 * 0.5,
+            -2.0,
+        ]
+    )
+    assert score == pytest.approx(sum(scores) / len(scores))
+
+
+def test_candidate_scores_macro_weight_games() -> None:
+    outputs = [
+        {
+            "game": "large",
+            "score": 0.1,
+            "solved": True,
+            "baseline_score": 0.0,
+            "baseline_solved": True,
+        },
+        {
+            "game": "large",
+            "score": 0.1,
+            "solved": True,
+            "baseline_score": 0.0,
+            "baseline_solved": True,
+        },
+        {
+            "game": "small",
+            "score": 0.5,
+            "solved": True,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+        },
+    ]
+
+    scores = adjusted_candidate_scores(
+        outputs,
+        lost_solve_penalty=4.0,
+        new_solve_bonus=1.0,
+        error_penalty=2.0,
+        score_delta_weight=1.0,
+        score_delta_clip=1.0,
+    )
+
+    assert scores == pytest.approx([0.075, 0.075, 2.25])
+    assert sum(scores) / len(scores) == pytest.approx((0.1 + 1.5) / 2)
 
 
 def test_context_retry_max_tokens_uses_reported_prompt_tokens() -> None:
@@ -232,22 +332,124 @@ def test_make_reflective_dataset_compacts_large_trace_payloads() -> None:
     assert len(record["Feedback"]) < DEFAULT_REFLECTION_FEEDBACK_CHARS + 80
     assert "[truncated 100 chars]" in record["Inputs"]["env_description"]
     assert "all levels still contributed to the scalar score" in record["Selection"]
+    assert record["Comparison"]["classification"] == "persistent_failure"
 
 
-def test_select_reflection_traces_keeps_lowest_scoring_failures() -> None:
+def test_make_reflective_dataset_includes_regression_comparison(tmp_path: Path) -> None:
+    base_code = tmp_path / "base.py"
+    base_code.write_text("def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0\n")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=object(),  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    eval_batch = SimpleNamespace(
+        trajectories=[
+            {
+                "task": {
+                    "game": "regressed-game",
+                    "level": 4,
+                    "budget": 100,
+                    "env_description": "rules",
+                },
+                "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 2.0\n",
+                "synthesis_error": None,
+                "result": {
+                    "feedback": "candidate exhausted search",
+                    "score": 0.0,
+                    "solved": False,
+                    "expanded": 100,
+                    "baseline_score": 0.75,
+                    "baseline_solved": True,
+                    "baseline_expanded": 12,
+                    "baseline_heuristic_code_path": str(base_code),
+                    "baseline_feedback": "base solved quickly",
+                },
+            }
+        ]
+    )
+
+    dataset = adapter.make_reflective_dataset(
+        candidate={},
+        eval_batch=eval_batch,
+        components_to_update=["heuristic_prompt"],
+    )
+
+    record = dataset["heuristic_prompt"][0]
+    assert record["Comparison"]["classification"] == "lost_baseline_solve"
+    assert "REGRESSION" in record["Feedback"]
+    assert "base prompt solved" in record["Feedback"]
+    assert "candidate failed" in record["Feedback"]
+    assert "base solved quickly" in record["Baseline Output"]["feedback"]
+    assert "return 1.0" in record["Baseline Output"]["heuristic_code"]
+
+
+def test_custom_proposer_requests_compact_global_prompt() -> None:
+    llm = _FakeLLM("Revised global prompt: keep the contract and avoid memorized examples.")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": "current prompt"},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "lost_baseline_solve"},
+                    "Feedback": "REGRESSION: base prompt solved but candidate failed.",
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] == "keep the contract and avoid memorized examples."
+    assert "single general prompt" in llm.prompts[0]
+    assert "Do not append long lists" in llm.prompts[0]
+    assert "REGRESSION" in llm.prompts[0]
+
+
+def test_select_reflection_traces_prioritizes_regressions_and_new_solves() -> None:
     trajectories = [
         {
             "task": {"game": f"game-{idx:02d}", "level": idx},
-            "result": {"score": float(idx), "solved": idx % 2 == 0},
+            "result": {
+                "score": float(idx),
+                "solved": idx % 2 == 0,
+                "baseline_solved": False,
+            },
         }
         for idx in range(DEFAULT_REFLECTION_MAX_RECORDS + 6)
     ]
+    trajectories.append(
+        {
+            "task": {"game": "regression", "level": 99},
+            "result": {"score": 0.0, "solved": False, "baseline_solved": True},
+        }
+    )
+    trajectories.append(
+        {
+            "task": {"game": "new-solve", "level": 100},
+            "result": {"score": 0.8, "solved": True, "baseline_solved": False},
+        }
+    )
 
     selected = select_reflection_traces(trajectories)
 
     assert len(selected) == DEFAULT_REFLECTION_MAX_RECORDS
-    assert [trace["task"]["level"] for trace in selected[:3]] == [1, 3, 5]
-    assert all(not trace["result"]["solved"] for trace in selected[:10])
+    assert selected[0]["task"]["game"] == "regression"
+    assert selected[1]["result"]["solved"] is True
+    assert selected[1]["result"]["baseline_solved"] is False
+    assert "new-solve" in {trace["task"]["game"] for trace in selected}
+    assert any(not trace["result"]["solved"] for trace in selected[:10])
 
 
 def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
@@ -258,6 +460,9 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert '--val-split "${VAL_SPLIT:-dev}"' in launcher
     assert '--max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}"' in launcher
     assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-600}"' in launcher
+    assert '--lost-solve-penalty "${LOST_SOLVE_PENALTY:-4.0}"' in launcher
+    assert '--new-solve-bonus "${NEW_SOLVE_BONUS:-1.0}"' in launcher
+    assert '--score-delta-weight "${SCORE_DELTA_WEIGHT:-0.25}"' in launcher
     assert 'RUN_HOLDOUT_COMPARE:-1' in launcher
     assert "scripts/compare_puzzlescript_batched_prompts.py" in launcher
 

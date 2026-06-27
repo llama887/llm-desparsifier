@@ -212,8 +212,11 @@ echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
     --dev-fraction "${DEV_FRACTION:-0.25}" \
     --max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}" \
     --max-metric-calls "${MAX_METRIC_CALLS:-0}" \
-    --lost-solve-penalty "${LOST_SOLVE_PENALTY:-0.02}" \
-    --candidate-error-penalty "${CANDIDATE_ERROR_PENALTY:-0.01}" \
+    --lost-solve-penalty "${LOST_SOLVE_PENALTY:-4.0}" \
+    --new-solve-bonus "${NEW_SOLVE_BONUS:-1.0}" \
+    --candidate-error-penalty "${CANDIDATE_ERROR_PENALTY:-2.0}" \
+    --score-delta-weight "${SCORE_DELTA_WEIGHT:-0.25}" \
+    --score-delta-clip "${SCORE_DELTA_CLIP:-0.5}" \
     --reflection-minibatch-size "${REFLECTION_MINIBATCH_SIZE:-0}" \
     --seed "${GEPA_SEED:-0}"
 
