@@ -257,7 +257,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher
     assert '--val-split "${VAL_SPLIT:-dev}"' in launcher
     assert '--max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}"' in launcher
-    assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}"' in launcher
+    assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-600}"' in launcher
     assert 'RUN_HOLDOUT_COMPARE:-1' in launcher
     assert "scripts/compare_puzzlescript_batched_prompts.py" in launcher
 
