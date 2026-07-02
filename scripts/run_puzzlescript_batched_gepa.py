@@ -87,7 +87,7 @@ DEFAULT_PARTIAL_PROGRESS_WEIGHT = 0.05
 DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4200
 DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 900
 DEFAULT_REFLECTION_DATASET_CHARS = 24000
-DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 120.0
+DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 300.0
 DEFAULT_LLM_TEMPERATURE = 0.0
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
@@ -2571,7 +2571,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("sbatch/evaluate_puzzlescript_search_array.s"),
     )
     parser.add_argument("--search-array-count", type=int, default=101)
-    parser.add_argument("--search-array-concurrency", type=int, default=64)
+    parser.add_argument("--search-array-concurrency", type=int, default=16)
     parser.add_argument("--search-poll-interval-s", type=float, default=15.0)
     parser.add_argument(
         "--search-array-stall-timeout-s",

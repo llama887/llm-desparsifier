@@ -455,7 +455,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("sbatch/evaluate_puzzlescript_search_array.s"),
     )
     parser.add_argument("--search-array-count", type=int, default=101)
-    parser.add_argument("--search-array-concurrency", type=int, default=64)
+    parser.add_argument("--search-array-concurrency", type=int, default=16)
     parser.add_argument("--search-poll-interval-s", type=float, default=15.0)
     parser.add_argument(
         "--search-array-stall-timeout-s",

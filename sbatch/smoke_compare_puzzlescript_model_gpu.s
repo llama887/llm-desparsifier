@@ -223,7 +223,7 @@ echo "[run] vllm_extra_args=${VLLM_EXTRA_ARGS:-}"
     --search-array-count "${SEARCH_ARRAY_COUNT:-8}" \
     --search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-8}" \
     --search-poll-interval-s "${SEARCH_POLL_INTERVAL_S:-10}" \
-    --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-120}" \
+    --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}" \
     --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}" \
     --lost-solve-penalty "${LOST_SOLVE_PENALTY:-4.0}" \
     --new-solve-bonus "${NEW_SOLVE_BONUS:-1.0}" \

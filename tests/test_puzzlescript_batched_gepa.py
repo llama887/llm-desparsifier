@@ -841,7 +841,9 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in launcher
     assert '--val-split "${VAL_SPLIT:-dev}"' in launcher
     assert '--max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}"' in launcher
-    assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-120}"' in launcher
+    assert 'search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-16}' in launcher
+    assert '--search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-16}"' in launcher
+    assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}"' in launcher
     assert '--lost-solve-penalty "${LOST_SOLVE_PENALTY:-8.0}"' in launcher
     assert '--new-solve-bonus "${NEW_SOLVE_BONUS:-1.0}"' in launcher
     assert '--score-delta-weight "${SCORE_DELTA_WEIGHT:-1.0}"' in launcher
@@ -854,6 +856,9 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     )
     assert "#SBATCH --time=02:00:00" in holdout_launcher
     assert 'VLLM_PORT_SPACING:-20' in holdout_launcher
+    assert 'search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-16}' in holdout_launcher
+    assert '--search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-16}"' in holdout_launcher
+    assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}"' in holdout_launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in holdout_launcher
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in holdout_launcher
 
@@ -873,7 +878,7 @@ def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:
     assert "#SBATCH --time=01:00:00" in launcher
     assert "runtime_ready()" in launcher
     assert "ensure_runtime()" in launcher
-    assert "#SBATCH --mem=8G" in launcher
+    assert "#SBATCH --mem=2G" in launcher
     assert "if runtime_ready; then" in launcher
     assert "[setup] using existing PuzzleScript runtime" in launcher
     assert "else\n    ensure_runtime\nfi" in launcher

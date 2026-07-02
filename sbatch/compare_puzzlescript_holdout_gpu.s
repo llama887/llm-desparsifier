@@ -183,7 +183,7 @@ OPTIMIZED_PROMPT="${OPTIMIZED_PROMPT:-artifacts/gepa_puzzlescript_batched_117950
 echo "[run] state_root=$RUN_STATE_ROOT"
 echo "[run] optimized_prompt=$OPTIMIZED_PROMPT"
 echo "[run] model=$LOCAL_LLM_MODEL base_url=$OPENAI_BASE_URL"
-echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-64}"
+echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-16}"
 
 "$SD_PATH/.venv/bin/python" -u scripts/compare_puzzlescript_batched_prompts.py \
     --env-grid "${ENV_GRID:-configs/gepa_puzzlescript_envs.yaml}" \
@@ -204,7 +204,7 @@ echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_A
     --submit-search-array \
     --search-array-script "$SEARCH_ARRAY_SCRIPT" \
     --search-array-count "${SEARCH_ARRAY_COUNT:-101}" \
-    --search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-64}" \
+    --search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-16}" \
     --search-poll-interval-s "${SEARCH_POLL_INTERVAL_S:-15}" \
-    --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-120}" \
+    --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}" \
     --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}"

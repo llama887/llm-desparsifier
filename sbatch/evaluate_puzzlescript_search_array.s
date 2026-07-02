@@ -3,7 +3,7 @@
 #SBATCH --job-name=puzzlescript-search
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=8G
+#SBATCH --mem=2G
 #SBATCH --time=01:00:00
 #SBATCH --array=0-100%64
 #SBATCH --account=torch_pr_45_tandon_advanced
