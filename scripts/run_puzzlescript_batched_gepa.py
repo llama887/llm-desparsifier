@@ -1865,6 +1865,85 @@ class PuzzleScriptBatchedGEPAAdapter:
         )
         return results
 
+    def _reuse_baseline_evaluation(
+        self,
+        *,
+        eval_dir: Path,
+        batch: Sequence[PuzzleScriptLevelTask],
+        capture_traces: bool,
+    ) -> Optional[tuple[list[dict[str, Any]], list[float], Optional[list[dict[str, Any]]]]]:
+        """Return stored base-prompt outputs for an exact base candidate.
+
+        The baseline pass already synthesized and searched the base prompt for
+        every train and validation task. Reusing those rows for later exact
+        base-prompt evaluations removes LLM resampling noise from the regression
+        metric while leaving all non-base candidate prompts on the normal
+        synthesis/search path.
+        """
+        if not self.baseline_by_key:
+            return None
+        outputs: list[dict[str, Any]] = []
+        trajectories: list[dict[str, Any]] = []
+        for task in batch:
+            baseline = self.baseline_by_key.get((task.game, task.level))
+            if baseline is None:
+                return None
+            result = dict(baseline)
+            result["task_id"] = task.task_id
+            result["game"] = task.game
+            result["level"] = task.level
+            self._attach_baseline_metadata(result)
+            outputs.append(result)
+            if capture_traces:
+                code_path = result.get("heuristic_code_path") or result.get(
+                    "baseline_heuristic_code_path"
+                )
+                heuristic_code = _read_optional_text(code_path, max_chars=16_000)
+                trajectories.append(
+                    {
+                        "task": asdict(task),
+                        "heuristic_code_path": code_path,
+                        "heuristic_code": heuristic_code,
+                        "synthesis_error": result.get("synthesis_error"),
+                        "result": result,
+                    }
+                )
+
+        scores = adjusted_candidate_scores(
+            outputs,
+            lost_solve_penalty=self.lost_solve_penalty,
+            new_solve_bonus=self.new_solve_bonus,
+            error_penalty=self.candidate_error_penalty,
+            score_delta_weight=self.score_delta_weight,
+            score_delta_clip=self.score_delta_clip,
+            partial_progress_weight=self.partial_progress_weight,
+        )
+        for output, adjusted_score in zip(outputs, scores, strict=True):
+            output["adjusted_score"] = adjusted_score
+        (eval_dir / "baseline_reuse.json").write_text(
+            json.dumps(
+                {
+                    "reused": True,
+                    "n_outputs": len(outputs),
+                    "reason": "exact base prompt with stored baseline outputs",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (eval_dir / "synthesis_manifest.json").write_text("[]\n", encoding="utf-8")
+        (eval_dir / "merged_results.json").write_text(
+            json.dumps(outputs, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        (eval_dir / "scored_results.json").write_text(
+            json.dumps(outputs, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        return outputs, scores, trajectories if capture_traces else None
+
     def evaluate(
         self,
         batch: list[PuzzleScriptLevelTask],
@@ -1943,6 +2022,25 @@ class PuzzleScriptBatchedGEPAAdapter:
                 scores=violation_scores,
                 trajectories=violation_trajectories if capture_traces else None,
             )
+
+        if prompt_text.strip() == PUZZLESCRIPT_HEURISTIC_CONTRACT.strip():
+            reused = self._reuse_baseline_evaluation(
+                eval_dir=eval_dir,
+                batch=batch,
+                capture_traces=capture_traces,
+            )
+            if reused is not None:
+                reused_outputs, reused_scores, trajectories_or_none = reused
+                print(
+                    f"[adapter] reused baseline outputs for exact base prompt: "
+                    f"{len(reused_outputs)} level(s)",
+                    flush=True,
+                )
+                return EvaluationBatch(
+                    outputs=reused_outputs,
+                    scores=reused_scores,
+                    trajectories=trajectories_or_none,
+                )
 
         task_rows = self._synthesize_batch(candidate=candidate, batch=batch, eval_dir=eval_dir)
         results_by_id = {

@@ -624,6 +624,59 @@ def test_custom_proposer_rejects_dangling_addendum_tail() -> None:
     assert result["heuristic_prompt"] == current_prompt
 
 
+def test_base_prompt_evaluation_reuses_stored_baseline_outputs(tmp_path: Path) -> None:
+    llm = _FakeLLM("def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=tmp_path,
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    adapter.set_baseline_outputs(
+        [
+            {
+                "task_id": 99,
+                "game": "base-game",
+                "level": 3,
+                "score": 0.75,
+                "solved": True,
+                "expanded": 12,
+                "generated": 20,
+                "solution_length": 4,
+                "partial_progress_score": 1.0,
+                "feedback": "baseline solved",
+                "error": None,
+            }
+        ]
+    )
+    task = PuzzleScriptLevelTask(
+        task_id=0,
+        game="base-game",
+        level=3,
+        budget=100,
+        env_description="Win conditions: all crates on targets",
+        game_text_path=str(tmp_path / "game.txt"),
+    )
+
+    batch = adapter.evaluate(
+        batch=[task],
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        capture_traces=False,
+    )
+
+    assert llm.prompts == []
+    assert batch.outputs[0]["task_id"] == 0
+    assert batch.outputs[0]["score"] == 0.75
+    assert batch.outputs[0]["solved"] is True
+    assert batch.outputs[0]["baseline_solved"] is True
+    assert batch.scores == pytest.approx([0.0])
+    eval_dirs = list((tmp_path / "candidate_evals").glob("eval-*"))
+    assert len(eval_dirs) == 1
+    assert (eval_dirs[0] / "baseline_reuse.json").exists()
+
+
 def test_build_reflection_feedback_includes_trace_diagnostics_for_solved_regression() -> None:
     feedback = build_reflection_feedback(
         {
