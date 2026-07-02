@@ -167,7 +167,7 @@ def test_build_train_dev_tasks_reassigns_task_ids_after_split() -> None:
     assert {task.game for task in train_tasks}.isdisjoint({task.game for task in dev_tasks})
 
 
-def test_candidate_score_penalizes_lost_solves_and_errors() -> None:
+def test_candidate_score_applies_eval_wide_gate_for_lost_solves_and_errors() -> None:
     outputs = [
         {
             "game": "a",
@@ -222,10 +222,10 @@ def test_candidate_score_penalizes_lost_solves_and_errors() -> None:
 
     assert scores == pytest.approx(
         [
-            0.25 * 0.1,
-            -4.0 + 0.25 * -0.5,
-            1.0 + 0.25 * 0.5,
-            -2.0,
+            0.25 * 0.1 - 4.0,
+            -4.0 + 0.25 * -0.5 - 4.0,
+            1.0 + 0.25 * 0.5 - 4.0,
+            -2.0 - 4.0,
         ]
     )
     assert score == pytest.approx(sum(scores) / len(scores))

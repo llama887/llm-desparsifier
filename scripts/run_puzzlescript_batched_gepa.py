@@ -850,10 +850,23 @@ def adjusted_candidate_scores(
     The list is still one score per task, matching GEPA's API, but each value is
     weighted so that the arithmetic mean is a per-game macro-average. That keeps
     broad game generalization visible even when one game contributes many more
-    levels than another.
+    levels than another. If any baseline-solved level regresses, an
+    evaluation-wide gate penalty is subtracted from every task score. This keeps
+    GEPA's Pareto selection from preserving wins produced by globally unsafe
+    prompt variants.
     """
     rows = list(outputs)
     weights = _macro_game_weights(rows)
+    gate_penalty = (
+        max(0.0, lost_solve_penalty)
+        if any(
+            _has_baseline(row)
+            and bool(row.get("baseline_solved", False))
+            and not bool(row.get("solved", False))
+            for row in rows
+        )
+        else 0.0
+    )
     scores: list[float] = []
     for row, weight in zip(rows, weights, strict=True):
         score = _base_relative_score(
@@ -865,7 +878,7 @@ def adjusted_candidate_scores(
             score_delta_clip=score_delta_clip,
             partial_progress_weight=partial_progress_weight,
         )
-        scores.append(score * weight)
+        scores.append(score * weight - gate_penalty)
     return scores
 
 
