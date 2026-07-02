@@ -1600,12 +1600,22 @@ def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
 def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
     """Clean a proposed GEPA prompt addendum and reject drift-prone shapes."""
     cleaned = strip_outer_markdown_fences(text).strip()
-    cleaned = re.sub(
-        r"^(?:revised global prompt|new instruction|prompt|addendum|additional guidance)\s*:\s*",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    ).strip()
+    addendum_labels = list(
+        re.finditer(
+            r"(?:^|\n)\s*(?:additional gepa guidance|addendum|additional guidance)\s*:\s*",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    )
+    if addendum_labels:
+        cleaned = cleaned[addendum_labels[-1].end() :].strip()
+    else:
+        cleaned = re.sub(
+            r"^(?:revised global prompt|new instruction|prompt)\s*:\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
     if candidate_prompt_issue(cleaned) is not None:
         return ""
     if not cleaned:
@@ -1622,6 +1632,40 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
     if _has_dangling_prompt_tail(cleaned):
         return ""
     return cleaned
+
+
+def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> str:
+    """Return a conservative exploration addendum when the proposer no-ops.
+
+    Local LLMs sometimes answer the addendum prompt by restating the base prompt
+    or by producing code. Keeping the current prompt in that case makes GEPA
+    spend every iteration on an exact baseline reuse. This fallback creates one
+    safe, general candidate from the available feedback while preserving the
+    base prompt's mechanics-first contract.
+    """
+    if not records:
+        return ""
+    classifications = {
+        str(cast(Mapping[str, Any], record.get("Comparison", {})).get("classification", ""))
+        for record in records
+    }
+    if "lost_baseline_solve" in classifications:
+        return (
+            "When a change risks a base-solved level, keep exact WINCONDITIONS, RULES, "
+            "LEGEND names, and collision-layer mechanics primary; use score_normalized "
+            "only as a tie-breaker and skip unproven deadlock penalties."
+        )
+    if "new_solve" in classifications:
+        return (
+            "Generalize new-solve evidence only through exact rule and win-condition "
+            "features: count unsatisfied objects by LEGEND name, prefer legal progress "
+            "moves, and keep generic role fallback secondary."
+        )
+    return (
+        "For base-unsolved levels, after reading WINCONDITIONS, RULES, and LEGEND, "
+        "add one conservative win-condition distance feature using exact object names "
+        "and legal progress moves; keep score_normalized only as a tie-breaker."
+    )
 
 
 def heuristic_code_shape(code: str) -> dict[str, bool]:
@@ -2261,9 +2305,18 @@ Comparison-focused feedback:
 """
             proposed = self.llm.complete(reflection_prompt)
             cleaned = _clean_proposed_addendum(proposed, max_chars=max_chars)
-            new_texts[component] = (
+            revised_prompt = (
                 _compose_prompt_with_addendum(base_prompt, cleaned) if cleaned else current_prompt
             )
+            if revised_prompt.strip() == current_prompt.strip():
+                fallback = _fallback_addendum_from_feedback(records)
+                if fallback:
+                    print(
+                        "[proposer] using conservative fallback addendum after no-op proposal",
+                        flush=True,
+                    )
+                    revised_prompt = _compose_prompt_with_addendum(base_prompt, fallback)
+            new_texts[component] = revised_prompt
         return new_texts
 
 
