@@ -868,7 +868,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     launcher = Path("sbatch/train_puzzlescript_batched_gepa_gpu.s").read_text(encoding="utf-8")
 
     assert "#SBATCH --cpus-per-task=2" in launcher
-    assert "#SBATCH --time=08:00:00" in launcher
+    assert "#SBATCH --time=07:00:00" in launcher
     assert "#SBATCH --gres=gpu:h100:2" in launcher
     assert 'elif [ -n "${RUN_STATE_ROOT:-}" ]; then' in launcher
     assert 'LOCAL_LLM_MODEL:-openai/gpt-oss-120b' in launcher
@@ -893,7 +893,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     holdout_launcher = Path("sbatch/compare_puzzlescript_holdout_gpu.s").read_text(
         encoding="utf-8"
     )
-    assert "#SBATCH --time=02:00:00" in holdout_launcher
+    assert "#SBATCH --time=01:15:00" in holdout_launcher
     assert 'VLLM_PORT_SPACING:-20' in holdout_launcher
     assert 'search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-16}' in holdout_launcher
     assert '--search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-16}"' in holdout_launcher
@@ -904,7 +904,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     smoke_launcher = Path("sbatch/smoke_compare_puzzlescript_model_gpu.s").read_text(
         encoding="utf-8"
     )
-    assert "#SBATCH --time=02:00:00" in smoke_launcher
+    assert "#SBATCH --time=01:15:00" in smoke_launcher
     assert 'VLLM_PORT_SPACING:-20' in smoke_launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in smoke_launcher
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in smoke_launcher
