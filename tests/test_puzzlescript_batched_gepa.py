@@ -555,6 +555,7 @@ def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
     assert "keep mechanics-specific object names primary" in result["heuristic_prompt"]
     assert "short addendum" in llm.prompts[0]
     assert "Do not rewrite the full base prompt" in llm.prompts[0]
+    assert "Do not return the base prompt unchanged" in llm.prompts[0]
     assert "REGRESSION" in llm.prompts[0]
 
 

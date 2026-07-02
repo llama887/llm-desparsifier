@@ -2277,6 +2277,8 @@ The existing base prompt is already strong. Propose only a short addendum that w
 
 Hard requirements:
 - Do not rewrite the full base prompt. Output only the short addendum text.
+- Do not return the base prompt unchanged. The addendum must test one specific,
+  conservative, generalizable hypothesis from the feedback.
 - Preserve the exact function contract and safety constraints by leaving the base prompt unchanged.
 - Preserve the base prompt's instruction to read WINCONDITIONS, RULES,
   COLLISIONLAYERS, LEGEND aliases, and the initial level state before choosing
