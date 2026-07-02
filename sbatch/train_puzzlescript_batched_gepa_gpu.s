@@ -201,7 +201,7 @@ echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
     --openai-base-url "$OPENAI_BASE_URL" \
     --openai-api-key "$OPENAI_API_KEY" \
     --max-model-tokens "${MAX_MODEL_TOKENS:-8192}" \
-    --temperature "${LLM_TEMPERATURE:-0.2}" \
+    --temperature "${LLM_TEMPERATURE:-0.0}" \
     --top-p "${LLM_TOP_P:-0.95}" \
     --llm-timeout-s "${LLM_TIMEOUT_S:-600}" \
     --llm-concurrency "${LLM_CONCURRENCY:-16}" \
@@ -210,7 +210,7 @@ echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
     --search-array-count "${SEARCH_ARRAY_COUNT:-101}" \
     --search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-64}" \
     --search-poll-interval-s "${SEARCH_POLL_INTERVAL_S:-15}" \
-    --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-600}" \
+    --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-120}" \
     --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}" \
     --val-split "${VAL_SPLIT:-dev}" \
     --dev-fraction "${DEV_FRACTION:-0.25}" \
@@ -248,7 +248,7 @@ if [ "${RUN_HOLDOUT_COMPARE:-1}" = "1" ]; then
         --openai-base-url "$OPENAI_BASE_URL" \
         --openai-api-key "$OPENAI_API_KEY" \
         --max-model-tokens "${HOLDOUT_MAX_MODEL_TOKENS:-${MAX_MODEL_TOKENS:-8192}}" \
-        --temperature "${HOLDOUT_LLM_TEMPERATURE:-${LLM_TEMPERATURE:-0.2}}" \
+        --temperature "${HOLDOUT_LLM_TEMPERATURE:-${LLM_TEMPERATURE:-0.0}}" \
         --top-p "${HOLDOUT_LLM_TOP_P:-${LLM_TOP_P:-0.95}}" \
         --llm-timeout-s "${HOLDOUT_LLM_TIMEOUT_S:-${LLM_TIMEOUT_S:-600}}" \
         --llm-concurrency "${HOLDOUT_LLM_CONCURRENCY:-${LLM_CONCURRENCY:-16}}" \
@@ -257,6 +257,6 @@ if [ "${RUN_HOLDOUT_COMPARE:-1}" = "1" ]; then
         --search-array-count "${HOLDOUT_SEARCH_ARRAY_COUNT:-${SEARCH_ARRAY_COUNT:-101}}" \
         --search-array-concurrency "${HOLDOUT_SEARCH_ARRAY_CONCURRENCY:-${SEARCH_ARRAY_CONCURRENCY:-64}}" \
         --search-poll-interval-s "${HOLDOUT_SEARCH_POLL_INTERVAL_S:-${SEARCH_POLL_INTERVAL_S:-15}}" \
-        --search-array-stall-timeout-s "${HOLDOUT_SEARCH_ARRAY_STALL_TIMEOUT_S:-${SEARCH_ARRAY_STALL_TIMEOUT_S:-600}}" \
+        --search-array-stall-timeout-s "${HOLDOUT_SEARCH_ARRAY_STALL_TIMEOUT_S:-${SEARCH_ARRAY_STALL_TIMEOUT_S:-120}}" \
         --extra-sbatch-args "${HOLDOUT_SEARCH_EXTRA_SBATCH_ARGS:-${SEARCH_EXTRA_SBATCH_ARGS:-}}"
 fi

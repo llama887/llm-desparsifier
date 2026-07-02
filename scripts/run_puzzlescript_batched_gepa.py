@@ -85,10 +85,13 @@ DEFAULT_SCORE_DELTA_WEIGHT = 1.0
 DEFAULT_SCORE_DELTA_CLIP = 0.5
 DEFAULT_PARTIAL_PROGRESS_WEIGHT = 0.05
 DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4200
+DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 900
 DEFAULT_REFLECTION_DATASET_CHARS = 24000
-DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 600.0
+DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 120.0
+DEFAULT_LLM_TEMPERATURE = 0.0
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
+GEPA_ADDENDUM_HEADER = "Additional GEPA guidance:"
 _CONTEXT_LENGTH_RE = re.compile(
     r"maximum context length is\s+(?P<context>\d+)\s+tokens.*?"
     r"prompt contains at least\s+(?P<input>\d+)\s+input tokens",
@@ -1516,6 +1519,42 @@ def build_comparison_payload(result: Mapping[str, Any], classification: str) -> 
     }
 
 
+def _has_dangling_prompt_tail(text: str) -> bool:
+    """Return True when prompt text appears cut at an unfinished list or heading.
+
+    GEPA proposals are later reused as high-level instructions. Accepting a
+    syntactically valid but truncated note, such as a final bullet marker or
+    heading ending in a colon, gives the synthesis model an incoherent contract
+    and has been a recurring source of generic fallback heuristics.
+    """
+    nonempty_lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if not nonempty_lines:
+        return True
+    tail = nonempty_lines[-1].strip()
+    if tail in {"-", "*", "•"}:
+        return True
+    if re.match(r"^(?:[-*]\s*)?(?:\d+[.)]\s*)?$", tail):
+        return True
+    if re.match(r"^#{1,6}\s+\S.*$", tail):
+        return True
+    return tail.endswith(":")
+
+
+def _strip_gepa_addendum(prompt_text: str) -> str:
+    """Return the stable base portion of a prompt before GEPA's generated addendum."""
+    marker = "\n\n" + GEPA_ADDENDUM_HEADER
+    if marker in prompt_text:
+        return prompt_text.split(marker, 1)[0].rstrip()
+    if GEPA_ADDENDUM_HEADER in prompt_text:
+        return prompt_text.split(GEPA_ADDENDUM_HEADER, 1)[0].rstrip()
+    return prompt_text.rstrip()
+
+
+def _compose_prompt_with_addendum(base_prompt: str, addendum: str) -> str:
+    """Attach one short GEPA addendum while keeping the base prompt unchanged."""
+    return f"{_strip_gepa_addendum(base_prompt)}\n\n{GEPA_ADDENDUM_HEADER}\n{addendum.strip()}"
+
+
 def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
     cleaned = strip_outer_markdown_fences(text).strip()
     cleaned = re.sub(
@@ -1526,12 +1565,50 @@ def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
     ).strip()
     if candidate_prompt_issue(cleaned) is not None:
         return ""
+    required_markers = (
+        "WINCONDITIONS",
+        "RULES",
+        "COLLISIONLAYERS",
+        "LEGEND",
+        "initial level state",
+        "score_normalized",
+        "Return 0.0",
+        "Do not output",
+    )
+    if any(marker not in cleaned for marker in required_markers):
+        return ""
+    if _has_dangling_prompt_tail(cleaned):
+        return ""
     if len(cleaned) <= max_chars:
         return cleaned
-    cutoff = cleaned.rfind("\n", 0, max_chars)
-    if cutoff < max_chars // 2:
-        cutoff = max_chars
-    return cleaned[:cutoff].rstrip()
+    return ""
+
+
+def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
+    """Clean a proposed GEPA prompt addendum and reject drift-prone shapes."""
+    cleaned = strip_outer_markdown_fences(text).strip()
+    cleaned = re.sub(
+        r"^(?:revised global prompt|new instruction|prompt|addendum|additional guidance)\s*:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    if candidate_prompt_issue(cleaned) is not None:
+        return ""
+    if not cleaned:
+        return ""
+    full_prompt_markers = (
+        "You are writing a heuristic function",
+        "Output exactly Python code defining",
+        "Runtime ctx keys include",
+    )
+    if any(marker in cleaned for marker in full_prompt_markers):
+        return ""
+    if len(cleaned) > max_chars:
+        return ""
+    if _has_dangling_prompt_tail(cleaned):
+        return ""
+    return cleaned
 
 
 def heuristic_code_shape(code: str) -> dict[str, bool]:
@@ -2031,20 +2108,21 @@ class PuzzleScriptBatchedGEPAAdapter:
         new_texts: dict[str, str] = {}
         for component in components_to_update:
             current_prompt = candidate[component]
+            base_prompt = _strip_gepa_addendum(current_prompt)
             records = reflective_dataset.get(component, [])
             feedback_payload = truncate_text(
                 json.dumps(records, indent=2, sort_keys=True, default=str),
                 DEFAULT_REFLECTION_DATASET_CHARS,
             )
-            max_chars = max(DEFAULT_PROPOSED_PROMPT_MAX_CHARS, len(PUZZLESCRIPT_HEURISTIC_CONTRACT))
+            max_chars = DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
             reflection_prompt = f"""You are revising one global prompt used to generate PuzzleScript A* heuristics.
 
 The research goal is a single general prompt, not per-game routing or memorized examples.
-Revise the current prompt using only compact, general rules supported by the comparison feedback.
+The existing base prompt is already strong. Propose only a short addendum that will be attached after it.
 
 Hard requirements:
-- Preserve the exact function contract and safety constraints.
-- Prefer small edits to the current prompt. Delete or rewrite stale wording if needed.
+- Do not rewrite the full base prompt. Output only the short addendum text.
+- Preserve the exact function contract and safety constraints by leaving the base prompt unchanged.
 - Preserve the base prompt's instruction to read WINCONDITIONS, RULES,
   COLLISIONLAYERS, LEGEND aliases, and the initial level state before choosing
   heuristic features.
@@ -2061,18 +2139,20 @@ Hard requirements:
   strengthen the base mechanics-reading rule, not as evidence to add broader
   deadlock or fallback heuristics.
 - Preserve general principles that created new solves only when they do not conflict with base-solved cases.
-- Keep the final prompt under {max_chars} characters.
-- Output only the revised prompt text. Do not include markdown, commentary, or labels.
+- Keep the addendum under {max_chars} characters.
+- Output only the addendum text. Do not include markdown, commentary, labels, or headings.
 
-Current global prompt:
-{current_prompt}
+Base prompt that will remain unchanged:
+{base_prompt}
 
 Comparison-focused feedback:
 {feedback_payload}
 """
             proposed = self.llm.complete(reflection_prompt)
-            cleaned = _clean_proposed_prompt(proposed, max_chars=max_chars)
-            new_texts[component] = cleaned if cleaned else current_prompt
+            cleaned = _clean_proposed_addendum(proposed, max_chars=max_chars)
+            new_texts[component] = (
+                _compose_prompt_with_addendum(base_prompt, cleaned) if cleaned else current_prompt
+            )
         return new_texts
 
 
@@ -2314,7 +2394,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--openai-api-key", type=str, default=os.getenv("OPENAI_API_KEY", "EMPTY"))
     parser.add_argument("--max-model-tokens", type=int, default=DEFAULT_MAX_MODEL_TOKENS)
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_LLM_TEMPERATURE)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--llm-timeout-s", type=float, default=600.0)
     parser.add_argument("--llm-concurrency", type=int, default=16)

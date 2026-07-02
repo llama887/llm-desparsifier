@@ -27,6 +27,7 @@ from scripts.run_puzzlescript_batched_gepa import (  # noqa: E402
     DEFAULT_BASE_URL,
     DEFAULT_CANDIDATE_ERROR_PENALTY,
     DEFAULT_ENV_GRID,
+    DEFAULT_LLM_TEMPERATURE,
     DEFAULT_LOST_SOLVE_PENALTY,
     DEFAULT_MAX_MODEL_TOKENS,
     DEFAULT_NEW_SOLVE_BONUS,
@@ -463,7 +464,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--openai-api-key", type=str, default=os.getenv("OPENAI_API_KEY", "EMPTY"))
     parser.add_argument("--max-model-tokens", type=int, default=DEFAULT_MAX_MODEL_TOKENS)
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_LLM_TEMPERATURE)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--llm-timeout-s", type=float, default=600.0)
     parser.add_argument("--llm-concurrency", type=int, default=4)

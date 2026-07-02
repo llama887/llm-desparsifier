@@ -10,10 +10,14 @@ import pytest
 
 from scripts.compare_puzzlescript_batched_prompts import compare_prompt_outputs
 from scripts.run_puzzlescript_batched_gepa import (
+    DEFAULT_LLM_TEMPERATURE,
+    DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS,
     DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS,
     DEFAULT_REFLECTION_FEEDBACK_CHARS,
     DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
     DEFAULT_REFLECTION_MAX_RECORDS,
+    GEPA_ADDENDUM_HEADER,
+    PUZZLESCRIPT_HEURISTIC_CONTRACT,
     PuzzleScriptBatchedGEPAAdapter,
     PuzzleScriptLevelTask,
     SearchArrayConfig,
@@ -519,8 +523,10 @@ def test_make_reflective_dataset_includes_regression_comparison(tmp_path: Path) 
     assert "return 1.0" in record["Baseline Output"]["heuristic_code"]
 
 
-def test_custom_proposer_requests_compact_global_prompt() -> None:
-    llm = _FakeLLM("Revised global prompt: keep the contract and avoid memorized examples.")
+def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
+    llm = _FakeLLM(
+        "Addendum: keep mechanics-specific object names primary and use score only as a tie-breaker."
+    )
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=llm,  # type: ignore[arg-type]
         state_root=Path("/tmp/gepa-state"),
@@ -531,7 +537,7 @@ def test_custom_proposer_requests_compact_global_prompt() -> None:
     )
 
     result = adapter.propose_new_texts(
-        candidate={"heuristic_prompt": "current prompt"},
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
         reflective_dataset={
             "heuristic_prompt": [
                 {
@@ -543,9 +549,12 @@ def test_custom_proposer_requests_compact_global_prompt() -> None:
         components_to_update=["heuristic_prompt"],
     )
 
-    assert result["heuristic_prompt"] == "keep the contract and avoid memorized examples."
-    assert "single general prompt" in llm.prompts[0]
-    assert "Do not append long lists" in llm.prompts[0]
+    assert result["heuristic_prompt"].startswith(
+        PUZZLESCRIPT_HEURISTIC_CONTRACT.rstrip() + "\n\n" + GEPA_ADDENDUM_HEADER
+    )
+    assert "keep mechanics-specific object names primary" in result["heuristic_prompt"]
+    assert "short addendum" in llm.prompts[0]
+    assert "Do not rewrite the full base prompt" in llm.prompts[0]
     assert "REGRESSION" in llm.prompts[0]
 
 
@@ -571,6 +580,48 @@ def test_custom_proposer_rejects_code_as_revised_prompt() -> None:
 
     assert result["heuristic_prompt"] == "current instruction prompt"
     assert "Do not output Python code as the revised prompt" in llm.prompts[0]
+
+
+def test_custom_proposer_rejects_overlong_addendum_instead_of_truncating() -> None:
+    current_prompt = PUZZLESCRIPT_HEURISTIC_CONTRACT
+    llm = _FakeLLM("x" * (DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS + 1))
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={"heuristic_prompt": []},
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] == current_prompt
+
+
+def test_custom_proposer_rejects_dangling_addendum_tail() -> None:
+    current_prompt = PUZZLESCRIPT_HEURISTIC_CONTRACT
+    llm = _FakeLLM("Use mechanics-specific blockers:\n-")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={"heuristic_prompt": []},
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] == current_prompt
 
 
 def test_build_reflection_feedback_includes_trace_diagnostics_for_solved_regression() -> None:
@@ -676,9 +727,10 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert '--tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-2}"' in launcher
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in launcher
+    assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in launcher
     assert '--val-split "${VAL_SPLIT:-dev}"' in launcher
     assert '--max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}"' in launcher
-    assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-600}"' in launcher
+    assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-120}"' in launcher
     assert '--lost-solve-penalty "${LOST_SOLVE_PENALTY:-8.0}"' in launcher
     assert '--new-solve-bonus "${NEW_SOLVE_BONUS:-1.0}"' in launcher
     assert '--score-delta-weight "${SCORE_DELTA_WEIGHT:-1.0}"' in launcher
@@ -690,11 +742,13 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
         encoding="utf-8"
     )
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in holdout_launcher
+    assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in holdout_launcher
 
     smoke_launcher = Path("sbatch/smoke_compare_puzzlescript_model_gpu.s").read_text(
         encoding="utf-8"
     )
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in smoke_launcher
+    assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in smoke_launcher
 
 
 def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:
