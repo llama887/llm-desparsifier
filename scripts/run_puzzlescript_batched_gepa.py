@@ -1661,18 +1661,22 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
         return (
             "When a change risks a base-solved level, keep exact WINCONDITIONS, RULES, "
             "LEGEND names, and collision-layer mechanics primary; use score_normalized "
-            "only as a tie-breaker and skip unproven deadlock penalties."
+            "only as a tie-breaker, do not treat missing goal objects as dead ends "
+            "unless RULES prove they cannot reappear, and skip other unproven deadlock penalties."
         )
     if "new_solve" in classifications:
         return (
             "Generalize new-solve evidence only through exact rule and win-condition "
             "features: count unsatisfied objects by LEGEND name, prefer legal progress "
-            "moves, and keep generic role fallback secondary."
+            "moves, keep generic role fallback secondary, and audit missing goal objects "
+            "against aliases and transforms before adding any penalty."
         )
     return (
         "For base-unsolved levels, after reading WINCONDITIONS, RULES, and LEGEND, "
-        "add one conservative win-condition distance feature using exact object names "
-        "and legal progress moves; keep score_normalized only as a tie-breaker."
+        "add at most one low-weight win-condition distance feature using exact object "
+        "names and legal progress moves; if aliases, transforms, or collision layers "
+        "make missing goal objects ambiguous, preserve the base fallback and keep "
+        "score_normalized only as a tie-breaker."
     )
 
 
@@ -2312,6 +2316,9 @@ Hard requirements:
 - Treat a candidate that loses base-solved levels as evidence to restore or
   strengthen the base mechanics-reading rule, not as evidence to add broader
   deadlock or fallback heuristics.
+- Do not turn missing goal objects into large dead-end penalties unless the
+  rules prove they cannot reappear; aliases, transforms, collision layers, and
+  rule-created objects often make missing-object checks unsafe.
 - Preserve general principles that created new solves only when they do not conflict with base-solved cases.
 - Keep the addendum under {max_chars} characters.
 - Output only the addendum text. Do not include markdown, commentary, labels, or headings.

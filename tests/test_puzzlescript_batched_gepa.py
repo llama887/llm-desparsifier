@@ -594,6 +594,7 @@ def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
     assert "short addendum" in llm.prompts[0]
     assert "Do not rewrite the full base prompt" in llm.prompts[0]
     assert "Do not return the base prompt unchanged" in llm.prompts[0]
+    assert "missing goal objects" in llm.prompts[0]
     assert "REGRESSION" in llm.prompts[0]
 
 
@@ -648,7 +649,8 @@ def test_custom_proposer_uses_feedback_fallback_for_noop_output() -> None:
     )
 
     assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
-    assert "conservative win-condition distance" in result["heuristic_prompt"]
+    assert "low-weight win-condition distance" in result["heuristic_prompt"]
+    assert "missing goal objects" in result["heuristic_prompt"]
 
 
 def test_custom_proposer_rejects_code_as_revised_prompt() -> None:
