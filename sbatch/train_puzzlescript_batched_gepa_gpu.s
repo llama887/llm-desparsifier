@@ -229,6 +229,7 @@ echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
     --score-delta-clip "${SCORE_DELTA_CLIP:-0.5}" \
     --partial-progress-weight "${PARTIAL_PROGRESS_WEIGHT:-0.05}" \
     --global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}" \
+    --global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}" \
     --reflection-minibatch-size "${REFLECTION_MINIBATCH_SIZE:-0}" \
     --seed "${GEPA_SEED:-0}"
 

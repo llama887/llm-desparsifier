@@ -327,6 +327,8 @@ def run_model_smoke(args: argparse.Namespace) -> None:
         score_delta_weight=args.score_delta_weight,
         score_delta_clip=args.score_delta_clip,
         partial_progress_weight=args.partial_progress_weight,
+        global_lost_solve_gate_penalty=args.global_lost_solve_gate_penalty,
+        global_net_solve_loss_gate_penalty=args.global_net_solve_loss_gate_penalty,
     )
 
     candidate = {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
@@ -496,6 +498,16 @@ def parse_args() -> argparse.Namespace:
         "--partial-progress-weight",
         type=float,
         default=DEFAULT_PARTIAL_PROGRESS_WEIGHT,
+    )
+    parser.add_argument(
+        "--global-lost-solve-gate-penalty",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--global-net-solve-loss-gate-penalty",
+        type=float,
+        default=None,
     )
     return parser.parse_args()
 
