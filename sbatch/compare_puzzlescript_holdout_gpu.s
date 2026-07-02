@@ -127,7 +127,10 @@ echo "[gpu] Started GPU heartbeat with PID: $HEARTBEAT_PID"
 
 export LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-openai/gpt-oss-120b}"
 if [ -z "${VLLM_PORT:-}" ]; then
-    export VLLM_PORT="$((20000 + (${SLURM_JOB_ID:-0} % 30000)))"
+    VLLM_PORT_BASE="${VLLM_PORT_BASE:-10000}"
+    VLLM_PORT_SPACING="${VLLM_PORT_SPACING:-20}"
+    VLLM_PORT_RANGE="${VLLM_PORT_RANGE:-2500}"
+    export VLLM_PORT="$((VLLM_PORT_BASE + ((${SLURM_JOB_ID:-0} % VLLM_PORT_RANGE) * VLLM_PORT_SPACING)))"
 fi
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://127.0.0.1:${VLLM_PORT}/v1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"

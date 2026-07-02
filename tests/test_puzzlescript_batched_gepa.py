@@ -836,6 +836,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert 'LOCAL_LLM_MODEL:-openai/gpt-oss-120b' in launcher
     assert '--tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-2}"' in launcher
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher
+    assert 'VLLM_PORT_SPACING:-20' in launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in launcher
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in launcher
     assert '--val-split "${VAL_SPLIT:-dev}"' in launcher
@@ -852,6 +853,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
         encoding="utf-8"
     )
     assert "#SBATCH --time=02:00:00" in holdout_launcher
+    assert 'VLLM_PORT_SPACING:-20' in holdout_launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in holdout_launcher
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in holdout_launcher
 
@@ -859,6 +861,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
         encoding="utf-8"
     )
     assert "#SBATCH --time=02:00:00" in smoke_launcher
+    assert 'VLLM_PORT_SPACING:-20' in smoke_launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in smoke_launcher
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in smoke_launcher
 
