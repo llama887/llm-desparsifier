@@ -722,6 +722,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     launcher = Path("sbatch/train_puzzlescript_batched_gepa_gpu.s").read_text(encoding="utf-8")
 
     assert "#SBATCH --cpus-per-task=2" in launcher
+    assert "#SBATCH --time=08:00:00" in launcher
     assert "#SBATCH --gres=gpu:h100:2" in launcher
     assert 'LOCAL_LLM_MODEL:-openai/gpt-oss-120b' in launcher
     assert '--tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-2}"' in launcher
