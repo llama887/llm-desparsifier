@@ -812,6 +812,7 @@ def candidate_score(
     score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
     score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
     partial_progress_weight: float = DEFAULT_PARTIAL_PROGRESS_WEIGHT,
+    global_lost_solve_gate_penalty: float | None = None,
 ) -> float:
     """Return the mean GEPA score for one candidate.
 
@@ -831,6 +832,7 @@ def candidate_score(
         score_delta_weight=score_delta_weight,
         score_delta_clip=score_delta_clip,
         partial_progress_weight=partial_progress_weight,
+        global_lost_solve_gate_penalty=global_lost_solve_gate_penalty,
     )
     return sum(scores) / len(scores)
 
@@ -844,6 +846,7 @@ def adjusted_candidate_scores(
     score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
     score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
     partial_progress_weight: float = DEFAULT_PARTIAL_PROGRESS_WEIGHT,
+    global_lost_solve_gate_penalty: float | None = None,
 ) -> list[float]:
     """Return macro-game-weighted per-task scores for GEPA.
 
@@ -857,8 +860,13 @@ def adjusted_candidate_scores(
     """
     rows = list(outputs)
     weights = _macro_game_weights(rows)
+    gate_value = (
+        lost_solve_penalty
+        if global_lost_solve_gate_penalty is None
+        else global_lost_solve_gate_penalty
+    )
     gate_penalty = (
-        max(0.0, lost_solve_penalty)
+        max(0.0, gate_value)
         if any(
             _has_baseline(row)
             and bool(row.get("baseline_solved", False))
@@ -1744,6 +1752,7 @@ class PuzzleScriptBatchedGEPAAdapter:
         score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
         score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
         partial_progress_weight: float = DEFAULT_PARTIAL_PROGRESS_WEIGHT,
+        global_lost_solve_gate_penalty: float | None = None,
     ) -> None:
         self.llm = llm
         self.state_root = state_root
@@ -1757,6 +1766,11 @@ class PuzzleScriptBatchedGEPAAdapter:
         self.score_delta_weight = max(0.0, score_delta_weight)
         self.score_delta_clip = max(0.0, score_delta_clip)
         self.partial_progress_weight = max(0.0, partial_progress_weight)
+        self.global_lost_solve_gate_penalty = (
+            None
+            if global_lost_solve_gate_penalty is None
+            else max(0.0, global_lost_solve_gate_penalty)
+        )
         self.baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
         self.eval_counter = _initial_eval_counter(self.state_root / "candidate_evals")
 
@@ -1961,6 +1975,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             score_delta_weight=self.score_delta_weight,
             score_delta_clip=self.score_delta_clip,
             partial_progress_weight=self.partial_progress_weight,
+            global_lost_solve_gate_penalty=self.global_lost_solve_gate_penalty,
         )
         for output, adjusted_score in zip(outputs, scores, strict=True):
             output["adjusted_score"] = adjusted_score
@@ -2049,6 +2064,7 @@ class PuzzleScriptBatchedGEPAAdapter:
                 score_delta_weight=self.score_delta_weight,
                 score_delta_clip=self.score_delta_clip,
                 partial_progress_weight=self.partial_progress_weight,
+                global_lost_solve_gate_penalty=self.global_lost_solve_gate_penalty,
             )
             for output, adjusted_score in zip(violation_outputs, violation_scores, strict=True):
                 output["adjusted_score"] = adjusted_score
@@ -2133,6 +2149,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             score_delta_weight=self.score_delta_weight,
             score_delta_clip=self.score_delta_clip,
             partial_progress_weight=self.partial_progress_weight,
+            global_lost_solve_gate_penalty=self.global_lost_solve_gate_penalty,
         )
         for output, adjusted_score in zip(outputs, scores, strict=True):
             output["adjusted_score"] = adjusted_score
@@ -2438,6 +2455,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         score_delta_weight=args.score_delta_weight,
         score_delta_clip=args.score_delta_clip,
         partial_progress_weight=args.partial_progress_weight,
+        global_lost_solve_gate_penalty=args.global_lost_solve_gate_penalty,
     )
 
     import gepa
@@ -2461,7 +2479,8 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         f"new_solve_bonus={args.new_solve_bonus} "
         f"candidate_error_penalty={args.candidate_error_penalty} "
         f"score_delta_weight={args.score_delta_weight} score_delta_clip={args.score_delta_clip} "
-        f"partial_progress_weight={args.partial_progress_weight}",
+        f"partial_progress_weight={args.partial_progress_weight} "
+        f"global_lost_solve_gate_penalty={args.global_lost_solve_gate_penalty}",
         flush=True,
     )
     baseline_batch = adapter.evaluate(
@@ -2610,6 +2629,16 @@ def parse_args() -> argparse.Namespace:
         "--partial-progress-weight",
         type=float,
         default=DEFAULT_PARTIAL_PROGRESS_WEIGHT,
+    )
+    parser.add_argument(
+        "--global-lost-solve-gate-penalty",
+        type=float,
+        default=None,
+        help=(
+            "Evaluation-wide penalty applied to every task when any baseline-solved "
+            "task regresses. Defaults to --lost-solve-penalty; set 0 for aggregate "
+            "net-solve optimization."
+        ),
     )
     parser.add_argument(
         "--reflection-minibatch-size",

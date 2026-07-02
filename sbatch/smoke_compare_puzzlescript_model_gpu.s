@@ -230,4 +230,5 @@ echo "[run] vllm_extra_args=${VLLM_EXTRA_ARGS:-}"
     --candidate-error-penalty "${CANDIDATE_ERROR_PENALTY:-2.0}" \
     --score-delta-weight "${SCORE_DELTA_WEIGHT:-0.25}" \
     --score-delta-clip "${SCORE_DELTA_CLIP:-0.5}" \
-    --partial-progress-weight "${PARTIAL_PROGRESS_WEIGHT:-0.05}"
+    --partial-progress-weight "${PARTIAL_PROGRESS_WEIGHT:-0.05}" \
+    --global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-4.0}}"

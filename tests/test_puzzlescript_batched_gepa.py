@@ -231,6 +231,44 @@ def test_candidate_score_applies_eval_wide_gate_for_lost_solves_and_errors() -> 
     assert score == pytest.approx(sum(scores) / len(scores))
 
 
+def test_candidate_score_can_disable_eval_wide_lost_solve_gate() -> None:
+    outputs = [
+        {
+            "game": "a",
+            "score": 0.0,
+            "solved": False,
+            "baseline_score": 0.5,
+            "baseline_solved": True,
+        },
+        {
+            "game": "a",
+            "score": 0.7,
+            "solved": True,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+        },
+    ]
+
+    scores = adjusted_candidate_scores(
+        outputs,
+        lost_solve_penalty=2.0,
+        new_solve_bonus=3.0,
+        score_delta_weight=1.0,
+        score_delta_clip=0.5,
+        global_lost_solve_gate_penalty=0.0,
+    )
+
+    assert scores == pytest.approx([-2.5, 3.5])
+    assert candidate_score(
+        outputs,
+        lost_solve_penalty=2.0,
+        new_solve_bonus=3.0,
+        score_delta_weight=1.0,
+        score_delta_clip=0.5,
+        global_lost_solve_gate_penalty=0.0,
+    ) == pytest.approx(0.5)
+
+
 def test_candidate_scores_macro_weight_games() -> None:
     outputs = [
         {
@@ -847,6 +885,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert '--lost-solve-penalty "${LOST_SOLVE_PENALTY:-8.0}"' in launcher
     assert '--new-solve-bonus "${NEW_SOLVE_BONUS:-1.0}"' in launcher
     assert '--score-delta-weight "${SCORE_DELTA_WEIGHT:-1.0}"' in launcher
+    assert '--global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}"' in launcher
     assert '--guard-levels "${GUARD_LEVELS:-' in launcher
     assert 'RUN_HOLDOUT_COMPARE:-1' in launcher
     assert "scripts/compare_puzzlescript_batched_prompts.py" in launcher
@@ -869,6 +908,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert 'VLLM_PORT_SPACING:-20' in smoke_launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in smoke_launcher
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in smoke_launcher
+    assert '--global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-4.0}}"' in smoke_launcher
 
 
 def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:
