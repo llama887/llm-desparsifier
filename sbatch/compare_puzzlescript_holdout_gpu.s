@@ -134,6 +134,17 @@ if [ -z "${VLLM_PORT:-}" ]; then
 fi
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://127.0.0.1:${VLLM_PORT}/v1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
+if [ -z "${VLLM_TENSOR_PARALLEL_SIZE:-}" ]; then
+    if [ -n "${SLURM_GPUS_ON_NODE:-}" ]; then
+        VLLM_TENSOR_PARALLEL_SIZE="${SLURM_GPUS_ON_NODE:-2}"
+    elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        IFS=',' read -r -a _visible_gpu_ids <<< "$CUDA_VISIBLE_DEVICES"
+        VLLM_TENSOR_PARALLEL_SIZE="${#_visible_gpu_ids[@]}"
+    else
+        VLLM_TENSOR_PARALLEL_SIZE=2
+    fi
+    export VLLM_TENSOR_PARALLEL_SIZE
+fi
 
 if [ "${START_VLLM:-1}" = "1" ]; then
     if ! command -v vllm >/dev/null 2>&1; then
@@ -150,7 +161,7 @@ if [ "${START_VLLM:-1}" = "1" ]; then
     vllm serve "$LOCAL_LLM_MODEL" \
         --host 127.0.0.1 \
         --port "$VLLM_PORT" \
-        --tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-2}" \
+        --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE" \
         --max-model-len "${VLLM_MAX_MODEL_LEN:-65536}" \
         --shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}" \
         ${VLLM_EXTRA_ARGS:-} &

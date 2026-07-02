@@ -912,7 +912,8 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert "#SBATCH --gres=gpu:h100:2" in launcher
     assert 'elif [ -n "${RUN_STATE_ROOT:-}" ]; then' in launcher
     assert 'LOCAL_LLM_MODEL:-openai/gpt-oss-120b' in launcher
-    assert '--tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-2}"' in launcher
+    assert 'VLLM_TENSOR_PARALLEL_SIZE="${SLURM_GPUS_ON_NODE:-2}"' in launcher
+    assert '--tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"' in launcher
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher
     assert 'VLLM_PORT_SPACING:-20' in launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in launcher
@@ -936,6 +937,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     )
     assert "#SBATCH --time=01:15:00" in holdout_launcher
     assert 'VLLM_PORT_SPACING:-20' in holdout_launcher
+    assert '--tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"' in holdout_launcher
     assert 'search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-16}' in holdout_launcher
     assert '--search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-16}"' in holdout_launcher
     assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}"' in holdout_launcher
@@ -947,6 +949,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     )
     assert "#SBATCH --time=01:15:00" in smoke_launcher
     assert 'VLLM_PORT_SPACING:-20' in smoke_launcher
+    assert '--tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"' in smoke_launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in smoke_launcher
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in smoke_launcher
     assert '--global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-4.0}}"' in smoke_launcher
