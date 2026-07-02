@@ -724,6 +724,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert "#SBATCH --cpus-per-task=2" in launcher
     assert "#SBATCH --time=08:00:00" in launcher
     assert "#SBATCH --gres=gpu:h100:2" in launcher
+    assert 'elif [ -n "${RUN_STATE_ROOT:-}" ]; then' in launcher
     assert 'LOCAL_LLM_MODEL:-openai/gpt-oss-120b' in launcher
     assert '--tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-2}"' in launcher
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher

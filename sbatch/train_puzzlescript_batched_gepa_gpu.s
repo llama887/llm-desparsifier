@@ -74,6 +74,8 @@ export PYTHONUNBUFFERED=1
 
 if [ -n "${STATE_ROOT:-}" ]; then
     RUN_STATE_ROOT="$STATE_ROOT"
+elif [ -n "${RUN_STATE_ROOT:-}" ]; then
+    RUN_STATE_ROOT="$RUN_STATE_ROOT"
 else
     RUN_STATE_ROOT="$PWD/artifacts/gepa_puzzlescript_batched_${SLURM_JOB_ID:-manual}"
 fi
