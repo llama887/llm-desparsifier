@@ -796,12 +796,14 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     holdout_launcher = Path("sbatch/compare_puzzlescript_holdout_gpu.s").read_text(
         encoding="utf-8"
     )
+    assert "#SBATCH --time=02:00:00" in holdout_launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in holdout_launcher
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in holdout_launcher
 
     smoke_launcher = Path("sbatch/smoke_compare_puzzlescript_model_gpu.s").read_text(
         encoding="utf-8"
     )
+    assert "#SBATCH --time=02:00:00" in smoke_launcher
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in smoke_launcher
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in smoke_launcher
 
