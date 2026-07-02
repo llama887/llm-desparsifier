@@ -1677,6 +1677,12 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
         str(cast(Mapping[str, Any], record.get("Comparison", {})).get("classification", ""))
         for record in records
     }
+    if "candidate_error" in classifications and classifications <= {"candidate_error"}:
+        return (
+            "No import statements, decorators, imported helpers, file access, or cached "
+            "library utilities are allowed anywhere in generated code; implement any "
+            "needed assignment, queue, or memo logic with plain local loops and literals."
+        )
     if "lost_baseline_solve" in classifications:
         return (
             "When a change risks a base-solved level, keep exact WINCONDITIONS, RULES, "
