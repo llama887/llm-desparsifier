@@ -867,6 +867,7 @@ def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:
     launcher = Path("sbatch/evaluate_puzzlescript_search_array.s").read_text(encoding="utf-8")
 
     assert "#SBATCH --cpus-per-task=1" in launcher
+    assert "#SBATCH --time=01:00:00" in launcher
     assert "runtime_ready()" in launcher
     assert "ensure_runtime()" in launcher
     assert "#SBATCH --mem=8G" in launcher
