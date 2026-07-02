@@ -15,14 +15,21 @@ from scripts.run_puzzlescript_batched_gepa import (
     DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
     DEFAULT_REFLECTION_MAX_RECORDS,
     PuzzleScriptBatchedGEPAAdapter,
+    PuzzleScriptLevelTask,
+    SearchArrayConfig,
     SearchArrayStalledError,
     adjusted_candidate_scores,
     assigned_tasks,
+    build_reflection_feedback,
     build_sbatch_array_command,
     build_train_dev_tasks,
+    candidate_prompt_issue,
     candidate_score,
     context_retry_max_tokens,
     evaluate_search_task_with_wall_timeout,
+    heuristic_code_shape,
+    merge_validation_guard_tasks,
+    parse_guard_level_selection,
     select_reflection_traces,
     split_train_dev_jobs,
     strip_outer_markdown_fences,
@@ -258,6 +265,99 @@ def test_candidate_scores_macro_weight_games() -> None:
     assert sum(scores) / len(scores) == pytest.approx((0.1 + 1.5) / 2)
 
 
+def test_candidate_scores_use_partial_progress_when_both_prompts_fail() -> None:
+    outputs = [
+        {
+            "game": "same",
+            "score": 0.0,
+            "solved": False,
+            "partial_progress_score": 0.65,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+            "baseline_partial_progress_score": 0.25,
+        }
+    ]
+
+    scores = adjusted_candidate_scores(
+        outputs,
+        lost_solve_penalty=4.0,
+        new_solve_bonus=1.0,
+        error_penalty=2.0,
+        score_delta_weight=1.0,
+        score_delta_clip=1.0,
+        partial_progress_weight=0.05,
+    )
+
+    assert scores == pytest.approx([0.02])
+
+
+def test_parse_guard_level_selection_accepts_exact_game_levels() -> None:
+    selection = parse_guard_level_selection(
+        "Not_Normal_Crates:5,11,12; Ice_Cubes:5,7 ; Beam_Islands:3"
+    )
+
+    assert selection == {
+        "Not_Normal_Crates": [5, 11, 12],
+        "Ice_Cubes": [5, 7],
+        "Beam_Islands": [3],
+    }
+
+
+def test_parse_guard_level_selection_rejects_malformed_entries() -> None:
+    with pytest.raises(ValueError, match="game:level"):
+        parse_guard_level_selection("Not_Normal_Crates")
+
+
+def test_merge_validation_guard_tasks_deduplicates_and_reassigns_ids() -> None:
+    dev_tasks = [
+        PuzzleScriptLevelTask(3, "dev", 0, 10, "dev0", "dev.txt"),
+        PuzzleScriptLevelTask(4, "shared", 1, 10, "dev-shared", "shared.txt"),
+    ]
+    guard_tasks = [
+        PuzzleScriptLevelTask(99, "shared", 1, 20, "guard-shared", "shared.txt"),
+        PuzzleScriptLevelTask(100, "guard", 5, 20, "guard5", "guard.txt"),
+    ]
+
+    merged = merge_validation_guard_tasks(dev_tasks, guard_tasks)
+
+    assert [(task.task_id, task.game, task.level, task.env_description) for task in merged] == [
+        (0, "dev", 0, "dev0"),
+        (1, "shared", 1, "dev-shared"),
+        (2, "guard", 5, "guard5"),
+    ]
+
+
+def test_heuristic_code_shape_flags_generic_fallback_and_mechanics_terms() -> None:
+    shape = heuristic_code_shape(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    role_positions = {}\n"
+        "    if not role_positions: return (1.0 - ctx.get('score_normalized', 0.0)) * 10.0\n"
+        "    return 1000.0 if 'door' else 0.0\n"
+    )
+
+    assert shape["uses_generic_role_helpers"] is True
+    assert shape["uses_score_fallback"] is True
+    assert shape["uses_large_penalty"] is True
+    assert shape["mentions_mechanics_terms"] is True
+
+
+def test_candidate_prompt_issue_rejects_code_but_allows_contract_signature() -> None:
+    instruction_prompt = (
+        "Output exactly Python code defining:\n"
+        "def heuristic_cost_to_go(ts, env_params, ctx) -> float\n"
+        "Explain the constraints before writing the function."
+    )
+    code_prompt = (
+        "def heuristic_cost_to_go(ts, env_params, ctx) -> float:\n"
+        "    if ctx.get('is_winning'):\n"
+        "        return 0.0\n"
+        "    return 1.0\n"
+    )
+
+    assert candidate_prompt_issue(instruction_prompt) is None
+    assert "Python implementation" in str(candidate_prompt_issue(code_prompt))
+
+
 def test_context_retry_max_tokens_uses_reported_prompt_tokens() -> None:
     message = (
         "This model's maximum context length is 32768 tokens. However, you requested "
@@ -289,6 +389,38 @@ def test_context_retry_max_tokens_default_keeps_headroom_for_token_recount() -> 
 
     assert context_retry_max_tokens(first_message, current_max_tokens=8192) == 7679
     assert context_retry_max_tokens(second_message, current_max_tokens=7679) == 7614
+
+
+def test_adapter_eval_counter_resumes_after_existing_eval_dirs(tmp_path: Path) -> None:
+    candidate_eval_root = tmp_path / "candidate_evals"
+    (candidate_eval_root / "eval-00035-existing").mkdir(parents=True)
+    (candidate_eval_root / "eval-not-a-counter").mkdir()
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=_FakeLLM(""),
+        state_root=tmp_path,
+        script_doctor=tmp_path,
+        search_config=SearchArrayConfig(
+            submit=False,
+            array_script=tmp_path / "unused.s",
+            array_count=1,
+            array_concurrency=1,
+            poll_interval_s=0.01,
+        ),
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    task = PuzzleScriptLevelTask(
+        task_id=0,
+        game="game",
+        level=0,
+        budget=1,
+        env_description="",
+        game_text_path="game.txt",
+    )
+
+    eval_dir = adapter._next_eval_dir({"heuristic_prompt": "prompt"}, [task])
+
+    assert eval_dir.name.startswith("eval-00036-")
 
 
 def test_make_reflective_dataset_compacts_large_trace_payloads() -> None:
@@ -417,6 +549,57 @@ def test_custom_proposer_requests_compact_global_prompt() -> None:
     assert "REGRESSION" in llm.prompts[0]
 
 
+def test_custom_proposer_rejects_code_as_revised_prompt() -> None:
+    llm = _FakeLLM(
+        "def heuristic_cost_to_go(ts, env_params, ctx) -> float:\n"
+        "    return 0.0\n"
+    )
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": "current instruction prompt"},
+        reflective_dataset={"heuristic_prompt": []},
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] == "current instruction prompt"
+    assert "Do not output Python code as the revised prompt" in llm.prompts[0]
+
+
+def test_build_reflection_feedback_includes_trace_diagnostics_for_solved_regression() -> None:
+    feedback = build_reflection_feedback(
+        {
+            "score": 0.4,
+            "solved": True,
+            "expanded": 400,
+            "baseline_score": 0.8,
+            "baseline_solved": True,
+            "baseline_expanded": 20,
+            "trace_summary": {
+                "best_seen_h": 3.0,
+                "open_set_size_at_end": 17,
+                "root_snapshot": {"score_normalized": 0.2},
+                "sampled_states": [
+                    {"snapshot": {"score_normalized": 0.5}},
+                    {"snapshot": {"score_normalized": 0.4}},
+                ],
+            },
+        },
+        "solved_regression",
+    )
+
+    assert "Candidate trace diagnostics" in feedback
+    assert "progress_range=0.200..0.500" in feedback
+    assert "open_set_size_at_end=17" in feedback
+
+
 def test_select_reflection_traces_prioritizes_regressions_and_new_solves() -> None:
     trajectories = [
         {
@@ -452,19 +635,66 @@ def test_select_reflection_traces_prioritizes_regressions_and_new_solves() -> No
     assert any(not trace["result"]["solved"] for trace in selected[:10])
 
 
+def test_select_reflection_traces_keeps_mechanics_diversity() -> None:
+    trajectories = [
+        {
+            "task": {
+                "game": f"generic-{idx:02d}",
+                "level": idx,
+                "env_description": "Win conditions: all target on crate",
+            },
+            "result": {"score": float(idx) / 100.0, "solved": False, "baseline_solved": False},
+        }
+        for idx in range(DEFAULT_REFLECTION_MAX_RECORDS + 10)
+    ]
+    trajectories.append(
+        {
+            "task": {
+                "game": "portal-alias-case",
+                "level": 100,
+                "env_description": (
+                    "Objects: playeru, playerl, portal, crate\n"
+                    "Rules: [ portal | > playeru ] -> [ > playeru | portal ]"
+                ),
+            },
+            "result": {"score": 9.0, "solved": False, "baseline_solved": False},
+        }
+    )
+
+    selected = select_reflection_traces(trajectories)
+
+    assert len(selected) == DEFAULT_REFLECTION_MAX_RECORDS
+    assert "portal-alias-case" in {trace["task"]["game"] for trace in selected}
+
+
 def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     launcher = Path("sbatch/train_puzzlescript_batched_gepa_gpu.s").read_text(encoding="utf-8")
 
     assert "#SBATCH --cpus-per-task=2" in launcher
+    assert "#SBATCH --gres=gpu:h100:2" in launcher
+    assert 'LOCAL_LLM_MODEL:-openai/gpt-oss-120b' in launcher
+    assert '--tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-2}"' in launcher
     assert 'VLLM_MAX_MODEL_LEN:-65536' in launcher
+    assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in launcher
     assert '--val-split "${VAL_SPLIT:-dev}"' in launcher
     assert '--max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}"' in launcher
     assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-600}"' in launcher
-    assert '--lost-solve-penalty "${LOST_SOLVE_PENALTY:-4.0}"' in launcher
+    assert '--lost-solve-penalty "${LOST_SOLVE_PENALTY:-8.0}"' in launcher
     assert '--new-solve-bonus "${NEW_SOLVE_BONUS:-1.0}"' in launcher
-    assert '--score-delta-weight "${SCORE_DELTA_WEIGHT:-0.25}"' in launcher
+    assert '--score-delta-weight "${SCORE_DELTA_WEIGHT:-1.0}"' in launcher
+    assert '--guard-levels "${GUARD_LEVELS:-' in launcher
     assert 'RUN_HOLDOUT_COMPARE:-1' in launcher
     assert "scripts/compare_puzzlescript_batched_prompts.py" in launcher
+
+    holdout_launcher = Path("sbatch/compare_puzzlescript_holdout_gpu.s").read_text(
+        encoding="utf-8"
+    )
+    assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in holdout_launcher
+
+    smoke_launcher = Path("sbatch/smoke_compare_puzzlescript_model_gpu.s").read_text(
+        encoding="utf-8"
+    )
+    assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in smoke_launcher
 
 
 def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:

@@ -1,13 +1,13 @@
 #!/bin/bash
 #
-#SBATCH --job-name=puzzlescript-holdout-compare
+#SBATCH --job-name=puzzlescript-model-smoke
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=128G
-#SBATCH --time=24:00:00
+#SBATCH --time=06:00:00
 #SBATCH --gres=gpu:h100:2
 #SBATCH --account=torch_pr_45_tandon_advanced
-#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-type=FAIL
 #SBATCH --mail-user=fyy2003@nyu.edu
 #SBATCH --chdir=/scratch/fyy2003/repos/llm-desparsifier
 #SBATCH --output=/scratch/fyy2003/repos/llm-desparsifier/sbatch/logs/%x-%j.out
@@ -72,23 +72,35 @@ SETUP_LOCK="$SLURM_SUBMIT_DIR/sbatch/logs/puzzlescript_setup.lock"
 export PATH="$SD_PATH/.venv/bin:$NODE_DIR/bin:$PATH"
 export PYTHONUNBUFFERED=1
 
+export LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-openai/gpt-oss-120b}"
+MODEL_LABEL="${MODEL_LABEL:-$(printf '%s' "$LOCAL_LLM_MODEL" | tr '/:.' '---')}"
 if [ -n "${STATE_ROOT:-}" ]; then
     RUN_STATE_ROOT="$STATE_ROOT"
 else
-    RUN_STATE_ROOT="$PWD/artifacts/puzzlescript_holdout_compare_${SLURM_JOB_ID:-manual}"
+    RUN_STATE_ROOT="$PWD/artifacts/puzzlescript_model_smoke_${MODEL_LABEL}_${SLURM_JOB_ID:-manual}"
 fi
 mkdir -p "$RUN_STATE_ROOT"
 
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$RUN_STATE_ROOT/xdg_cache}"
-export HF_HOME="${HF_HOME:-$RUN_STATE_ROOT/hf_home}"
+# Use the shared Hugging Face cache by default so repeated smoke jobs do not
+# redownload large model weights. Keep compiled runtime caches inside the run.
+export RUN_HOME="${RUN_HOME:-$RUN_STATE_ROOT/home}"
+export HOME="$RUN_HOME"
+export TMPDIR="${TMPDIR:-$RUN_STATE_ROOT/tmp}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/scratch/fyy2003/.cache}"
+export HF_HOME="${HF_HOME:-/scratch/fyy2003/.cache/huggingface}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-$RUN_STATE_ROOT/flashinfer_workspace_base}"
 export FLASHINFER_WORKSPACE_DIR="${FLASHINFER_WORKSPACE_DIR:-$RUN_STATE_ROOT/flashinfer_workspace}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$RUN_STATE_ROOT/triton_cache}"
+export TENSORRT_LLM_HOME="${TENSORRT_LLM_HOME:-$RUN_STATE_ROOT/tensorrt_llm}"
+export TLLM_HOME="${TLLM_HOME:-$TENSORRT_LLM_HOME}"
+export TRTLLM_CACHE_DIR="${TRTLLM_CACHE_DIR:-$TENSORRT_LLM_HOME/cache}"
 export TORCH_HOME="${TORCH_HOME:-$RUN_STATE_ROOT/torch_home}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$RUN_STATE_ROOT/torchinductor_cache}"
 mkdir -p \
+    "$RUN_HOME/.tensorrt_llm/tmp" \
+    "$TMPDIR" \
     "$XDG_CACHE_HOME" \
     "$HF_HOME" \
     "$HUGGINGFACE_HUB_CACHE" \
@@ -96,6 +108,8 @@ mkdir -p \
     "$FLASHINFER_WORKSPACE_BASE" \
     "$FLASHINFER_WORKSPACE_DIR" \
     "$TRITON_CACHE_DIR" \
+    "$TENSORRT_LLM_HOME/tmp" \
+    "$TRTLLM_CACHE_DIR" \
     "$TORCH_HOME" \
     "$TORCHINDUCTOR_CACHE_DIR"
 
@@ -108,6 +122,7 @@ export GPU_HEARTBEAT_MAX_COMPUTE_SECONDS="${GPU_HEARTBEAT_MAX_COMPUTE_SECONDS:-1
 export GPU_HEARTBEAT_COMPUTE_GAIN_SECONDS="${GPU_HEARTBEAT_COMPUTE_GAIN_SECONDS:-0.03}"
 export GPU_HEARTBEAT_MATMULS_PER_CHUNK="${GPU_HEARTBEAT_MATMULS_PER_CHUNK:-8}"
 export GPU_HEARTBEAT_DTYPE="${GPU_HEARTBEAT_DTYPE:-bfloat16}"
+export GPU_HEARTBEAT_LOG_INTERVAL_S="${GPU_HEARTBEAT_LOG_INTERVAL_S:-60}"
 
 cleanup() {
     if [ -n "${HEARTBEAT_PID:-}" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
@@ -125,7 +140,6 @@ nice -n 19 "$SD_PATH/.venv/bin/python" -u sbatch/gpu_heartbeat.py &
 HEARTBEAT_PID=$!
 echo "[gpu] Started GPU heartbeat with PID: $HEARTBEAT_PID"
 
-export LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-openai/gpt-oss-120b}"
 if [ -z "${VLLM_PORT:-}" ]; then
     export VLLM_PORT="$((20000 + (${SLURM_JOB_ID:-0} % 30000)))"
 fi
@@ -136,7 +150,7 @@ if [ "${START_VLLM:-1}" = "1" ]; then
     if ! command -v vllm >/dev/null 2>&1; then
         if [ "${INSTALL_VLLM:-1}" = "1" ]; then
             echo "[vllm] Installing vLLM into $SD_PATH/.venv"
-            uv pip install --python "$SD_PATH/.venv/bin/python" "${VLLM_PACKAGE:-vllm>=0.17.0}"
+            uv pip install --python "$SD_PATH/.venv/bin/python" "${VLLM_PACKAGE:-vllm>=0.23.0}"
         else
             echo "[vllm] vllm command not found and INSTALL_VLLM=0" >&2
             exit 2
@@ -148,7 +162,7 @@ if [ "${START_VLLM:-1}" = "1" ]; then
         --host 127.0.0.1 \
         --port "$VLLM_PORT" \
         --tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-2}" \
-        --max-model-len "${VLLM_MAX_MODEL_LEN:-65536}" \
+        --max-model-len "${VLLM_MAX_MODEL_LEN:-32768}" \
         --shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}" \
         ${VLLM_EXTRA_ARGS:-} &
     VLLM_PID=$!
@@ -159,7 +173,7 @@ import time
 import urllib.request
 
 base = os.environ["OPENAI_BASE_URL"].rstrip("/")
-deadline = time.time() + float(os.environ.get("VLLM_STARTUP_TIMEOUT_S", "1800"))
+deadline = time.time() + float(os.environ.get("VLLM_STARTUP_TIMEOUT_S", "3600"))
 url = base.rsplit("/v1", 1)[0] + "/health"
 while time.time() < deadline:
     try:
@@ -175,33 +189,42 @@ PY
 fi
 
 SEARCH_ARRAY_SCRIPT="${SEARCH_ARRAY_SCRIPT:-sbatch/evaluate_puzzlescript_search_array.s}"
-OPTIMIZED_PROMPT="${OPTIMIZED_PROMPT:-artifacts/gepa_puzzlescript_batched_11795049/best_prompt.txt}"
+read -r -a SMOKE_GAME_ARGS <<< "${SMOKE_GAMES:-sokoban_sanity No_Right_Turn_Sokoban Crates_and_Portals Gravity_Sokoban Ice_Cubes Beam_Islands}"
 
 echo "[run] state_root=$RUN_STATE_ROOT"
-echo "[run] optimized_prompt=$OPTIMIZED_PROMPT"
 echo "[run] model=$LOCAL_LLM_MODEL base_url=$OPENAI_BASE_URL"
-echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-64}"
+echo "[run] smoke_games=${SMOKE_GAME_ARGS[*]}"
+echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-8} concurrency=${SEARCH_ARRAY_CONCURRENCY:-8}"
+echo "[run] vllm_extra_args=${VLLM_EXTRA_ARGS:-}"
 
-"$SD_PATH/.venv/bin/python" -u scripts/compare_puzzlescript_batched_prompts.py \
+"$SD_PATH/.venv/bin/python" -u scripts/smoke_compare_puzzlescript_models.py \
     --env-grid "${ENV_GRID:-configs/gepa_puzzlescript_envs.yaml}" \
     --state-root "$RUN_STATE_ROOT" \
     --script-doctor "$SD_PATH" \
-    --optimized-prompt "$OPTIMIZED_PROMPT" \
-    --levels-per-game "${LEVELS_PER_GAME:-0}" \
-    --max-expansions "${MAX_EXPANSIONS:-50000}" \
-    --astar-timeout-s "${ASTAR_TIMEOUT_S:-30}" \
+    --games "${SMOKE_GAME_ARGS[@]}" \
+    --max-games "${MAX_GAMES:-6}" \
+    --levels-per-game "${LEVELS_PER_GAME:-1}" \
+    --max-tasks "${MAX_TASKS:-6}" \
+    --max-expansions "${MAX_EXPANSIONS:-10000}" \
+    --astar-timeout-s "${ASTAR_TIMEOUT_S:-20}" \
     --model "$LOCAL_LLM_MODEL" \
     --openai-base-url "$OPENAI_BASE_URL" \
     --openai-api-key "$OPENAI_API_KEY" \
-    --max-model-tokens "${MAX_MODEL_TOKENS:-8192}" \
+    --max-model-tokens "${MAX_MODEL_TOKENS:-4096}" \
     --temperature "${LLM_TEMPERATURE:-0.2}" \
     --top-p "${LLM_TOP_P:-0.95}" \
     --llm-timeout-s "${LLM_TIMEOUT_S:-600}" \
-    --llm-concurrency "${LLM_CONCURRENCY:-16}" \
+    --llm-concurrency "${LLM_CONCURRENCY:-3}" \
     --submit-search-array \
     --search-array-script "$SEARCH_ARRAY_SCRIPT" \
-    --search-array-count "${SEARCH_ARRAY_COUNT:-101}" \
-    --search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-64}" \
-    --search-poll-interval-s "${SEARCH_POLL_INTERVAL_S:-15}" \
+    --search-array-count "${SEARCH_ARRAY_COUNT:-8}" \
+    --search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-8}" \
+    --search-poll-interval-s "${SEARCH_POLL_INTERVAL_S:-10}" \
     --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-600}" \
-    --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}"
+    --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}" \
+    --lost-solve-penalty "${LOST_SOLVE_PENALTY:-4.0}" \
+    --new-solve-bonus "${NEW_SOLVE_BONUS:-1.0}" \
+    --candidate-error-penalty "${CANDIDATE_ERROR_PENALTY:-2.0}" \
+    --score-delta-weight "${SCORE_DELTA_WEIGHT:-0.25}" \
+    --score-delta-clip "${SCORE_DELTA_CLIP:-0.5}" \
+    --partial-progress-weight "${PARTIAL_PROGRESS_WEIGHT:-0.05}"

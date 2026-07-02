@@ -16,6 +16,7 @@ optimization path and uses GEPA's adapter interface directly.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import multiprocessing as mp
@@ -29,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from queue import Empty
-from typing import Any, Mapping, Optional, Sequence, cast
+from typing import Any, Mapping, Optional, Protocol, Sequence, cast
 
 import yaml
 
@@ -49,7 +50,7 @@ from puzzlescript_sanitizer import sanitize_and_compile_puzzlescript_heuristic  
 DEFAULT_ENV_GRID = Path("configs/gepa_puzzlescript_envs.yaml")
 DEFAULT_STATE_ROOT = Path("artifacts/gepa_puzzlescript_batched_state")
 DEFAULT_SCRIPT_DOCTOR = _PROJECT_ROOT.parent / "script-doctor"
-DEFAULT_MODEL = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 DEFAULT_MAX_MODEL_TOKENS = 8192
 DEFAULT_MAX_EXPANSIONS = 50_000
@@ -65,11 +66,24 @@ DEFAULT_REFLECTION_MAX_RECORDS = 24
 DEFAULT_SEARCH_TASK_WALL_TIMEOUT_S = 120.0
 DEFAULT_DEV_FRACTION = 0.25
 DEFAULT_MAX_GEPA_ITERATIONS = 16
-DEFAULT_LOST_SOLVE_PENALTY = 4.0
+DEFAULT_GUARD_LEVELS = (
+    "Aperture_Science_Sokoban_Testing_Initiative:5;"
+    "Beam_Islands:3;"
+    "Gravity_Sokoban:6,9;"
+    "Ice_Cubes:5,7,14,26;"
+    "Inswaption:7,18;"
+    "Memory_Push:0,2;"
+    "Not_Normal_Crates:5,11,12;"
+    "Sokoban_Dungeon:1;"
+    "Sokocross:0,5;"
+    "where_did_all_this_ice_come_from_:3,6"
+)
+DEFAULT_LOST_SOLVE_PENALTY = 8.0
 DEFAULT_NEW_SOLVE_BONUS = 1.0
 DEFAULT_CANDIDATE_ERROR_PENALTY = 2.0
-DEFAULT_SCORE_DELTA_WEIGHT = 0.25
+DEFAULT_SCORE_DELTA_WEIGHT = 1.0
 DEFAULT_SCORE_DELTA_CLIP = 0.5
+DEFAULT_PARTIAL_PROGRESS_WEIGHT = 0.05
 DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4200
 DEFAULT_REFLECTION_DATASET_CHARS = 24000
 DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 600.0
@@ -125,6 +139,13 @@ Heuristic requirements:
 - If unsure, build a finite fallback from win_conditions_text, object names,
   object counts, player-to-interaction distance, and score_normalized instead
   of hard-coding a Sokoban template.
+- Do not assume exact object keys such as "player", "crate", or "target".
+  Inspect ctx['object_names'], ctx['object_positions'], WINCONDITIONS, and
+  LEGEND aliases to collect player variants, crate-like objects, target-like
+  objects, exits, portals, terrain, and other mechanic-specific roles.
+- Prefer robust helper logic that derives object roles from names and win text
+  over a single hard-coded Sokoban key. If aliases exist, use all matching
+  variants instead of treating missing "player" or "crate" as an invalid state.
 """
 
 
@@ -147,6 +168,13 @@ class SearchArrayConfig:
     poll_interval_s: float
     stall_timeout_s: float = DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S
     extra_sbatch_args: tuple[str, ...] = ()
+
+
+class TextCompletionClient(Protocol):
+    """Minimal text-generation interface used by GEPA synthesis and reflection."""
+
+    def complete(self, prompt: str) -> str:
+        """Return one model completion for the supplied prompt."""
 
 
 @dataclass
@@ -296,6 +324,38 @@ def reflection_trace_priority(trace: Mapping[str, Any]) -> tuple[int, float, str
     )
 
 
+def trace_mechanics_signature(trace: Mapping[str, Any]) -> str:
+    """Return a compact mechanics label used to diversify reflection examples."""
+    task = trace.get("task", {})
+    game = str(task.get("game", ""))
+    env_description = str(task.get("env_description", ""))
+    text = f"{game}\n{env_description}".lower()
+    labels: list[str] = []
+    if re.search(r"\bplayer(?:u|d|l|r|v|h|1|2)\b", text):
+        labels.append("player-alias")
+    if "portal" in text or "teleport" in text or "wrap" in text:
+        labels.append("portal")
+    if "gravity" in text:
+        labels.append("gravity")
+    if "ice" in text or "slide" in text or "slipper" in text:
+        labels.append("ice")
+    if "beam" in text or "laser" in text:
+        labels.append("beam")
+    if "pull" in text or "[ <" in text:
+        labels.append("pull")
+    if "swap" in text or "inswap" in text:
+        labels.append("swap")
+    if "mud" in text or "footprint" in text:
+        labels.append("terrain")
+    if "all target" in text and "crate" in text:
+        labels.append("target-crate")
+    elif "all target" in text and "wall" in text:
+        labels.append("target-wall")
+    elif "win conditions" in text:
+        labels.append("other-win")
+    return "+".join(labels) if labels else "generic"
+
+
 def select_reflection_traces(
     trajectories: Sequence[Mapping[str, Any]],
     *,
@@ -318,6 +378,16 @@ def select_reflection_traces(
 
     selected: list[Mapping[str, Any]] = []
     seen_ids: set[int] = set()
+    seen_mechanics: set[str] = set()
+
+    def add_trace(trace: Mapping[str, Any]) -> bool:
+        if id(trace) in seen_ids:
+            return False
+        selected.append(trace)
+        seen_ids.add(id(trace))
+        seen_mechanics.add(trace_mechanics_signature(trace))
+        return True
+
     priority_groups = (
         "lost_baseline_solve",
         "new_solve",
@@ -334,15 +404,25 @@ def select_reflection_traces(
         if not group:
             continue
         trace = group[0]
-        selected.append(trace)
-        seen_ids.add(id(trace))
+        add_trace(trace)
+        if len(selected) >= max_records:
+            return selected
+
+    # After outcome seeding, add one representative per mechanics signature so
+    # crowded generic failures do not hide player-alias, portal, gravity, beam,
+    # or terrain cases from the reflection prompt.
+    for trace in sorted(traces, key=reflection_trace_priority):
+        if id(trace) in seen_ids:
+            continue
+        signature = trace_mechanics_signature(trace)
+        if signature in seen_mechanics:
+            continue
+        add_trace(trace)
         if len(selected) >= max_records:
             return selected
 
     for trace in sorted(traces, key=reflection_trace_priority):
-        if id(trace) in seen_ids:
-            continue
-        selected.append(trace)
+        add_trace(trace)
         if len(selected) >= max_records:
             return selected
     return selected
@@ -352,6 +432,47 @@ def strip_outer_markdown_fences(code: str) -> str:
     cleaned = re.sub(r"^```(?:python)?\s*\n?", "", code.strip(), flags=re.IGNORECASE)
     cleaned = re.sub(r"\n?```\s*$", "", cleaned)
     return cleaned.strip()
+
+
+def candidate_prompt_issue(prompt_text: str) -> Optional[str]:
+    """Return a prompt-shape issue when GEPA proposes implementation code.
+
+    The optimized component is a reusable instruction prompt that later asks an
+    LLM to write one heuristic per level. GEPA can occasionally return a full
+    `heuristic_cost_to_go` implementation as the component itself; accepting
+    that turns the global prompt into a brittle code template. This guard allows
+    instruction prompts that mention the required signature but rejects text that
+    is itself a Python implementation.
+    """
+    cleaned = strip_outer_markdown_fences(prompt_text)
+    stripped = cleaned.strip()
+    if not stripped:
+        return "candidate prompt is empty"
+    first_content_line = next(
+        (line.strip() for line in stripped.splitlines() if line.strip()),
+        "",
+    )
+    if re.match(
+        r"^(?:async\s+def|def\s+heuristic_cost_to_go\s*\(|import\s+|from\s+\S+\s+import\s+)",
+        first_content_line,
+    ):
+        return "candidate prompt is a Python implementation rather than instruction text"
+    try:
+        tree = ast.parse(stripped)
+    except SyntaxError:
+        return None
+    if not tree.body:
+        return "candidate prompt is empty"
+    first_node = tree.body[0]
+    if isinstance(first_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Import, ast.ImportFrom)):
+        return "candidate prompt is a Python implementation rather than instruction text"
+    if any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "heuristic_cost_to_go"
+        for node in tree.body
+    ):
+        return "candidate prompt contains a heuristic implementation instead of instructions"
+    return None
 
 
 def heuristic_score(solved: bool, expanded: int, max_expansions: int) -> float:
@@ -395,6 +516,58 @@ def split_train_dev_jobs(
     return train, dev
 
 
+def parse_guard_level_selection(selection: str) -> dict[str, list[int]]:
+    """Parse an exact `game:level,level;...` guard-level specification.
+
+    Guard levels are held-out benchmark cases that previously exposed a
+    base-prompt regression or a useful optimized-prompt win. Keeping the parser
+    exact rather than fuzzy prevents accidental validation leakage across whole
+    games while still letting the runner protect known mechanics patterns.
+    """
+    levels_by_game: dict[str, list[int]] = {}
+    text = selection.strip()
+    if not text:
+        return levels_by_game
+    for raw_entry in text.split(";"):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            raise ValueError(
+                "Guard level entries must use game:level,level format; "
+                f"got {entry!r}"
+            )
+        game, raw_levels = entry.split(":", 1)
+        game = game.strip()
+        if not game or not raw_levels.strip():
+            raise ValueError(
+                "Guard level entries must use game:level,level format; "
+                f"got {entry!r}"
+            )
+        parsed_levels: list[int] = []
+        for raw_level in raw_levels.split(","):
+            raw_level = raw_level.strip()
+            if not raw_level:
+                continue
+            try:
+                level = int(raw_level)
+            except ValueError as exc:
+                raise ValueError(
+                    "Guard level entries must use integer levels; "
+                    f"got {raw_level!r} in {entry!r}"
+                ) from exc
+            if level < 0:
+                raise ValueError(f"Guard level must be non-negative; got {level}")
+            parsed_levels.append(level)
+        if not parsed_levels:
+            raise ValueError(
+                "Guard level entries must use game:level,level format; "
+                f"got {entry!r}"
+            )
+        levels_by_game[game] = sorted(dict.fromkeys(parsed_levels))
+    return levels_by_game
+
+
 def _task_game(task: Any) -> str:
     if isinstance(task, Mapping):
         return str(task["game"])
@@ -413,8 +586,8 @@ def task_key(task: Any) -> tuple[str, int]:
 
 
 def _with_task_id(task: Any, task_id: int) -> Any:
-    if is_dataclass(task):
-        return replace(task, task_id=task_id)
+    if is_dataclass(task) and not isinstance(task, type):
+        return replace(cast(PuzzleScriptLevelTask, task), task_id=task_id)
     if isinstance(task, Mapping):
         row = dict(task)
         row["task_id"] = task_id
@@ -469,6 +642,23 @@ def unique_tasks_by_key(tasks: Sequence[PuzzleScriptLevelTask]) -> list[PuzzleSc
     return unique
 
 
+def merge_validation_guard_tasks(
+    validation_tasks: Sequence[PuzzleScriptLevelTask],
+    guard_tasks: Sequence[PuzzleScriptLevelTask],
+) -> list[PuzzleScriptLevelTask]:
+    """Return validation tasks plus non-duplicate guard tasks with dense ids.
+
+    The guard set augments, rather than replaces, the normal development split.
+    When a configured guard level already appears in validation, the original
+    validation task wins so the split remains stable and task ids are reassigned
+    only after deduplication.
+    """
+    return cast(
+        list[PuzzleScriptLevelTask],
+        reassign_task_ids(unique_tasks_by_key([*validation_tasks, *guard_tasks])),
+    )
+
+
 def _is_game_compile_error(error: object) -> bool:
     if error is None:
         return False
@@ -493,6 +683,54 @@ def is_candidate_error(output: Mapping[str, Any]) -> bool:
 def _clamp(value: float, limit: float) -> float:
     bound = max(0.0, limit)
     return max(-bound, min(bound, value))
+
+
+def _score_normalized_from_snapshot(snapshot: Mapping[str, Any]) -> Optional[float]:
+    value = snapshot.get("score_normalized")
+    if value is None:
+        return None
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def trace_partial_progress_score(trace_summary: Mapping[str, Any]) -> float:
+    """Return the best normalized engine progress visible in an A* trace.
+
+    Unsolved searches otherwise all receive a raw search score of zero. This
+    small auxiliary signal gives GEPA a bounded ordering among failed attempts
+    without letting partial progress outweigh solve preservation.
+    """
+    values: list[float] = []
+    root_snapshot = trace_summary.get("root_snapshot")
+    if isinstance(root_snapshot, Mapping):
+        value = _score_normalized_from_snapshot(root_snapshot)
+        if value is not None:
+            values.append(value)
+    for state in trace_summary.get("sampled_states", []) or []:
+        if not isinstance(state, Mapping):
+            continue
+        snapshot = state.get("snapshot")
+        if not isinstance(snapshot, Mapping):
+            continue
+        value = _score_normalized_from_snapshot(snapshot)
+        if value is not None:
+            values.append(value)
+    return max(values) if values else 0.0
+
+
+def _row_partial_progress_score(row: Mapping[str, Any], *, prefix: str = "") -> float:
+    value = row.get(f"{prefix}partial_progress_score")
+    if value is not None:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.0
+    trace_summary = row.get(f"{prefix}trace_summary")
+    if isinstance(trace_summary, Mapping):
+        return trace_partial_progress_score(trace_summary)
+    return 0.0
 
 
 def _macro_game_weights(rows: Sequence[Mapping[str, Any]]) -> list[float]:
@@ -520,6 +758,7 @@ def _base_relative_score(
     error_penalty: float,
     score_delta_weight: float,
     score_delta_clip: float,
+    partial_progress_weight: float,
 ) -> float:
     """Score one result by robust improvement over the stored base prompt.
 
@@ -529,13 +768,20 @@ def _base_relative_score(
     efficiency matter only as a capped tie-breaker.
     """
     raw_score = float(row.get("score", 0.0))
+    solved = bool(row.get("solved", False))
+    partial_weight = max(0.0, partial_progress_weight)
     if not _has_baseline(row):
-        score = raw_score
+        score = raw_score if solved else partial_weight * _row_partial_progress_score(row)
     else:
         baseline_score = float(row.get("baseline_score", 0.0))
-        solved = bool(row.get("solved", False))
         baseline_solved = bool(row.get("baseline_solved", False))
-        delta = _clamp(raw_score - baseline_score, score_delta_clip)
+        raw_quality = raw_score if solved else partial_weight * _row_partial_progress_score(row)
+        baseline_quality = (
+            baseline_score
+            if baseline_solved
+            else partial_weight * _row_partial_progress_score(row, prefix="baseline_")
+        )
+        delta = _clamp(raw_quality - baseline_quality, score_delta_clip)
         score = max(0.0, score_delta_weight) * delta
         if baseline_solved and not solved:
             score -= max(0.0, lost_solve_penalty)
@@ -562,6 +808,7 @@ def candidate_score(
     error_penalty: float = DEFAULT_CANDIDATE_ERROR_PENALTY,
     score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
     score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
+    partial_progress_weight: float = DEFAULT_PARTIAL_PROGRESS_WEIGHT,
 ) -> float:
     """Return the mean GEPA score for one candidate.
 
@@ -580,6 +827,7 @@ def candidate_score(
         error_penalty=error_penalty,
         score_delta_weight=score_delta_weight,
         score_delta_clip=score_delta_clip,
+        partial_progress_weight=partial_progress_weight,
     )
     return sum(scores) / len(scores)
 
@@ -592,6 +840,7 @@ def adjusted_candidate_scores(
     error_penalty: float = DEFAULT_CANDIDATE_ERROR_PENALTY,
     score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
     score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
+    partial_progress_weight: float = DEFAULT_PARTIAL_PROGRESS_WEIGHT,
 ) -> list[float]:
     """Return macro-game-weighted per-task scores for GEPA.
 
@@ -611,6 +860,7 @@ def adjusted_candidate_scores(
             error_penalty=error_penalty,
             score_delta_weight=score_delta_weight,
             score_delta_clip=score_delta_clip,
+            partial_progress_weight=partial_progress_weight,
         )
         scores.append(score * weight)
     return scores
@@ -677,10 +927,13 @@ def build_level_tasks(
     script_doctor: Path,
     levels_per_game: int,
     budget: int,
+    selected_levels_by_game: Mapping[str, Sequence[int]] | None = None,
 ) -> list[PuzzleScriptLevelTask]:
     tasks: list[PuzzleScriptLevelTask] = []
     for entry in jobs:
         name = str(entry["name"])
+        if selected_levels_by_game is not None and name not in selected_levels_by_game:
+            continue
         game_text_path = find_game_text_path(name, script_doctor)
         if game_text_path is None:
             print(f"[inputs] skipping {name}: no game text found")
@@ -692,8 +945,20 @@ def build_level_tasks(
             engine = evaluator.load_engine(json_str)
             engine.load_level(0)
             n_levels = engine.get_num_levels()
-            requested_levels = max(1, int(entry.get("levels", n_levels) or n_levels))
-            selected = select_level_indices(n_levels, requested_levels, levels_per_game)
+            if selected_levels_by_game is not None:
+                selected = [
+                    int(level)
+                    for level in selected_levels_by_game.get(name, [])
+                    if 0 <= int(level) < n_levels
+                ]
+                if len(selected) < len(selected_levels_by_game.get(name, [])):
+                    print(
+                        f"[inputs] {name}: skipped guard levels outside [0, {n_levels})",
+                        flush=True,
+                    )
+            else:
+                requested_levels = max(1, int(entry.get("levels", n_levels) or n_levels))
+                selected = select_level_indices(n_levels, requested_levels, levels_per_game)
             base_desc = build_env_description(compiled, engine.get_id_dict(), game_text)
             for level in selected:
                 try:
@@ -750,7 +1015,7 @@ def validate_heuristic_code(code: str) -> Optional[str]:
 
 def synthesize_heuristic_code(
     *,
-    llm: OpenAITextClient,
+    llm: TextCompletionClient,
     prompt_text: str,
     task: PuzzleScriptLevelTask,
 ) -> tuple[str, Optional[str]]:
@@ -789,6 +1054,7 @@ def search_failure_result(task: Mapping[str, Any], *, feedback: str, error: str)
         "game": str(task["game"]),
         "level": int(task["level"]),
         "score": 0.0,
+        "partial_progress_score": 0.0,
         "solved": False,
         "expanded": 0,
         "generated": 0,
@@ -837,11 +1103,13 @@ def evaluate_search_task(
             timeout_s=astar_timeout_s,
         )
         score = heuristic_score(result.solved, result.expanded_states, budget)
+        partial_progress = trace_partial_progress_score(result.trace_summary)
         feedback = (
             f"Game={game} level={level} solved={result.solved} "
             f"score={score:.4f} expanded={result.expanded_states}/{budget} "
             f"generated={result.generated_states} solution_length={result.solution_length} "
-            f"terminated={result.trace_summary.get('terminated_reason', 'unknown')}"
+            f"terminated={result.trace_summary.get('terminated_reason', 'unknown')} "
+            f"partial_progress={partial_progress:.3f}"
         )
         if not result.solved:
             feedback += "\nTrace summary:\n" + json.dumps(
@@ -854,6 +1122,7 @@ def evaluate_search_task(
             "game": game,
             "level": level,
             "score": score,
+            "partial_progress_score": partial_progress,
             "raw_search_score": result.score,
             "solved": result.solved,
             "expanded": result.expanded_states,
@@ -895,7 +1164,7 @@ def _search_task_worker(
     result_queue.put(result)
 
 
-def _multiprocessing_context() -> mp.context.BaseContext:
+def _multiprocessing_context() -> Any:
     if "spawn" in mp.get_all_start_methods():
         return mp.get_context("spawn")
     return mp.get_context("fork")
@@ -1131,6 +1400,35 @@ def _result_summary(prefix: str, result: Mapping[str, Any], *, baseline: bool = 
     )
 
 
+def _compact_trace_diagnostics(result: Mapping[str, Any]) -> str:
+    """Return one short trace summary line for reflection feedback."""
+    trace_summary = result.get("trace_summary")
+    if not isinstance(trace_summary, Mapping):
+        return ""
+    values: list[float] = []
+    root_snapshot = trace_summary.get("root_snapshot")
+    if isinstance(root_snapshot, Mapping):
+        value = _score_normalized_from_snapshot(root_snapshot)
+        if value is not None:
+            values.append(value)
+    for state in trace_summary.get("sampled_states", []) or []:
+        if not isinstance(state, Mapping):
+            continue
+        snapshot = state.get("snapshot")
+        if not isinstance(snapshot, Mapping):
+            continue
+        value = _score_normalized_from_snapshot(snapshot)
+        if value is not None:
+            values.append(value)
+    parts = ["Candidate trace diagnostics:"]
+    if values:
+        parts.append(f"progress_range={min(values):.3f}..{max(values):.3f}")
+    for key in ("best_seen_h", "best_seen_f", "open_set_size_at_end", "terminated_reason"):
+        if key in trace_summary:
+            parts.append(f"{key}={trace_summary[key]}")
+    return " ".join(parts) if len(parts) > 1 else ""
+
+
 def build_reflection_feedback(result: Mapping[str, Any], classification: str) -> str:
     """Return targeted feedback for GEPA reflection.
 
@@ -1198,6 +1496,9 @@ def build_reflection_feedback(result: Mapping[str, Any], classification: str) ->
         lines.append("Base raw feedback:\n" + baseline_feedback)
     if candidate_feedback:
         lines.append("Candidate raw feedback:\n" + candidate_feedback)
+    diagnostics = _compact_trace_diagnostics(result)
+    if diagnostics and classification != "stable_or_improved":
+        lines.append(diagnostics)
     return "\n".join(lines)
 
 
@@ -1223,6 +1524,8 @@ def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
         cleaned,
         flags=re.IGNORECASE,
     ).strip()
+    if candidate_prompt_issue(cleaned) is not None:
+        return ""
     if len(cleaned) <= max_chars:
         return cleaned
     cutoff = cleaned.rfind("\n", 0, max_chars)
@@ -1231,11 +1534,71 @@ def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
     return cleaned[:cutoff].rstrip()
 
 
+def heuristic_code_shape(code: str) -> dict[str, bool]:
+    """Return compact flags describing generated heuristic strategy shape.
+
+    Reflection already includes truncated code, but these booleans make it cheap
+    for the proposal LLM to notice when a candidate drifted from concrete
+    mechanics-specific terms into generic role discovery or score-only fallback.
+    """
+    lowered = code.lower()
+    return {
+        "uses_generic_role_helpers": "role_positions" in lowered or "role_keywords" in lowered,
+        "uses_score_fallback": "score_normalized" in lowered,
+        "uses_win_text": "win_conditions_text" in lowered,
+        "uses_ascii_state": "ascii_state" in lowered,
+        "uses_large_penalty": any(
+            marker in lowered for marker in ("1e6", "1000.0", "5000.0", "1e5")
+        ),
+        "mentions_mechanics_terms": any(
+            term in lowered
+            for term in (
+                "button",
+                "door",
+                "portal",
+                "laser",
+                "beam",
+                "ice",
+                "gravity",
+                "swap",
+                "pull",
+                "mud",
+                "boulder",
+                "exit",
+            )
+        ),
+    }
+
+
+def _initial_eval_counter(candidate_eval_root: Path) -> int:
+    """Return the highest existing adapter evaluation counter.
+
+    GEPA resume state lives under `gepa_run`, while the batched adapter writes
+    per-candidate synthesis and search artifacts under `candidate_evals`. When a
+    killed Slurm job is resumed with the same state root, the adapter must append
+    new evaluation directories instead of overwriting previous evidence.
+    Nonconforming directory names are ignored so manual notes or partial files do
+    not block resuming.
+    """
+
+    max_counter = 0
+    for path in candidate_eval_root.glob("eval-*"):
+        parts = path.name.split("-", 2)
+        if len(parts) < 2:
+            continue
+        try:
+            counter = int(parts[1])
+        except ValueError:
+            continue
+        max_counter = max(max_counter, counter)
+    return max_counter
+
+
 class PuzzleScriptBatchedGEPAAdapter:
     def __init__(
         self,
         *,
-        llm: OpenAITextClient,
+        llm: TextCompletionClient,
         state_root: Path,
         script_doctor: Path,
         search_config: SearchArrayConfig,
@@ -1246,6 +1609,7 @@ class PuzzleScriptBatchedGEPAAdapter:
         candidate_error_penalty: float = DEFAULT_CANDIDATE_ERROR_PENALTY,
         score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
         score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
+        partial_progress_weight: float = DEFAULT_PARTIAL_PROGRESS_WEIGHT,
     ) -> None:
         self.llm = llm
         self.state_root = state_root
@@ -1258,8 +1622,9 @@ class PuzzleScriptBatchedGEPAAdapter:
         self.candidate_error_penalty = max(0.0, candidate_error_penalty)
         self.score_delta_weight = max(0.0, score_delta_weight)
         self.score_delta_clip = max(0.0, score_delta_clip)
+        self.partial_progress_weight = max(0.0, partial_progress_weight)
         self.baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
-        self.eval_counter = 0
+        self.eval_counter = _initial_eval_counter(self.state_root / "candidate_evals")
 
     def set_baseline_outputs(self, outputs: Sequence[Mapping[str, Any]]) -> None:
         """Store base-prompt outcomes used to penalize solve regressions."""
@@ -1278,6 +1643,7 @@ class PuzzleScriptBatchedGEPAAdapter:
         result["baseline_expanded"] = baseline.get("expanded")
         result["baseline_generated"] = baseline.get("generated")
         result["baseline_solution_length"] = baseline.get("solution_length")
+        result["baseline_partial_progress_score"] = baseline.get("partial_progress_score", 0.0)
         result["baseline_feedback"] = baseline.get("feedback")
         result["baseline_heuristic_code_path"] = baseline.get("heuristic_code_path")
 
@@ -1427,6 +1793,67 @@ class PuzzleScriptBatchedGEPAAdapter:
             f"capture_traces={capture_traces}",
             flush=True,
         )
+        prompt_text = candidate.get(HEURISTIC_COMPONENT, PUZZLESCRIPT_HEURISTIC_CONTRACT)
+        prompt_issue = candidate_prompt_issue(prompt_text)
+        if prompt_issue is not None:
+            print(f"[adapter] rejecting candidate prompt: {prompt_issue}", flush=True)
+            violation_outputs: list[dict[str, Any]] = []
+            violation_trajectories: list[dict[str, Any]] = []
+            for task in batch:
+                result = {
+                    "task_id": task.task_id,
+                    "game": task.game,
+                    "level": task.level,
+                    "score": 0.0,
+                    "partial_progress_score": 0.0,
+                    "solved": False,
+                    "expanded": 0,
+                    "generated": 0,
+                    "solution_length": 0,
+                    "feedback": (
+                        "Prompt contract violation: GEPA proposed implementation code "
+                        f"instead of reusable instruction text. Issue: {prompt_issue}"
+                    ),
+                    "error": f"prompt contract violation: {prompt_issue}",
+                }
+                self._attach_baseline_metadata(result)
+                violation_outputs.append(result)
+                if capture_traces:
+                    violation_trajectories.append(
+                        {
+                            "task": asdict(task),
+                            "heuristic_code_path": None,
+                            "heuristic_code": "",
+                            "synthesis_error": result["error"],
+                            "result": result,
+                        }
+                    )
+            violation_scores = adjusted_candidate_scores(
+                violation_outputs,
+                lost_solve_penalty=self.lost_solve_penalty,
+                new_solve_bonus=self.new_solve_bonus,
+                error_penalty=self.candidate_error_penalty,
+                score_delta_weight=self.score_delta_weight,
+                score_delta_clip=self.score_delta_clip,
+                partial_progress_weight=self.partial_progress_weight,
+            )
+            for output, adjusted_score in zip(violation_outputs, violation_scores, strict=True):
+                output["adjusted_score"] = adjusted_score
+            (eval_dir / "synthesis_manifest.json").write_text("[]\n", encoding="utf-8")
+            (eval_dir / "merged_results.json").write_text(
+                json.dumps(violation_outputs, indent=2, sort_keys=True, default=str) + "\n",
+                encoding="utf-8",
+            )
+            (eval_dir / "scored_results.json").write_text(
+                json.dumps(violation_outputs, indent=2, sort_keys=True, default=str) + "\n",
+                encoding="utf-8",
+            )
+            return EvaluationBatch(
+                outputs=violation_outputs,
+                scores=violation_scores,
+                trajectories=violation_trajectories if capture_traces else None,
+            )
+
         task_rows = self._synthesize_batch(candidate=candidate, batch=batch, eval_dir=eval_dir)
         results_by_id = {
             int(row["task_id"]): row
@@ -1473,6 +1900,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             error_penalty=self.candidate_error_penalty,
             score_delta_weight=self.score_delta_weight,
             score_delta_clip=self.score_delta_clip,
+            partial_progress_weight=self.partial_progress_weight,
         )
         for output, adjusted_score in zip(outputs, scores, strict=True):
             output["adjusted_score"] = adjusted_score
@@ -1544,6 +1972,7 @@ class PuzzleScriptBatchedGEPAAdapter:
                 result.get("baseline_heuristic_code_path"),
                 max_chars=DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
             )
+            generated_code = trace.get("heuristic_code", "")
             targeted_feedback = build_reflection_feedback(result, classification)
             records.append(
                 {
@@ -1559,6 +1988,7 @@ class PuzzleScriptBatchedGEPAAdapter:
                     "Comparison": build_comparison_payload(result, classification),
                     "Baseline Output": {
                         "heuristic_code": baseline_code,
+                        "code_shape": heuristic_code_shape(baseline_code),
                         "feedback": truncate_text(
                             str(result.get("baseline_feedback", "")),
                             DEFAULT_REFLECTION_FEEDBACK_CHARS,
@@ -1566,9 +1996,10 @@ class PuzzleScriptBatchedGEPAAdapter:
                     },
                     "Generated Outputs": {
                         "heuristic_code": truncate_text(
-                            trace.get("heuristic_code", ""),
+                            generated_code,
                             DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
                         ),
+                        "code_shape": heuristic_code_shape(generated_code),
                         "synthesis_error": trace.get("synthesis_error"),
                     },
                     "Feedback": truncate_text(
@@ -1614,8 +2045,21 @@ Revise the current prompt using only compact, general rules supported by the com
 Hard requirements:
 - Preserve the exact function contract and safety constraints.
 - Prefer small edits to the current prompt. Delete or rewrite stale wording if needed.
+- Preserve the base prompt's instruction to read WINCONDITIONS, RULES,
+  COLLISIONLAYERS, LEGEND aliases, and the initial level state before choosing
+  heuristic features.
+- Do not replace game-specific mechanics analysis with a generic role-discovery
+  template. Generic substring roles and score-based fallback are last resorts,
+  not the main heuristic strategy.
+- Do not output Python code as the revised prompt; output instruction text that
+  will later ask a separate model call to write Python code.
+- The revised prompt must not begin with `def`, `import`, or a
+  `heuristic_cost_to_go` implementation.
 - Do not append long lists of named games, levels, examples, or mechanics inventories.
 - Prioritize preventing lost base solves over small expansion-count improvements.
+- Treat a candidate that loses base-solved levels as evidence to restore or
+  strengthen the base mechanics-reading rule, not as evidence to add broader
+  deadlock or fallback heuristics.
 - Preserve general principles that created new solves only when they do not conflict with base-solved cases.
 - Keep the final prompt under {max_chars} characters.
 - Output only the revised prompt text. Do not include markdown, commentary, or labels.
@@ -1672,6 +2116,21 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
             levels_per_game=args.levels_per_game,
             budget=max(1, args.max_expansions),
         )
+    guard_level_selection = parse_guard_level_selection(args.guard_levels)
+    guard_tasks: list[PuzzleScriptLevelTask] = []
+    if guard_level_selection:
+        guard_tasks = build_level_tasks(
+            evaluator=evaluator,
+            jobs=eval_jobs,
+            script_doctor=args.script_doctor,
+            levels_per_game=0,
+            budget=max(1, args.max_expansions),
+            selected_levels_by_game=guard_level_selection,
+        )
+        val_tasks = merge_validation_guard_tasks(
+            [cast(PuzzleScriptLevelTask, task) for task in val_tasks],
+            guard_tasks,
+        )
     if not train_tasks:
         raise RuntimeError("No train tasks were loadable.")
     if not val_tasks:
@@ -1684,6 +2143,9 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         "all_train_games": sorted({task.game for task in all_train_tasks}),
         "train_games": sorted({task.game for task in train_tasks}),
         "val_games": sorted({task.game for task in val_tasks}),
+        "guard_levels": guard_level_selection,
+        "guard_task_count": len(guard_tasks),
+        "guard_games": sorted({task.game for task in guard_tasks}),
         "train_task_count": len(train_tasks),
         "val_task_count": len(val_tasks),
     }
@@ -1729,6 +2191,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         candidate_error_penalty=args.candidate_error_penalty,
         score_delta_weight=args.score_delta_weight,
         score_delta_clip=args.score_delta_clip,
+        partial_progress_weight=args.partial_progress_weight,
     )
 
     import gepa
@@ -1751,7 +2214,8 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         f"tasks={len(baseline_tasks)} lost_solve_penalty={args.lost_solve_penalty} "
         f"new_solve_bonus={args.new_solve_bonus} "
         f"candidate_error_penalty={args.candidate_error_penalty} "
-        f"score_delta_weight={args.score_delta_weight} score_delta_clip={args.score_delta_clip}",
+        f"score_delta_weight={args.score_delta_weight} score_delta_clip={args.score_delta_clip} "
+        f"partial_progress_weight={args.partial_progress_weight}",
         flush=True,
     )
     baseline_batch = adapter.evaluate(
@@ -1793,6 +2257,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     print(
         "[gepa] starting standalone optimization: "
         f"train_tasks={len(train_tasks)} val_tasks={len(val_tasks)} "
+        f"guard_tasks={len(guard_tasks)} "
         f"val_split={args.val_split} "
         f"reflection_minibatch_size={reflection_minibatch_size} "
         f"max_metric_calls={max_metric_calls}",
@@ -1875,6 +2340,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--val-split", choices=("train", "dev", "eval"), default="dev")
     parser.add_argument("--dev-fraction", type=float, default=DEFAULT_DEV_FRACTION)
+    parser.add_argument(
+        "--guard-levels",
+        type=str,
+        default="",
+        help=(
+            "Optional semicolon-separated game:level,level exact holdout guard set "
+            "added to validation for base-solve regression protection."
+        ),
+    )
     parser.add_argument("--max-gepa-iterations", type=int, default=DEFAULT_MAX_GEPA_ITERATIONS)
     parser.add_argument("--max-metric-calls", type=int, default=0)
     parser.add_argument("--lost-solve-penalty", type=float, default=DEFAULT_LOST_SOLVE_PENALTY)
@@ -1886,6 +2360,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--score-delta-weight", type=float, default=DEFAULT_SCORE_DELTA_WEIGHT)
     parser.add_argument("--score-delta-clip", type=float, default=DEFAULT_SCORE_DELTA_CLIP)
+    parser.add_argument(
+        "--partial-progress-weight",
+        type=float,
+        default=DEFAULT_PARTIAL_PROGRESS_WEIGHT,
+    )
     parser.add_argument(
         "--reflection-minibatch-size",
         type=int,

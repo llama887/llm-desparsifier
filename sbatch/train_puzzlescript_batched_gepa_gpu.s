@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=128G
 #SBATCH --time=48:00:00
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:h100:2
 #SBATCH --account=torch_pr_45_tandon_advanced
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=fyy2003@nyu.edu
@@ -113,6 +113,7 @@ export GPU_HEARTBEAT_MAX_COMPUTE_SECONDS="${GPU_HEARTBEAT_MAX_COMPUTE_SECONDS:-1
 export GPU_HEARTBEAT_COMPUTE_GAIN_SECONDS="${GPU_HEARTBEAT_COMPUTE_GAIN_SECONDS:-0.03}"
 export GPU_HEARTBEAT_MATMULS_PER_CHUNK="${GPU_HEARTBEAT_MATMULS_PER_CHUNK:-8}"
 export GPU_HEARTBEAT_DTYPE="${GPU_HEARTBEAT_DTYPE:-bfloat16}"
+export GPU_HEARTBEAT_LOG_INTERVAL_S="${GPU_HEARTBEAT_LOG_INTERVAL_S:-60}"
 
 cleanup() {
     if [ -n "${HEARTBEAT_PID:-}" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
@@ -126,11 +127,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "[gpu] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 nice -n 19 "$SD_PATH/.venv/bin/python" -u sbatch/gpu_heartbeat.py &
 HEARTBEAT_PID=$!
 echo "[gpu] Started GPU heartbeat with PID: $HEARTBEAT_PID"
 
-export LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}"
+export LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-openai/gpt-oss-120b}"
 if [ -z "${VLLM_PORT:-}" ]; then
     export VLLM_PORT="$((20000 + (${SLURM_JOB_ID:-0} % 30000)))"
 fi
@@ -141,7 +143,7 @@ if [ "${START_VLLM:-1}" = "1" ]; then
     if ! command -v vllm >/dev/null 2>&1; then
         if [ "${INSTALL_VLLM:-1}" = "1" ]; then
             echo "[vllm] Installing vLLM into $SD_PATH/.venv"
-            uv pip install --python "$SD_PATH/.venv/bin/python" "${VLLM_PACKAGE:-vllm>=0.15.0}"
+            uv pip install --python "$SD_PATH/.venv/bin/python" "${VLLM_PACKAGE:-vllm>=0.17.0}"
         else
             echo "[vllm] vllm command not found and INSTALL_VLLM=0" >&2
             exit 2
@@ -152,7 +154,9 @@ if [ "${START_VLLM:-1}" = "1" ]; then
     vllm serve "$LOCAL_LLM_MODEL" \
         --host 127.0.0.1 \
         --port "$VLLM_PORT" \
+        --tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-2}" \
         --max-model-len "${VLLM_MAX_MODEL_LEN:-65536}" \
+        --shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}" \
         ${VLLM_EXTRA_ARGS:-} &
     VLLM_PID=$!
 
@@ -210,13 +214,15 @@ echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
     --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}" \
     --val-split "${VAL_SPLIT:-dev}" \
     --dev-fraction "${DEV_FRACTION:-0.25}" \
+    --guard-levels "${GUARD_LEVELS:-Aperture_Science_Sokoban_Testing_Initiative:5;Beam_Islands:3;Gravity_Sokoban:6,9;Ice_Cubes:5,7,14,26;Inswaption:7,18;Memory_Push:0,2;Not_Normal_Crates:5,11,12;Sokoban_Dungeon:1;Sokocross:0,5;where_did_all_this_ice_come_from_:3,6}" \
     --max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}" \
     --max-metric-calls "${MAX_METRIC_CALLS:-0}" \
-    --lost-solve-penalty "${LOST_SOLVE_PENALTY:-4.0}" \
+    --lost-solve-penalty "${LOST_SOLVE_PENALTY:-8.0}" \
     --new-solve-bonus "${NEW_SOLVE_BONUS:-1.0}" \
     --candidate-error-penalty "${CANDIDATE_ERROR_PENALTY:-2.0}" \
-    --score-delta-weight "${SCORE_DELTA_WEIGHT:-0.25}" \
+    --score-delta-weight "${SCORE_DELTA_WEIGHT:-1.0}" \
     --score-delta-clip "${SCORE_DELTA_CLIP:-0.5}" \
+    --partial-progress-weight "${PARTIAL_PROGRESS_WEIGHT:-0.05}" \
     --reflection-minibatch-size "${REFLECTION_MINIBATCH_SIZE:-0}" \
     --seed "${GEPA_SEED:-0}"
 

@@ -108,8 +108,8 @@ def compare_prompt_outputs(
     per_game: list[dict[str, Any]] = []
     for game, rows in sorted(by_game.items()):
         n_rows = len(rows)
-        base_solved = sum(1 for row in rows if row["base_solved"])
-        optimized_solved = sum(1 for row in rows if row["optimized_solved"])
+        base_solved_count = sum(1 for row in rows if row["base_solved"])
+        optimized_solved_count = sum(1 for row in rows if row["optimized_solved"])
         base_score = sum(float(row["base_score"]) for row in rows) / n_rows
         optimized_score = sum(float(row["optimized_score"]) for row in rows) / n_rows
         per_game.append(
@@ -119,9 +119,9 @@ def compare_prompt_outputs(
                 "base_score_mean": base_score,
                 "optimized_score_mean": optimized_score,
                 "score_delta": optimized_score - base_score,
-                "base_solved": base_solved,
-                "optimized_solved": optimized_solved,
-                "solved_delta": optimized_solved - base_solved,
+                "base_solved": base_solved_count,
+                "optimized_solved": optimized_solved_count,
+                "solved_delta": optimized_solved_count - base_solved_count,
                 "better_score_count": sum(1 for row in rows if row["score_delta"] > 0.0),
                 "worse_score_count": sum(1 for row in rows if row["score_delta"] < 0.0),
                 "new_solve_count": sum(1 for row in rows if row["solve_delta"] > 0),

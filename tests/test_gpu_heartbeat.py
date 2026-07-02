@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from sbatch.gpu_heartbeat import (
     HeartbeatConfig,
+    _normalize_gpu_utilizations,
     compute_burst_seconds,
     get_gpu_utilization,
+    get_gpu_utilizations,
     resolve_matmul_dtype,
 )
 
@@ -82,3 +84,18 @@ def test_get_gpu_utilization_parses_multiple_visible_devices(monkeypatch) -> Non
     monkeypatch.setattr("subprocess.check_output", lambda *args, **kwargs: "4\n71\n")
 
     assert get_gpu_utilization() == 71
+
+
+def test_get_gpu_utilizations_filters_cuda_visible_device_indices(monkeypatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+    monkeypatch.setattr(
+        "subprocess.check_output",
+        lambda *args, **kwargs: "0, 4\n1, 71\n2, 15\n3, 9\n",
+    )
+
+    assert get_gpu_utilizations() == [15, 9]
+
+
+def test_normalize_gpu_utilizations_returns_one_value_per_device() -> None:
+    assert _normalize_gpu_utilizations([12, 34, 56], 2) == [12, 34]
+    assert _normalize_gpu_utilizations([12], 2) == [100, 100]
