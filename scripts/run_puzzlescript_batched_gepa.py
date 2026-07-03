@@ -1546,7 +1546,30 @@ def _compact_trace_diagnostics(result: Mapping[str, Any]) -> str:
     return " ".join(parts) if len(parts) > 1 else ""
 
 
-def build_reflection_feedback(result: Mapping[str, Any], classification: str) -> str:
+def _mechanics_diagnostic_line(mechanics_signature: str) -> str:
+    """Return a short mechanics note that reinforces single-prompt abstraction.
+
+    Reflection examples are selected partly by mechanics signature so the LLM can
+    see varied failure modes. The signature is evidence for abstraction only: it
+    should help the proposer infer reusable preconditions, not create routed
+    prompt variants for the labeled family.
+    """
+    signature = mechanics_signature.strip()
+    if not signature or signature == "generic":
+        return ""
+    return (
+        f"Mechanics evidence for diagnosis only: {signature}. "
+        "Use it to infer abstract preconditions; do not route, bucket, or write "
+        "a specialized prompt for this mechanics family."
+    )
+
+
+def build_reflection_feedback(
+    result: Mapping[str, Any],
+    classification: str,
+    *,
+    mechanics_signature: str = "",
+) -> str:
     """Return targeted feedback for GEPA reflection.
 
     Raw search traces are useful but insufficient by themselves. The reflection
@@ -1615,17 +1638,32 @@ def build_reflection_feedback(result: Mapping[str, Any], classification: str) ->
         lines.append("Base raw feedback:\n" + baseline_feedback)
     if candidate_feedback:
         lines.append("Candidate raw feedback:\n" + candidate_feedback)
+    mechanics_line = _mechanics_diagnostic_line(mechanics_signature)
+    if mechanics_line and classification != "stable_or_improved":
+        lines.append(mechanics_line)
     diagnostics = _compact_trace_diagnostics(result)
     if diagnostics and classification != "stable_or_improved":
         lines.append(diagnostics)
     return "\n".join(lines)
 
 
-def build_comparison_payload(result: Mapping[str, Any], classification: str) -> dict[str, Any]:
+def build_comparison_payload(
+    result: Mapping[str, Any],
+    classification: str,
+    *,
+    mechanics_signature: str = "",
+) -> dict[str, Any]:
+    """Return compact scalar comparison metadata for a reflection record.
+
+    The mechanics signature is included as a diagnostic grouping label. It is not
+    an instruction to route the prompt, and the paired feedback text states that
+    explicitly so GEPA converts the label into one reusable rule.
+    """
     raw_score = float(result.get("score", 0.0))
     baseline_score = float(result.get("baseline_score", 0.0))
     return {
         "classification": classification,
+        "mechanics_signature": mechanics_signature or "generic",
         "candidate_solved": bool(result.get("solved", False)),
         "baseline_solved": bool(result.get("baseline_solved", False)),
         "candidate_score": raw_score,
@@ -2431,12 +2469,17 @@ class PuzzleScriptBatchedGEPAAdapter:
             task = trace["task"]
             result = trace["result"]
             classification = trace_classification(trace)
+            mechanics_signature = trace_mechanics_signature(trace)
             baseline_code = _read_optional_text(
                 result.get("baseline_heuristic_code_path"),
                 max_chars=DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
             )
             generated_code = trace.get("heuristic_code", "")
-            targeted_feedback = build_reflection_feedback(result, classification)
+            targeted_feedback = build_reflection_feedback(
+                result,
+                classification,
+                mechanics_signature=mechanics_signature,
+            )
             records.append(
                 {
                     "Inputs": {
@@ -2448,7 +2491,11 @@ class PuzzleScriptBatchedGEPAAdapter:
                             DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS,
                         ),
                     },
-                    "Comparison": build_comparison_payload(result, classification),
+                    "Comparison": build_comparison_payload(
+                        result,
+                        classification,
+                        mechanics_signature=mechanics_signature,
+                    ),
                     "Baseline Output": {
                         "heuristic_code": baseline_code,
                         "code_shape": heuristic_code_shape(baseline_code),

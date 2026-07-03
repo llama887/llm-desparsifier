@@ -726,6 +726,61 @@ def test_make_reflective_dataset_includes_regression_comparison(tmp_path: Path) 
     assert "return 1.0" in record["Baseline Output"]["heuristic_code"]
 
 
+def test_make_reflective_dataset_includes_mechanics_signature_as_diagnostic_only(
+    tmp_path: Path,
+) -> None:
+    base_code = tmp_path / "base.py"
+    base_code.write_text("def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0\n")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=object(),  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    eval_batch = SimpleNamespace(
+        trajectories=[
+            {
+                "task": {
+                    "game": "portal-alias-case",
+                    "level": 3,
+                    "budget": 100,
+                    "env_description": (
+                        "Objects: playeru, playerl, portal, crate\n"
+                        "Rules: [ portal | > playeru ] -> [ > playeru | portal ]"
+                    ),
+                },
+                "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 2.0\n",
+                "synthesis_error": None,
+                "result": {
+                    "feedback": "candidate exhausted search",
+                    "score": 0.0,
+                    "solved": False,
+                    "expanded": 100,
+                    "baseline_score": 0.75,
+                    "baseline_solved": True,
+                    "baseline_expanded": 12,
+                    "baseline_heuristic_code_path": str(base_code),
+                    "baseline_feedback": "base solved quickly",
+                },
+            }
+        ]
+    )
+
+    dataset = adapter.make_reflective_dataset(
+        candidate={},
+        eval_batch=eval_batch,
+        components_to_update=["heuristic_prompt"],
+    )
+
+    record = dataset["heuristic_prompt"][0]
+    assert record["Comparison"]["mechanics_signature"] == "player-alias+portal"
+    assert "Mechanics evidence for diagnosis only: player-alias+portal" in record["Feedback"]
+    assert "do not route" in record["Feedback"]
+    assert "abstract preconditions" in record["Feedback"]
+
+
 def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
     llm = _FakeLLM(
         "Addendum: keep mechanics-specific object names primary and use score only as a tie-breaker."
