@@ -2001,6 +2001,17 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert '--global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-4.0}}"' in smoke_launcher
 
 
+def test_gepa_validation_split_excludes_holdout_eval_jobs_from_metric() -> None:
+    runner = Path("scripts/run_puzzlescript_batched_gepa.py").read_text(encoding="utf-8")
+
+    assert 'parser.add_argument("--val-split", choices=("train", "dev"), default="dev")' in runner
+    task_split_block = runner[
+        runner.index("    train_jobs, _eval_jobs = load_env_grid(args.env_grid)") :
+        runner.index("    guard_level_selection = parse_guard_level_selection")
+    ]
+    assert "jobs=eval_jobs" not in task_split_block
+
+
 def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:
     launcher = Path("sbatch/evaluate_puzzlescript_search_array.s").read_text(encoding="utf-8")
 

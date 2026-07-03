@@ -3181,7 +3181,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     (gepa_run_dir / "prog_candidates").mkdir(exist_ok=True)
 
     evaluator = PuzzleScriptEvaluator(args.script_doctor)
-    train_jobs, eval_jobs = load_env_grid(args.env_grid)
+    train_jobs, _eval_jobs = load_env_grid(args.env_grid)
     all_train_tasks = build_level_tasks(
         evaluator=evaluator,
         jobs=train_jobs,
@@ -3199,13 +3199,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         val_tasks = [cast(PuzzleScriptLevelTask, task) for task in split_val_tasks]
     else:
         train_tasks = all_train_tasks
-        val_tasks = train_tasks if args.val_split == "train" else build_level_tasks(
-            evaluator=evaluator,
-            jobs=eval_jobs,
-            script_doctor=args.script_doctor,
-            levels_per_game=args.levels_per_game,
-            budget=max(1, args.max_expansions),
-        )
+        val_tasks = train_tasks
     guard_level_selection = parse_guard_level_selection(args.guard_levels)
     guard_tasks: list[PuzzleScriptLevelTask] = []
     if guard_level_selection:
@@ -3490,7 +3484,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional whitespace-separated sbatch args appended before the array script.",
     )
-    parser.add_argument("--val-split", choices=("train", "dev", "eval"), default="dev")
+    parser.add_argument("--val-split", choices=("train", "dev"), default="dev")
     parser.add_argument("--dev-fraction", type=float, default=DEFAULT_DEV_FRACTION)
     parser.add_argument(
         "--guard-levels",
