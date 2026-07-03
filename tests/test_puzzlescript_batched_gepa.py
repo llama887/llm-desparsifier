@@ -901,6 +901,60 @@ def test_base_prompt_evaluation_reuses_stored_baseline_outputs(tmp_path: Path) -
     assert (eval_dirs[0] / "baseline_reuse.json").exists()
 
 
+def test_seeded_prompt_evaluation_reuses_stored_baseline_outputs(tmp_path: Path) -> None:
+    seed_candidate = build_seed_candidate("Use exact LEGEND aliases before substring guesses.")
+    llm = _FakeLLM("def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=tmp_path,
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    adapter.set_baseline_outputs(
+        [
+            {
+                "task_id": 99,
+                "game": "seeded-game",
+                "level": 4,
+                "score": 0.5,
+                "solved": False,
+                "expanded": 34,
+                "generated": 45,
+                "solution_length": 0,
+                "partial_progress_score": 0.25,
+                "feedback": "seeded baseline",
+                "error": None,
+            }
+        ],
+        candidate=seed_candidate,
+    )
+    task = PuzzleScriptLevelTask(
+        task_id=0,
+        game="seeded-game",
+        level=4,
+        budget=100,
+        env_description="Win conditions: all crates on targets",
+        game_text_path=str(tmp_path / "game.txt"),
+    )
+
+    batch = adapter.evaluate(
+        batch=[task],
+        candidate=seed_candidate,
+        capture_traces=False,
+    )
+
+    assert llm.prompts == []
+    assert batch.outputs[0]["task_id"] == 0
+    assert batch.outputs[0]["score"] == 0.5
+    assert batch.outputs[0]["solved"] is False
+    assert batch.outputs[0]["baseline_solved"] is False
+    eval_dirs = list((tmp_path / "candidate_evals").glob("eval-*"))
+    assert len(eval_dirs) == 1
+    assert (eval_dirs[0] / "baseline_reuse.json").exists()
+
+
 def test_build_reflection_feedback_includes_trace_diagnostics_for_solved_regression() -> None:
     feedback = build_reflection_feedback(
         {

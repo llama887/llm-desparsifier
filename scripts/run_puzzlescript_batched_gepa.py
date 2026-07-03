@@ -1912,14 +1912,33 @@ class PuzzleScriptBatchedGEPAAdapter:
             else max(0.0, global_net_solve_loss_gate_penalty)
         )
         self.baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+        self.baseline_prompt_text: Optional[str] = None
         self.eval_counter = _initial_eval_counter(self.state_root / "candidate_evals")
 
-    def set_baseline_outputs(self, outputs: Sequence[Mapping[str, Any]]) -> None:
-        """Store base-prompt outcomes used to penalize solve regressions."""
+    def set_baseline_outputs(
+        self,
+        outputs: Sequence[Mapping[str, Any]],
+        *,
+        candidate: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """Store baseline outcomes and the exact prompt that produced them.
+
+        Standard runs use the canonical PuzzleScript contract as the baseline.
+        Seeded GEPA runs intentionally start from that contract plus an initial
+        addendum, so reuse must key off the exact seeded prompt rather than only
+        the canonical base text. This keeps repeated evaluations of the
+        baseline candidate deterministic and prevents LLM resampling noise from
+        appearing as prompt quality changes.
+        """
         self.baseline_by_key = {
             (str(row["game"]), int(row["level"])): dict(row)
             for row in outputs
         }
+        baseline_candidate = candidate or {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
+        self.baseline_prompt_text = baseline_candidate.get(
+            HEURISTIC_COMPONENT,
+            PUZZLESCRIPT_HEURISTIC_CONTRACT,
+        ).strip()
 
     def _attach_baseline_metadata(self, result: dict[str, Any]) -> None:
         baseline = self.baseline_by_key.get((str(result["game"]), int(result["level"])))
@@ -2080,11 +2099,11 @@ class PuzzleScriptBatchedGEPAAdapter:
     ) -> Optional[tuple[list[dict[str, Any]], list[float], Optional[list[dict[str, Any]]]]]:
         """Return stored base-prompt outputs for an exact base candidate.
 
-        The baseline pass already synthesized and searched the base prompt for
-        every train and validation task. Reusing those rows for later exact
-        base-prompt evaluations removes LLM resampling noise from the regression
-        metric while leaving all non-base candidate prompts on the normal
-        synthesis/search path.
+        The baseline pass already synthesized and searched the baseline prompt
+        for every train and validation task. Reusing those rows for later exact
+        baseline-prompt evaluations removes LLM resampling noise from the
+        regression metric while leaving all non-baseline candidate prompts on
+        the normal synthesis/search path.
         """
         if not self.baseline_by_key:
             return None
@@ -2133,7 +2152,7 @@ class PuzzleScriptBatchedGEPAAdapter:
                 {
                     "reused": True,
                     "n_outputs": len(outputs),
-                    "reason": "exact base prompt with stored baseline outputs",
+                    "reason": "exact baseline prompt with stored baseline outputs",
                 },
                 indent=2,
                 sort_keys=True,
@@ -2233,7 +2252,7 @@ class PuzzleScriptBatchedGEPAAdapter:
                 trajectories=violation_trajectories if capture_traces else None,
             )
 
-        if prompt_text.strip() == PUZZLESCRIPT_HEURISTIC_CONTRACT.strip():
+        if self.baseline_prompt_text is not None and prompt_text.strip() == self.baseline_prompt_text:
             reused = self._reuse_baseline_evaluation(
                 eval_dir=eval_dir,
                 batch=batch,
@@ -2242,7 +2261,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             if reused is not None:
                 reused_outputs, reused_scores, trajectories_or_none = reused
                 print(
-                    f"[adapter] reused baseline outputs for exact base prompt: "
+                    f"[adapter] reused baseline outputs for exact baseline prompt: "
                     f"{len(reused_outputs)} level(s)",
                     flush=True,
                 )
@@ -2646,7 +2665,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         capture_traces=False,
     )
     baseline_outputs = [dict(row) for row in baseline_batch.outputs]
-    adapter.set_baseline_outputs(baseline_outputs)
+    adapter.set_baseline_outputs(baseline_outputs, candidate=seed_candidate)
     baseline_score_mean = (
         sum(_result_float(row, "score") for row in baseline_outputs) / len(baseline_outputs)
         if baseline_outputs
