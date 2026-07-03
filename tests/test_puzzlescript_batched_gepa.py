@@ -674,7 +674,15 @@ def test_make_reflective_dataset_compacts_large_trace_payloads() -> None:
 
 def test_make_reflective_dataset_includes_regression_comparison(tmp_path: Path) -> None:
     base_code = tmp_path / "base.py"
-    base_code.write_text("def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0\n")
+    base_code.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    queue = [(0, 0)]\n"
+        "    visited = {(0, 0)}\n"
+        "    while queue:\n"
+        "        queue.pop(0)\n"
+        "    return 1.0\n",
+        encoding="utf-8",
+    )
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=object(),  # type: ignore[arg-type]
         state_root=Path("/tmp/gepa-state"),
@@ -692,7 +700,12 @@ def test_make_reflective_dataset_includes_regression_comparison(tmp_path: Path) 
                     "budget": 100,
                     "env_description": "rules",
                 },
-                "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 2.0\n",
+                "heuristic_code": (
+                    "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+                    "    if not ctx.get('object_positions'):\n"
+                    "        return float('inf')\n"
+                    "    return 1000.0\n"
+                ),
                 "synthesis_error": None,
                 "result": {
                     "feedback": "candidate exhausted search",
@@ -726,6 +739,12 @@ def test_make_reflective_dataset_includes_regression_comparison(tmp_path: Path) 
     assert "observable WINCONDITIONS" in record["Feedback"]
     assert "base solved quickly" in record["Baseline Output"]["feedback"]
     assert "return 1.0" in record["Baseline Output"]["heuristic_code"]
+    assert record["Baseline Output"]["code_shape"]["uses_reachability_search"] is True
+    assert record["Generated Outputs"]["code_shape"]["uses_nonfinite_return"] is True
+    assert record["Generated Outputs"]["code_shape"]["uses_large_penalty"] is True
+    assert "Code-shape contrast" in record["Feedback"]
+    assert "reachability" in record["Feedback"]
+    assert "non-finite or huge penalties" in record["Feedback"]
 
 
 def test_make_reflective_dataset_includes_mechanics_signature_as_diagnostic_only(

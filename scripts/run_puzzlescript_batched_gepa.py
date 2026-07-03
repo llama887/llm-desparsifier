@@ -1879,13 +1879,31 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
     mechanics-specific terms into generic role discovery or score-only fallback.
     """
     lowered = code.lower()
+    uses_large_penalty = bool(
+        re.search(r"\b(?:1_000_000|1000000|10000|5000|1000|500)(?:\.0)?\b", lowered)
+        or re.search(r"\b1e[5-9]\b", lowered)
+    )
     return {
         "uses_generic_role_helpers": "role_positions" in lowered or "role_keywords" in lowered,
         "uses_score_fallback": "score_normalized" in lowered,
         "uses_win_text": "win_conditions_text" in lowered,
         "uses_ascii_state": "ascii_state" in lowered,
-        "uses_large_penalty": any(
-            marker in lowered for marker in ("1e6", "1000.0", "5000.0", "1e5")
+        "uses_large_penalty": uses_large_penalty,
+        "uses_nonfinite_return": bool(
+            re.search(r"float\(\s*['\"]inf['\"]\s*\)", lowered)
+            or re.search(r"\bmath\.inf\b", lowered)
+            or re.search(r"\binf\b", lowered)
+        ),
+        "uses_reachability_search": any(
+            marker in lowered
+            for marker in (
+                "while queue",
+                "q_index",
+                "visited",
+                "bfs",
+                "dist = [[",
+                "reachable",
+            )
         ),
         "mentions_mechanics_terms": any(
             term in lowered
@@ -1905,6 +1923,38 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
             )
         ),
     }
+
+
+def _code_shape_diagnostic_line(
+    baseline_shape: Mapping[str, bool],
+    generated_shape: Mapping[str, bool],
+    classification: str,
+) -> str:
+    """Explain high-signal implementation contrasts for GEPA reflection.
+
+    The proposer already receives truncated code, but a compact contrast line
+    makes recurring search failures visible even when the raw code is long. This
+    is diagnostic feedback only; it does not route prompts or mutate scores.
+    """
+    if classification == "stable_or_improved":
+        return ""
+    parts: list[str] = []
+    if baseline_shape.get("uses_reachability_search") and not generated_shape.get(
+        "uses_reachability_search"
+    ):
+        parts.append(
+            "the base heuristic used reachability/BFS-style search, so do not replace "
+            "it with plain Manhattan/count terms when terrain, blockers, doors, water, "
+            "or collision layers affect legal paths"
+        )
+    if generated_shape.get("uses_nonfinite_return") or generated_shape.get("uses_large_penalty"):
+        parts.append(
+            "the candidate used non-finite or huge penalties; keep penalties finite and "
+            "low unless WINCONDITIONS and RULES prove an irreversible dead state"
+        )
+    if not parts:
+        return ""
+    return "Code-shape contrast: " + "; ".join(parts) + "."
 
 
 def _initial_eval_counter(candidate_eval_root: Path) -> int:
@@ -2464,11 +2514,20 @@ class PuzzleScriptBatchedGEPAAdapter:
                 max_chars=DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
             )
             generated_code = trace.get("heuristic_code", "")
+            baseline_shape = heuristic_code_shape(baseline_code)
+            generated_shape = heuristic_code_shape(generated_code)
             targeted_feedback = build_reflection_feedback(
                 result,
                 classification,
                 mechanics_signature=mechanics_signature,
             )
+            shape_feedback = _code_shape_diagnostic_line(
+                baseline_shape,
+                generated_shape,
+                classification,
+            )
+            if shape_feedback:
+                targeted_feedback = f"{targeted_feedback}\n{shape_feedback}"
             records.append(
                 {
                     "Inputs": {
@@ -2487,7 +2546,7 @@ class PuzzleScriptBatchedGEPAAdapter:
                     ),
                     "Baseline Output": {
                         "heuristic_code": baseline_code,
-                        "code_shape": heuristic_code_shape(baseline_code),
+                        "code_shape": baseline_shape,
                         "feedback": truncate_text(
                             str(result.get("baseline_feedback", "")),
                             DEFAULT_REFLECTION_FEEDBACK_CHARS,
@@ -2498,7 +2557,7 @@ class PuzzleScriptBatchedGEPAAdapter:
                             generated_code,
                             DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
                         ),
-                        "code_shape": heuristic_code_shape(generated_code),
+                        "code_shape": generated_shape,
                         "synthesis_error": trace.get("synthesis_error"),
                     },
                     "Feedback": truncate_text(
