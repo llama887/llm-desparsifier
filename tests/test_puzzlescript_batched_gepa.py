@@ -101,6 +101,21 @@ def heuristic_cost_to_go(ts, env_params, ctx):
     assert "imports are not allowed" in issue
 
 
+def test_validate_heuristic_code_rejects_non_finite_sentinels() -> None:
+    code = """
+def heuristic_cost_to_go(ts, env_params, ctx):
+    if ctx.get("is_winning"):
+        return 0.0
+    best = float("inf")
+    return best
+"""
+
+    issue = validate_heuristic_code(code)
+
+    assert issue is not None
+    assert "non-finite" in issue
+
+
 def test_assigned_tasks_uses_round_robin_partitioning() -> None:
     tasks = [{"task_id": idx} for idx in range(10)]
 

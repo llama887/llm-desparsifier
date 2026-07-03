@@ -5,6 +5,7 @@ for PuzzleScript where ctx is a plain dict and the LLM needs to access
 nested dicts (object_positions, etc.). This sanitizer validates:
   - Exactly one function named heuristic_cost_to_go(ts, env_params, ctx)
   - No imports, exec, eval, open, __builtins__, compile
+  - No non-finite constants or sentinels such as float("inf") or math.nan
   - Only math is available in the namespace
 """
 
@@ -19,6 +20,17 @@ _BANNED_NAMES = frozenset({
     "exec", "eval", "compile", "open", "__import__", "globals", "locals",
     "getattr", "setattr", "delattr", "breakpoint", "exit", "quit",
     "__builtins__", "os", "sys", "subprocess", "shutil",
+})
+_NONFINITE_FLOAT_STRINGS = frozenset({
+    "inf",
+    "+inf",
+    "-inf",
+    "infinity",
+    "+infinity",
+    "-infinity",
+    "nan",
+    "+nan",
+    "-nan",
 })
 
 
@@ -52,11 +64,35 @@ class _PuzzleScriptHeuristicValidator(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name) and node.func.id in _BANNED_NAMES:
             raise ValueError(f"'{node.func.id}' is not allowed")
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "float"
+            and len(node.args) == 1
+            and not node.keywords
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and node.args[0].value.strip().lower() in _NONFINITE_FLOAT_STRINGS
+        ):
+            raise ValueError("non-finite float sentinels are not allowed")
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
         if node.id in _BANNED_NAMES:
             raise ValueError(f"'{node.id}' is not allowed")
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "math"
+            and node.attr in {"inf", "nan"}
+        ):
+            raise ValueError("non-finite math constants are not allowed")
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, float) and not math.isfinite(node.value):
+            raise ValueError("non-finite numeric constants are not allowed")
         self.generic_visit(node)
 
 
