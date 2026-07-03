@@ -720,8 +720,9 @@ def test_make_reflective_dataset_includes_regression_comparison(tmp_path: Path) 
     assert "base prompt solved" in record["Feedback"]
     assert "candidate failed" in record["Feedback"]
     assert "general precondition" in record["Feedback"]
-    assert "Single-prompt abstraction" in record["Feedback"]
-    assert "do not write a named-game exception" in record["Feedback"]
+    assert "Generalization target" in record["Feedback"]
+    assert "prompt structure or categorization" in record["Feedback"]
+    assert "observable WINCONDITIONS" in record["Feedback"]
     assert "base solved quickly" in record["Baseline Output"]["feedback"]
     assert "return 1.0" in record["Baseline Output"]["heuristic_code"]
 
@@ -777,8 +778,10 @@ def test_make_reflective_dataset_includes_mechanics_signature_as_diagnostic_only
     record = dataset["heuristic_prompt"][0]
     assert record["Comparison"]["mechanics_signature"] == "player-alias+portal"
     assert "Mechanics evidence for diagnosis only: player-alias+portal" in record["Feedback"]
-    assert "do not route" in record["Feedback"]
+    assert "rule-derived conditions" in record["Feedback"]
+    assert "categories" in record["Feedback"]
     assert "abstract preconditions" in record["Feedback"]
+    assert "observable mechanics" in record["Feedback"]
 
 
 def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
@@ -815,7 +818,10 @@ def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
     assert "Do not rewrite the full base prompt" in llm.prompts[0]
     assert "Do not return the base prompt unchanged" in llm.prompts[0]
     assert "one human heuristic designer's reusable decision procedure" in llm.prompts[0]
-    assert "Do not propose prompt routing" in llm.prompts[0]
+    assert "train/validation performance" in llm.prompts[0]
+    assert "GEPA may" in llm.prompts[0]
+    assert "self-discover categories" in llm.prompts[0]
+    assert "runner will not implement buckets in code" in llm.prompts[0]
     assert "preconditioned reasoning" in llm.prompts[0]
     assert "missing goal objects" in llm.prompts[0]
     assert "REGRESSION" in llm.prompts[0]
@@ -972,11 +978,12 @@ def test_custom_proposer_rejects_dangling_addendum_tail() -> None:
     assert result["heuristic_prompt"] == current_prompt
 
 
-def test_custom_proposer_rejects_prompt_routing_addendum() -> None:
+def test_custom_proposer_allows_rule_derived_conditional_addendum() -> None:
     current_prompt = PUZZLESCRIPT_HEURISTIC_CONTRACT
     llm = _FakeLLM(
-        "Use prompt routing: if game_title contains Sokoban, use a box-target prompt; "
-        "otherwise use a separate prompt for ice games."
+        "Use conditional prompt routing: if WINCONDITIONS and RULES prove stable "
+        "pushable objects with monotonic target progress, emphasize box-target "
+        "matching; otherwise keep interaction distance and score progress secondary."
     )
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=llm,  # type: ignore[arg-type]
@@ -993,7 +1000,8 @@ def test_custom_proposer_rejects_prompt_routing_addendum() -> None:
         components_to_update=["heuristic_prompt"],
     )
 
-    assert result["heuristic_prompt"] == current_prompt
+    assert result["heuristic_prompt"] != current_prompt
+    assert "conditional prompt routing" in result["heuristic_prompt"]
 
 
 def test_base_prompt_evaluation_reuses_stored_baseline_outputs(tmp_path: Path) -> None:

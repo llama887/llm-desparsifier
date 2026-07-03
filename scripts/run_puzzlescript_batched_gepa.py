@@ -1550,17 +1550,18 @@ def _mechanics_diagnostic_line(mechanics_signature: str) -> str:
     """Return a short mechanics note that reinforces single-prompt abstraction.
 
     Reflection examples are selected partly by mechanics signature so the LLM can
-    see varied failure modes. The signature is evidence for abstraction only: it
-    should help the proposer infer reusable preconditions, not create routed
-    prompt variants for the labeled family.
+    see varied failure modes. The signature is evidence for abstraction, not a
+    runner-side bucket assignment; GEPA may still discover categories or routing
+    inside the prompt when those categories are grounded in observed game rules.
     """
     signature = mechanics_signature.strip()
     if not signature or signature == "generic":
         return ""
     return (
         f"Mechanics evidence for diagnosis only: {signature}. "
-        "Use it to infer abstract preconditions; do not route, bucket, or write "
-        "a specialized prompt for this mechanics family."
+        "Use it to infer generalizable rule-derived conditions, categories, or "
+        "abstract preconditions if helpful; ground them in observable mechanics "
+        "rather than memorized game titles."
     )
 
 
@@ -1586,7 +1587,7 @@ def build_reflection_feedback(
                 _result_summary("Base result", result, baseline=True),
                 _result_summary("Candidate result", result),
                 "Reflection target: preserve the base behavior by identifying the invalid assumption that caused the regression and converting it into a general precondition.",
-                "Single-prompt abstraction: do not write a named-game exception or route to a bucket; phrase the fix as one reusable rule about when target counts, distances, deadlocks, missing objects, or score fallback are justified.",
+                "Generalization target: avoid named-game memorization; any prompt structure or categorization should be grounded in observable WINCONDITIONS, RULES, LEGEND aliases, COLLISIONLAYERS, or state properties.",
             ]
         )
     elif classification == "new_solve":
@@ -1655,9 +1656,9 @@ def build_comparison_payload(
 ) -> dict[str, Any]:
     """Return compact scalar comparison metadata for a reflection record.
 
-    The mechanics signature is included as a diagnostic grouping label. It is not
-    an instruction to route the prompt, and the paired feedback text states that
-    explicitly so GEPA converts the label into one reusable rule.
+    The mechanics signature is included as a diagnostic grouping label. It does
+    not route anything in code; it gives GEPA evidence it may turn into
+    self-discovered prompt categories when those categories generalize.
     """
     raw_score = float(result.get("score", 0.0))
     baseline_score = float(result.get("baseline_score", 0.0))
@@ -1788,8 +1789,6 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
         return ""
     if not cleaned:
         return ""
-    if _proposed_addendum_scope_issue(cleaned) is not None:
-        return ""
     full_prompt_markers = (
         "You are writing a heuristic function",
         "Output exactly Python code defining",
@@ -1802,38 +1801,6 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
     if _has_dangling_prompt_tail(cleaned):
         return ""
     return cleaned
-
-
-def _proposed_addendum_scope_issue(text: str) -> str | None:
-    """Return why an addendum violates the single-prompt experiment contract.
-
-    The optimizer may use mechanic-stratified evidence, but the artifact being
-    optimized must remain one general prompt. This guard rejects proposal shapes
-    that would turn the addendum into prompt routing, buckets, or title-specific
-    dispatch while still allowing abstract mechanics preconditions.
-    """
-    lowered = text.lower()
-    routing_markers = (
-        "separate prompt",
-        "multiple prompts",
-        "prompt routing",
-        "route to",
-        "bucket-specific",
-        "bucket specific",
-        "prompt bucket",
-        "mechanic bucket",
-        "mechanics bucket",
-        "game-specific prompt",
-        "game specific prompt",
-        "if game_title",
-        "if game title",
-        "ctx.get('game_title')",
-        'ctx.get("game_title")',
-    )
-    for marker in routing_markers:
-        if marker in lowered:
-            return "addendum introduces prompt routing or title-specific dispatch"
-    return None
 
 
 def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> str:
@@ -2550,7 +2517,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             max_chars = DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
             reflection_prompt = f"""You are revising one global prompt used to generate PuzzleScript A* heuristics.
 
-The research goal is a single general prompt, not per-game routing or memorized examples.
+The research goal is one general prompt, selected by GEPA-visible train/validation performance, not a prompt tuned on heldout data.
 The desired artifact should behave like one human heuristic designer's reusable decision procedure for unseen games.
 The existing base prompt is already strong. Propose only a short addendum that will be attached after it.
 
@@ -2558,9 +2525,13 @@ Hard requirements:
 - Do not rewrite the full base prompt. Output only the short addendum text.
 - Do not return the base prompt unchanged. The addendum must test one specific,
   conservative, generalizable hypothesis from the feedback.
-- Do not propose prompt routing, buckets, multiple modes, title-specific dispatch,
-  or separate prompts for mechanics families. Stratified evidence is only for
-  learning one reusable prompt.
+- Choose whatever addendum structure the comparison evidence supports. GEPA may
+  self-discover categories, conditionals, or routing inside the prompt, but the
+  runner will not implement buckets in code and the addendum should not force a
+  category scheme without evidence.
+- Avoid memorized title/level exceptions unless the feedback clearly shows they
+  generalize through observable mechanics. The goal is validation generalization,
+  not fitting a few named cases.
 - Phrase the addendum as preconditioned reasoning: before using target counts,
   distances, deadlocks, missing-object penalties, or score fallback, state what
   the heuristic writer must verify from WINCONDITIONS, RULES, LEGEND,
