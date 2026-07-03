@@ -1737,6 +1737,28 @@ def build_seed_candidate(initial_addendum: str = "") -> dict[str, str]:
     }
 
 
+def read_initial_gepa_addendum(inline_addendum: str, addendum_file: Path | None) -> str:
+    """Resolve the optional seed addendum from either CLI text or a file.
+
+    SLURM's ``--export`` option splits environment payloads on commas, which is
+    exactly the punctuation used by useful prompt-routing addenda. Reading the
+    seed text from a file keeps the optimization contract unchanged while making
+    launch-time transport robust to commas, conditionals, and multi-sentence
+    guidance.
+    """
+    inline = inline_addendum.strip()
+    if addendum_file is None:
+        return inline
+    resolved_path = addendum_file.expanduser()
+    file_text = resolved_path.read_text(encoding="utf-8").strip()
+    if inline and file_text:
+        raise ValueError(
+            "Specify either inline --initial-gepa-addendum or "
+            "--initial-gepa-addendum-file, not both."
+        )
+    return file_text or inline
+
+
 def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
     cleaned = strip_outer_markdown_fences(text).strip()
     cleaned = re.sub(
@@ -2715,13 +2737,17 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         if args.max_metric_calls > 0
         else len(val_tasks) + args.max_gepa_iterations * len(train_tasks) * 2
     )
-    seed_candidate = build_seed_candidate(args.initial_gepa_addendum)
+    initial_gepa_addendum = read_initial_gepa_addendum(
+        args.initial_gepa_addendum,
+        args.initial_gepa_addendum_file,
+    )
+    seed_candidate = build_seed_candidate(initial_gepa_addendum)
     baseline_tasks = [
         cast(PuzzleScriptLevelTask, task)
         for task in reassign_task_ids(unique_tasks_by_key([*train_tasks, *val_tasks]))
     ]
     scoring_baseline_outputs: Optional[list[dict[str, Any]]] = None
-    if args.initial_gepa_addendum.strip():
+    if initial_gepa_addendum:
         base_candidate = {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
         print(
             "[gepa] evaluating original base prompt for seeded-run scoring: "
@@ -2747,7 +2773,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         f"partial_progress_weight={args.partial_progress_weight} "
         f"global_lost_solve_gate_penalty={args.global_lost_solve_gate_penalty} "
         f"global_net_solve_loss_gate_penalty={args.global_net_solve_loss_gate_penalty} "
-        f"initial_gepa_addendum_chars={len(args.initial_gepa_addendum.strip())}",
+        f"initial_gepa_addendum_chars={len(initial_gepa_addendum)}",
         flush=True,
     )
     baseline_batch = adapter.evaluate(
@@ -2950,6 +2976,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional initial GEPA addendum attached to the base PuzzleScript "
             "heuristic prompt before optimization starts."
+        ),
+    )
+    parser.add_argument(
+        "--initial-gepa-addendum-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path containing the initial GEPA addendum. Prefer this "
+            "for SLURM launches because --export splits comma-heavy text."
         ),
     )
     parser.add_argument("--seed", type=int, default=0)

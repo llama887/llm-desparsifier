@@ -38,6 +38,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     local_search_fallback_workers,
     merge_validation_guard_tasks,
     parse_guard_level_selection,
+    read_initial_gepa_addendum,
     select_reflection_traces,
     split_train_dev_jobs,
     strip_outer_markdown_fences,
@@ -1002,6 +1003,31 @@ def test_custom_proposer_allows_rule_derived_conditional_addendum() -> None:
 
     assert result["heuristic_prompt"] != current_prompt
     assert "conditional prompt routing" in result["heuristic_prompt"]
+
+
+def test_initial_addendum_file_preserves_prompt_routing_text(tmp_path: Path) -> None:
+    addendum = (
+        "Let the heuristic design use whatever prompt-level structure the game text supports. "
+        "If categories, conditionals, or routing are useful, define them from observable "
+        "WINCONDITIONS, RULES, LEGEND aliases, COLLISIONLAYERS, and state properties."
+    )
+    addendum_path = tmp_path / "seed_addendum.txt"
+    addendum_path.write_text(addendum, encoding="utf-8")
+
+    resolved = read_initial_gepa_addendum("", addendum_path)
+    prompt = build_seed_candidate(resolved)["heuristic_prompt"]
+
+    assert resolved == addendum
+    assert "If categories, conditionals, or routing are useful" in prompt
+    assert "COLLISIONLAYERS, and state properties" in prompt
+
+
+def test_initial_addendum_rejects_inline_and_file(tmp_path: Path) -> None:
+    addendum_path = tmp_path / "seed_addendum.txt"
+    addendum_path.write_text("Use score_normalized only as a tie-breaker.", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="either inline"):
+        read_initial_gepa_addendum("Inline addendum.", addendum_path)
 
 
 def test_base_prompt_evaluation_reuses_stored_baseline_outputs(tmp_path: Path) -> None:

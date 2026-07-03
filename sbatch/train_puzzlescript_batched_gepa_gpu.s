@@ -198,12 +198,17 @@ PY
 fi
 
 SEARCH_ARRAY_SCRIPT="${SEARCH_ARRAY_SCRIPT:-sbatch/evaluate_puzzlescript_search_array.s}"
+INITIAL_GEPA_ADDENDUM_FILE_ARG=()
+if [ -n "${INITIAL_GEPA_ADDENDUM_FILE:-}" ]; then
+    INITIAL_GEPA_ADDENDUM_FILE_ARG=(--initial-gepa-addendum-file "$INITIAL_GEPA_ADDENDUM_FILE")
+fi
 
 echo "[run] state_root=$RUN_STATE_ROOT"
 echo "[run] model=$LOCAL_LLM_MODEL base_url=$OPENAI_BASE_URL"
 echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-16}"
 echo "[run] search_extra_sbatch_args=${SEARCH_EXTRA_SBATCH_ARGS:-}"
 echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
+echo "[run] initial_gepa_addendum_file=${INITIAL_GEPA_ADDENDUM_FILE:-}"
 
 "$SD_PATH/.venv/bin/python" -u scripts/run_puzzlescript_batched_gepa.py \
     --env-grid "${ENV_GRID:-configs/gepa_puzzlescript_envs.yaml}" \
@@ -243,6 +248,7 @@ echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
     --global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}" \
     --reflection-minibatch-size "${REFLECTION_MINIBATCH_SIZE:-0}" \
     --initial-gepa-addendum "${INITIAL_GEPA_ADDENDUM:-}" \
+    "${INITIAL_GEPA_ADDENDUM_FILE_ARG[@]}" \
     --seed "${GEPA_SEED:-0}"
 
 if [ "${RUN_HOLDOUT_COMPARE:-1}" = "1" ]; then
