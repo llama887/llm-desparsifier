@@ -937,6 +937,95 @@ def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
     assert "REGRESSION" in llm.prompts[0]
 
 
+def test_custom_proposer_includes_current_addendum_when_revising() -> None:
+    current_addendum = (
+        "For persistent failures, inspect rules for a mechanics-grounded progress "
+        "signal before falling back to score."
+    )
+    current_prompt = build_seed_candidate(current_addendum)["heuristic_prompt"]
+    llm = _FakeLLM(
+        "Keep the mechanics-grounded progress signal, but require rule-grounded "
+        "preconditions before adding new terms."
+    )
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "lost_baseline_solve"},
+                    "Feedback": "REGRESSION: base prompt solved but candidate failed.",
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "Keep the mechanics-grounded progress signal" in result["heuristic_prompt"]
+    assert "Current addendum being revised" in llm.prompts[0]
+    assert current_addendum in llm.prompts[0]
+    assert "Output a replacement addendum" in llm.prompts[0]
+    assert "preserve the useful part" in llm.prompts[0]
+
+
+def test_custom_proposer_fallback_preserves_current_addendum_when_repairing_errors() -> None:
+    current_addendum = (
+        "For persistent failures, test exactly one conservative prompt-level "
+        "exploration hypothesis: before falling back to score alone, inspect "
+        "WINCONDITIONS, RULES, LEGEND aliases, COLLISIONLAYERS, and object counts "
+        "for a mechanics-grounded progress signal such as object-goal matching, "
+        "player-to-interaction reachability, blocker or terrain distance, staged "
+        "transformation progress, or score_normalized as a small tie-breaker. "
+        "Use the signal only when its observable precondition is present, keep it "
+        "finite/nonnegative, and otherwise preserve the base prompt behavior."
+    )
+    current_prompt = build_seed_candidate(current_addendum)["heuristic_prompt"]
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {
+                        "classification": "lost_baseline_solve",
+                        "candidate_error": True,
+                    },
+                    "Feedback": (
+                        "REGRESSION: base prompt solved but candidate failed. "
+                        "Heuristic validation failed before search: imports are not allowed."
+                    ),
+                    "Generated Outputs": {"synthesis_error": "imports are not allowed"},
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    revised_prompt = result["heuristic_prompt"]
+    assert "mechanics-grounded progress signal" in revised_prompt
+    assert "No import statements" in revised_prompt
+    assert len(revised_prompt.split(GEPA_ADDENDUM_HEADER, 1)[1].strip()) <= (
+        DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+    )
+
+
 def test_custom_proposer_extracts_addendum_from_full_prompt_output() -> None:
     llm = _FakeLLM(
         PUZZLESCRIPT_HEURISTIC_CONTRACT

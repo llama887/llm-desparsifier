@@ -80,7 +80,7 @@ DEFAULT_SOLVED_REGRESSION_SCORE_MARGIN = 0.01
 DEFAULT_SOLVED_REGRESSION_EXPANSION_MARGIN = 100.0
 DEFAULT_SOLVED_REGRESSION_EXPANSION_RATIO = 1.2
 DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4200
-DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 900
+DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 1200
 DEFAULT_REFLECTION_DATASET_CHARS = 24000
 DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 300.0
 DEFAULT_LLM_TEMPERATURE = 0.0
@@ -1801,6 +1801,19 @@ def _strip_gepa_addendum(prompt_text: str) -> str:
     return prompt_text.rstrip()
 
 
+def _current_gepa_addendum(prompt_text: str) -> str:
+    """Return the current GEPA addendum without the stable base prompt.
+
+    The custom proposer generates a replacement addendum. Exposing the current
+    addendum keeps GEPA's search over one accumulating prompt instead of making
+    each repair rediscover or discard the previous prompt-level insight.
+    """
+    marker = GEPA_ADDENDUM_HEADER
+    if marker not in prompt_text:
+        return ""
+    return prompt_text.split(marker, 1)[1].strip()
+
+
 def _compose_prompt_with_addendum(base_prompt: str, addendum: str) -> str:
     """Attach one short GEPA addendum while keeping the base prompt unchanged."""
     return f"{_strip_gepa_addendum(base_prompt)}\n\n{GEPA_ADDENDUM_HEADER}\n{addendum.strip()}"
@@ -1919,6 +1932,34 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
     if _has_dangling_prompt_tail(cleaned):
         return ""
     return cleaned
+
+
+def _merge_current_addendum_with_fallback(
+    current_addendum: str,
+    fallback_addendum: str,
+    *,
+    max_chars: int,
+) -> str:
+    """Return a fallback repair that preserves the current prompt insight when possible.
+
+    GEPA revisions should move one prompt forward. If the proposer no-ops after a
+    promising addendum, a safety fallback should usually tighten that addendum
+    rather than erase it. This merge is purely prompt text composition; it does
+    not route games or select candidate behavior outside GEPA.
+    """
+    fallback = _clean_proposed_addendum(fallback_addendum, max_chars=max_chars)
+    if not fallback:
+        return ""
+    current = _clean_proposed_addendum(current_addendum, max_chars=max_chars)
+    if not current:
+        return fallback
+    if fallback in current:
+        return current
+    if current in fallback:
+        return fallback
+    combined = f"{current} {fallback}"
+    cleaned = _clean_proposed_addendum(combined, max_chars=max_chars)
+    return cleaned or fallback
 
 
 def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> str:
@@ -2920,6 +2961,7 @@ class PuzzleScriptBatchedGEPAAdapter:
         for component in components_to_update:
             current_prompt = candidate[component]
             base_prompt = _strip_gepa_addendum(current_prompt)
+            current_addendum = _current_gepa_addendum(current_prompt)
             records = reflective_dataset.get(component, [])
             feedback_payload = truncate_text(
                 json.dumps(records, indent=2, sort_keys=True, default=str),
@@ -2930,10 +2972,13 @@ class PuzzleScriptBatchedGEPAAdapter:
 
 The research goal is one general prompt, selected by GEPA-visible train/validation performance, not a prompt tuned on heldout data.
 The desired artifact should behave like one human heuristic designer's reusable decision procedure for unseen games.
-The existing base prompt is already strong. Propose only a short addendum that will be attached after it.
+The existing base prompt is already strong. Propose only a short replacement addendum that will be attached after it.
 
 Hard requirements:
 - Do not rewrite the full base prompt. Output only the short addendum text.
+- Output a replacement addendum for the current addendum. If the current
+  addendum produced useful new solves and the feedback asks for safety repairs,
+  preserve the useful part while tightening its preconditions.
 - Do not return the base prompt unchanged. The addendum must test one specific,
   conservative, generalizable hypothesis from the feedback.
 - Choose whatever addendum structure the comparison evidence supports. GEPA may
@@ -2982,6 +3027,9 @@ Hard requirements:
 Base prompt that will remain unchanged:
 {base_prompt}
 
+Current addendum being revised:
+{current_addendum or "<none>"}
+
 Comparison-focused feedback:
 {feedback_payload}
 """
@@ -2993,11 +3041,17 @@ Comparison-focused feedback:
             if revised_prompt.strip() == current_prompt.strip():
                 fallback = _fallback_addendum_from_feedback(records)
                 if fallback:
-                    print(
-                        "[proposer] using conservative fallback addendum after no-op proposal",
-                        flush=True,
+                    merged_fallback = _merge_current_addendum_with_fallback(
+                        current_addendum,
+                        fallback,
+                        max_chars=max_chars,
                     )
-                    revised_prompt = _compose_prompt_with_addendum(base_prompt, fallback)
+                    if merged_fallback:
+                        print(
+                            "[proposer] using conservative fallback addendum after no-op proposal",
+                            flush=True,
+                        )
+                        revised_prompt = _compose_prompt_with_addendum(base_prompt, merged_fallback)
             new_texts[component] = revised_prompt
         return new_texts
 
