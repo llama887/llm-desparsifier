@@ -3287,6 +3287,20 @@ class PuzzleScriptBatchedGEPAAdapter:
         ] = {}
         self.eval_counter = _initial_eval_counter(self.state_root / "candidate_evals")
 
+    def set_scoring_baseline_outputs(self, outputs: Sequence[Mapping[str, Any]]) -> None:
+        """Store base-prompt outputs used for candidate scoring only.
+
+        Seeded runs evaluate the seeded prompt once before it becomes the
+        deterministic reuse baseline. Loading the original base-prompt scoring
+        rows before that evaluation keeps the first seed artifact and any exact
+        in-run cache entry base-relative instead of raw-score calibrated.
+        """
+
+        self.baseline_by_key = {
+            (str(row["game"]), int(row["level"])): dict(row)
+            for row in outputs
+        }
+
     def set_baseline_outputs(
         self,
         outputs: Sequence[Mapping[str, Any]],
@@ -3311,10 +3325,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             for row in outputs
         }
         scoring_rows = outputs if scoring_outputs is None else scoring_outputs
-        self.baseline_by_key = {
-            (str(row["game"]), int(row["level"])): dict(row)
-            for row in scoring_rows
-        }
+        self.set_scoring_baseline_outputs(scoring_rows)
         baseline_candidate = candidate or {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
         self.baseline_prompt_text = baseline_candidate.get(
             HEURISTIC_COMPONENT,
@@ -4247,6 +4258,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
             json.dumps(scoring_baseline_outputs, indent=2, sort_keys=True, default=str) + "\n",
             encoding="utf-8",
         )
+        adapter.set_scoring_baseline_outputs(scoring_baseline_outputs)
     print(
         "[gepa] evaluating seed prompt baseline for deterministic reuse: "
         f"tasks={len(baseline_tasks)} lost_solve_penalty={args.lost_solve_penalty} "

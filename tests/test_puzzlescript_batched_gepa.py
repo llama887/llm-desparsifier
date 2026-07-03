@@ -2366,6 +2366,100 @@ def test_seeded_prompt_reuse_can_score_against_original_base_outputs(tmp_path: P
     assert batch.scores[0] < -5.0
 
 
+def test_candidate_evaluation_can_preload_scoring_baseline_before_reuse_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed_candidate = build_seed_candidate("Use exact LEGEND aliases before substring guesses.")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=_FakeLLM(""),
+        state_root=tmp_path,
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+        lost_solve_penalty=5.0,
+        score_delta_weight=1.0,
+        score_delta_clip=1.0,
+    )
+    task = PuzzleScriptLevelTask(
+        task_id=0,
+        game="seeded-game",
+        level=4,
+        budget=100,
+        env_description="Win conditions: all crates on targets",
+        game_text_path=str(tmp_path / "game.txt"),
+    )
+    code_path = tmp_path / "seeded_heuristic.py"
+    code_path.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0\n",
+        encoding="utf-8",
+    )
+
+    adapter.set_scoring_baseline_outputs(
+        [
+            {
+                "task_id": 11,
+                "game": "seeded-game",
+                "level": 4,
+                "score": 0.9,
+                "solved": True,
+                "expanded": 12,
+                "generated": 20,
+                "solution_length": 6,
+                "partial_progress_score": 1.0,
+                "feedback": "original base solved",
+                "error": None,
+            }
+        ]
+    )
+
+    def fake_synthesize_batch(**_kwargs: object) -> list[dict[str, object]]:
+        return [
+            {
+                "task_id": 0,
+                "game": "seeded-game",
+                "level": 4,
+                "budget": 100,
+                "env_description": task.env_description,
+                "game_text_path": task.game_text_path,
+                "heuristic_code_path": str(code_path),
+                "synthesis_error": None,
+            }
+        ]
+
+    def fake_run_search(**_kwargs: object) -> list[dict[str, object]]:
+        return [
+            {
+                "task_id": 0,
+                "game": "seeded-game",
+                "level": 4,
+                "score": 0.5,
+                "solved": False,
+                "expanded": 34,
+                "generated": 45,
+                "solution_length": 0,
+                "partial_progress_score": 0.25,
+                "feedback": "seeded baseline",
+                "error": None,
+                "heuristic_code_path": str(code_path),
+            }
+        ]
+
+    monkeypatch.setattr(adapter, "_synthesize_batch", fake_synthesize_batch)
+    monkeypatch.setattr(adapter, "_run_search", fake_run_search)
+
+    batch = adapter.evaluate(batch=[task], candidate=seed_candidate, capture_traces=False)
+
+    assert batch.outputs[0]["baseline_solved"] is True
+    assert batch.outputs[0]["baseline_score"] == pytest.approx(0.9)
+    assert batch.scores[0] < -5.0
+    eval_dirs = list((tmp_path / "candidate_evals").glob("eval-*"))
+    assert len(eval_dirs) == 1
+    scored = (eval_dirs[0] / "scored_results.json").read_text(encoding="utf-8")
+    assert "baseline_solved" in scored
+
+
 def test_nonbaseline_candidate_evaluation_reuses_exact_candidate_task_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
