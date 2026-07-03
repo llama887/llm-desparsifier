@@ -4027,9 +4027,10 @@ Hard requirements:
   progress, staged progress, stable roles, legal interaction distance, or
   provable irreversibility.
 - Prioritize preventing lost base solves over small expansion-count improvements,
-  but treat repeated solved-efficiency regressions as evidence to simplify,
-  soften, or precondition expensive heuristic terms when solve outcomes are
-  preserved.
+  but treat repeated solved-efficiency regressions as evidence to inspect which
+  ordering signal changed: preserve base passability/reachability, matching, or
+  player-interaction terms when the candidate omitted them, and only simplify or
+  soften expensive terms that the candidate added or over-weighted.
 - Treat a candidate that loses base-solved levels as evidence to restore or
   strengthen the base mechanics-reading rule, not as evidence to add broader
   deadlock or fallback heuristics.

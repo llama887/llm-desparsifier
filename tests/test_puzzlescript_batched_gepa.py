@@ -1222,6 +1222,8 @@ def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
     assert "Prompt-internal if-statements" in llm.prompts[0]
     assert "runner will not implement buckets in code" in llm.prompts[0]
     assert "repeated solved-efficiency regressions" in llm.prompts[0]
+    assert "preserve base passability/reachability" in llm.prompts[0]
+    assert "candidate added or over-weighted" in llm.prompts[0]
     assert "preconditioned reasoning" in llm.prompts[0]
     assert "missing goal objects" in llm.prompts[0]
     assert "REGRESSION" in llm.prompts[0]
