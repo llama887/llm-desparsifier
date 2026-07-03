@@ -1027,6 +1027,60 @@ def test_custom_proposer_fallback_preserves_current_addendum_when_repairing_erro
     )
 
 
+def test_custom_proposer_compacts_code_repair_to_preserve_long_addendum() -> None:
+    current_addendum = (
+        "Build one compact causal sketch from WINCONDITIONS, RULES, LEGEND "
+        "aliases/composites, COLLISIONLAYERS, and the initial state, then choose "
+        "a rule-grounded regime inside the same prompt. For stable pushable "
+        "objects with monotonic target/exit progress and no creation/respawn "
+        "aliases, use direct object-target matching, movement distance, and only "
+        "provable deadlocks. If rules can transform, create, destroy, swap, pull, "
+        "teleport, respawn, or hide win-required objects behind aliases/composites, "
+        "avoid huge missing-object penalties unless no rule or alias can recreate "
+        "the object; use finite interaction distance, count progress, and "
+        "score_normalized as low-weight fallback. Use generic keyword roles only "
+        "when WINCONDITIONS or RULES support that role. Use legal "
+        "reachability/frontier distances only when terrain, gates, one-way effects, "
+        "beams, gravity, or blockers make Manhattan distance misleading."
+    )
+    current_prompt = build_seed_candidate(current_addendum)["heuristic_prompt"]
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {
+                        "classification": "lost_baseline_solve",
+                        "candidate_error": True,
+                    },
+                    "Feedback": (
+                        "REGRESSION: base prompt solved but candidate failed. "
+                        "Heuristic validation failed before search: imports are not allowed."
+                    ),
+                    "Generated Outputs": {"synthesis_error": "imports are not allowed"},
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    revised_addendum = result["heuristic_prompt"].split(GEPA_ADDENDUM_HEADER, 1)[1].strip()
+    assert "compact causal sketch" in revised_addendum
+    assert "no imports" in revised_addendum
+    assert "non-finite" in revised_addendum
+    assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+
+
 def test_custom_proposer_extracts_addendum_from_full_prompt_output() -> None:
     llm = _FakeLLM(
         PUZZLESCRIPT_HEURISTIC_CONTRACT

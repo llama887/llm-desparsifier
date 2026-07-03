@@ -1941,6 +1941,27 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
     return cleaned
 
 
+def _compact_code_contract_fallback(fallback_addendum: str) -> str:
+    """Return a short code-contract repair suitable for long prompt addenda.
+
+    Some useful GEPA addenda are already close to the addendum budget. If a
+    code-error repair cannot fit in full, a compact suffix preserves the current
+    mechanics insight while still communicating the concrete validation issue.
+    """
+    lowered = fallback_addendum.lower()
+    if "no import" not in lowered:
+        return ""
+    if "non-finite" not in lowered and "collections.deque" not in lowered:
+        return ""
+    return (
+        "Preserve the current mechanics guidance, but enforce code safety: no "
+        "imports, decorators, imported helpers, file access, external modules, "
+        "collections.deque, float('inf'), math.inf, nan, or other non-finite "
+        "returns; use bounded finite values and local lists, indexes, dicts, sets, "
+        "and loops."
+    )
+
+
 def _merge_current_addendum_with_fallback(
     current_addendum: str,
     fallback_addendum: str,
@@ -1966,7 +1987,20 @@ def _merge_current_addendum_with_fallback(
         return fallback
     combined = f"{current} {fallback}"
     cleaned = _clean_proposed_addendum(combined, max_chars=max_chars)
-    return cleaned or fallback
+    if cleaned:
+        return cleaned
+    compact_fallback = _compact_code_contract_fallback(fallback)
+    if compact_fallback:
+        compact = _clean_proposed_addendum(compact_fallback, max_chars=max_chars)
+        if compact:
+            compact_combined = f"{current} {compact}"
+            compact_cleaned = _clean_proposed_addendum(
+                compact_combined,
+                max_chars=max_chars,
+            )
+            if compact_cleaned:
+                return compact_cleaned
+    return fallback
 
 
 def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> str:
