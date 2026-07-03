@@ -1280,6 +1280,43 @@ def test_custom_proposer_uses_reachability_overfit_fallback_for_noop_output() ->
     assert "player-only" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_preserves_new_solve_when_efficiency_feedback_is_mixed() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "new_solve"},
+                    "Feedback": "POSITIVE EXAMPLE: candidate solved while base failed.",
+                },
+                {
+                    "Comparison": {"classification": "solved_regression"},
+                    "Feedback": (
+                        "EFFICIENCY REGRESSION: both prompts solved this level, "
+                        "but candidate was materially worse."
+                    ),
+                },
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
+    assert "new-solve" in result["heuristic_prompt"]
+    assert "expensive tie-breakers" in result["heuristic_prompt"]
+    assert "score-only fallback" in result["heuristic_prompt"]
+
+
 def test_custom_proposer_uses_code_contract_fallback_for_candidate_errors() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
