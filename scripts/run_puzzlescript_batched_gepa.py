@@ -328,6 +328,27 @@ def _is_high_headroom_common_solve(
     return baseline_expanded is not None and baseline_expanded >= max(0.0, threshold)
 
 
+def _common_solve_efficiency_headroom_scale(
+    row: Mapping[str, Any],
+    *,
+    threshold: float = DEFAULT_EFFICIENCY_HEADROOM_EXPANSIONS,
+) -> float:
+    """Return the scalar weight for paired expansion deltas.
+
+    Expansion ratios from tiny base searches are noisy and have low absolute
+    payoff. Scale the common-solve efficiency term by the amount of base-search
+    headroom so GEPA prefers prompt edits that reduce expensive solved searches
+    while still leaving a small signal for cheap levels.
+    """
+    if _common_solve_efficiency_log2_delta(row) is None:
+        return 0.0
+    baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    if baseline_expanded is None or baseline_expanded <= 0:
+        return 0.0
+    positive_threshold = max(1.0, threshold)
+    return _clamp(baseline_expanded / positive_threshold, 1.0)
+
+
 def _efficiency_headroom_feedback_line(result: Mapping[str, Any]) -> str:
     """Return a compact explanation of common-solve efficiency headroom."""
     delta = _common_solve_efficiency_log2_delta(result)
@@ -897,13 +918,15 @@ def _common_solve_efficiency_delta(row: Mapping[str, Any], *, clip: float) -> fl
     frequent moderate slowdowns nearly invisible to GEPA. This term compares
     expansions directly on paired common solves: positive means the candidate is
     faster than the base prompt, negative means it is slower. The logarithmic
-    ratio treats 2x faster and 2x slower symmetrically, while clipping keeps the
-    signal subordinate to solve/loss events.
+    ratio treats 2x faster and 2x slower symmetrically. Headroom scaling reduces
+    cheap-level jitter, while clipping keeps the signal subordinate to solve/loss
+    events.
     """
     ratio_delta = _common_solve_efficiency_log2_delta(row)
     if ratio_delta is None:
         return 0.0
-    return _clamp(ratio_delta, max(0.0, clip))
+    scaled_delta = ratio_delta * _common_solve_efficiency_headroom_scale(row)
+    return _clamp(scaled_delta, max(0.0, clip))
 
 
 def _macro_game_weights(rows: Sequence[Mapping[str, Any]]) -> list[float]:

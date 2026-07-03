@@ -440,6 +440,38 @@ def test_candidate_scores_penalize_common_solve_expansion_slowdowns() -> None:
     assert scores[0] < -0.1
 
 
+def test_candidate_scores_weight_common_solve_efficiency_by_headroom() -> None:
+    outputs = [
+        {
+            "game": "low-headroom",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 24,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "baseline_expanded": 49,
+        },
+        {
+            "game": "high-headroom",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 2_499,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "baseline_expanded": 4_999,
+        },
+    ]
+
+    scores = adjusted_candidate_scores(
+        outputs,
+        score_delta_weight=0.0,
+        common_solve_efficiency_weight=1.0,
+        common_solve_efficiency_clip=2.0,
+    )
+
+    assert scores[1] > scores[0] * 3.0
+
+
 def test_candidate_score_does_not_reward_equal_new_lost_from_efficiency() -> None:
     outputs = [
         {
