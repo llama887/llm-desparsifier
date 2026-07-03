@@ -79,7 +79,7 @@ DEFAULT_GUARD_LEVELS = (
     "where_did_all_this_ice_come_from_:3,6"
 )
 DEFAULT_LOST_SOLVE_PENALTY = 8.0
-DEFAULT_NEW_SOLVE_BONUS = 1.0
+DEFAULT_NEW_SOLVE_BONUS = 4.0
 DEFAULT_CANDIDATE_ERROR_PENALTY = 2.0
 DEFAULT_SCORE_DELTA_WEIGHT = 1.0
 DEFAULT_SCORE_DELTA_CLIP = 0.5
@@ -856,18 +856,14 @@ def adjusted_candidate_scores(
     The list is still one score per task, matching GEPA's API, but each value is
     weighted so that the arithmetic mean is a per-game macro-average. That keeps
     broad game generalization visible even when one game contributes many more
-    levels than another. If any baseline-solved level regresses, an
-    evaluation-wide gate penalty is subtracted from every task score. This keeps
-    GEPA's Pareto selection from preserving wins produced by globally unsafe
-    prompt variants.
+    levels than another. Per-level lost-solve penalties preserve base behavior,
+    while the default evaluation-wide gate only fires when a candidate has a net
+    solve loss. An explicit any-lost-solve gate can still be enabled for stricter
+    regression-protection experiments.
     """
     rows = list(outputs)
     weights = _macro_game_weights(rows)
-    gate_value = (
-        lost_solve_penalty
-        if global_lost_solve_gate_penalty is None
-        else global_lost_solve_gate_penalty
-    )
+    gate_value = 0.0 if global_lost_solve_gate_penalty is None else global_lost_solve_gate_penalty
     lost_solves = sum(
         _has_baseline(row)
         and bool(row.get("baseline_solved", False))
@@ -2909,8 +2905,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Evaluation-wide penalty applied to every task when any baseline-solved "
-            "task regresses. Defaults to --lost-solve-penalty; set 0 to allow "
-            "solve tradeoffs while keeping the net-solve-loss gate active."
+            "task regresses. Defaults to disabled; set positive for strict "
+            "no-regression experiments while keeping per-level lost-solve penalties."
         ),
     )
     parser.add_argument(

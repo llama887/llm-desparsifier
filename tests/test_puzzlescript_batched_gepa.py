@@ -229,7 +229,7 @@ def test_build_train_dev_tasks_reassigns_task_ids_after_split() -> None:
     assert {task.game for task in train_tasks}.isdisjoint({task.game for task in dev_tasks})
 
 
-def test_candidate_score_applies_eval_wide_gate_for_lost_solves_and_errors() -> None:
+def test_candidate_score_can_apply_explicit_eval_wide_gate_for_lost_solves_and_errors() -> None:
     outputs = [
         {
             "game": "a",
@@ -272,6 +272,7 @@ def test_candidate_score_applies_eval_wide_gate_for_lost_solves_and_errors() -> 
         error_penalty=2.0,
         score_delta_weight=0.25,
         score_delta_clip=0.5,
+        global_lost_solve_gate_penalty=4.0,
     )
     score = candidate_score(
         outputs,
@@ -280,6 +281,7 @@ def test_candidate_score_applies_eval_wide_gate_for_lost_solves_and_errors() -> 
         error_penalty=2.0,
         score_delta_weight=0.25,
         score_delta_clip=0.5,
+        global_lost_solve_gate_penalty=4.0,
     )
 
     assert scores == pytest.approx(
@@ -291,6 +293,66 @@ def test_candidate_score_applies_eval_wide_gate_for_lost_solves_and_errors() -> 
         ]
     )
     assert score == pytest.approx(sum(scores) / len(scores))
+
+
+def test_candidate_score_defaults_to_net_solve_loss_gate_not_any_loss_gate() -> None:
+    outputs = [
+        {
+            "game": "a",
+            "score": 0.0,
+            "solved": False,
+            "baseline_score": 0.5,
+            "baseline_solved": True,
+        },
+        {
+            "game": "b",
+            "score": 0.7,
+            "solved": True,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+        },
+    ]
+
+    scores = adjusted_candidate_scores(
+        outputs,
+        lost_solve_penalty=2.0,
+        new_solve_bonus=3.0,
+        score_delta_weight=1.0,
+        score_delta_clip=0.5,
+    )
+
+    assert scores == pytest.approx([-2.5, 3.5])
+    assert candidate_score(
+        outputs,
+        lost_solve_penalty=2.0,
+        new_solve_bonus=3.0,
+        score_delta_weight=1.0,
+        score_delta_clip=0.5,
+    ) == pytest.approx(0.5)
+
+
+def test_candidate_score_rewards_large_net_solve_gain_by_default() -> None:
+    outputs = [
+        {
+            "game": "loss",
+            "score": 0.0,
+            "solved": False,
+            "baseline_score": 0.5,
+            "baseline_solved": True,
+        },
+        *[
+            {
+                "game": f"gain-{idx}",
+                "score": 0.7,
+                "solved": True,
+                "baseline_score": 0.0,
+                "baseline_solved": False,
+            }
+            for idx in range(5)
+        ],
+    ]
+
+    assert candidate_score(outputs) > 0.0
 
 
 def test_candidate_score_can_disable_eval_wide_lost_solve_gate() -> None:
@@ -1181,9 +1243,9 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert '--search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-16}"' in launcher
     assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}"' in launcher
     assert '--lost-solve-penalty "${LOST_SOLVE_PENALTY:-8.0}"' in launcher
-    assert '--new-solve-bonus "${NEW_SOLVE_BONUS:-1.0}"' in launcher
+    assert '--new-solve-bonus "${NEW_SOLVE_BONUS:-4.0}"' in launcher
+    assert '--global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-0.0}"' in launcher
     assert '--score-delta-weight "${SCORE_DELTA_WEIGHT:-1.0}"' in launcher
-    assert '--global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}"' in launcher
     assert '--global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}"' in launcher
     assert '--initial-gepa-addendum "${INITIAL_GEPA_ADDENDUM:-}"' in launcher
     assert '--guard-levels "${GUARD_LEVELS:-' in launcher
