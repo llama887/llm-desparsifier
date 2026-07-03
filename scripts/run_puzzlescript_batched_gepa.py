@@ -2644,6 +2644,9 @@ Hard requirements:
   self-discover categories, conditionals, or routing inside the prompt, but the
   runner will not implement buckets in code and the addendum should not force a
   category scheme without evidence.
+- Prompt-internal if-statements, decision trees, or named categories are allowed
+  prompt shapes when the feedback supports them; define them from observable
+  rules and state properties rather than from game titles.
 - Avoid memorized title/level exceptions unless the feedback clearly shows they
   generalize through observable mechanics. The goal is validation generalization,
   not fitting a few named cases.
@@ -2666,7 +2669,10 @@ Hard requirements:
   Mention a mechanic only to define an abstract precondition such as reversible
   progress, staged progress, stable roles, legal interaction distance, or
   provable irreversibility.
-- Prioritize preventing lost base solves over small expansion-count improvements.
+- Prioritize preventing lost base solves over small expansion-count improvements,
+  but treat repeated solved-efficiency regressions as evidence to simplify,
+  soften, or precondition expensive heuristic terms when solve outcomes are
+  preserved.
 - Treat a candidate that loses base-solved levels as evidence to restore or
   strengthen the base mechanics-reading rule, not as evidence to add broader
   deadlock or fallback heuristics.
