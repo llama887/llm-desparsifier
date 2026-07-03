@@ -796,7 +796,11 @@ def test_make_reflective_dataset_compacts_large_trace_payloads() -> None:
         components_to_update=["heuristic_prompt"],
     )
 
-    record = dataset["heuristic_prompt"][0]
+    record = next(
+        item
+        for item in dataset["heuristic_prompt"]
+        if item["Comparison"]["classification"] == "persistent_failure"
+    )
     assert len(record["Inputs"]["env_description"]) < DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS + 80
     assert len(record["Generated Outputs"]["heuristic_code"]) < DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS + 80
     assert len(record["Feedback"]) < DEFAULT_REFLECTION_FEEDBACK_CHARS + 80
@@ -861,7 +865,11 @@ def test_make_reflective_dataset_includes_regression_comparison(tmp_path: Path) 
         components_to_update=["heuristic_prompt"],
     )
 
-    record = dataset["heuristic_prompt"][0]
+    record = next(
+        item
+        for item in dataset["heuristic_prompt"]
+        if item["Comparison"]["classification"] == "lost_baseline_solve"
+    )
     assert record["Comparison"]["classification"] == "lost_baseline_solve"
     assert "REGRESSION" in record["Feedback"]
     assert "base prompt solved" in record["Feedback"]
@@ -928,13 +936,81 @@ def test_make_reflective_dataset_includes_mechanics_signature_as_diagnostic_only
         components_to_update=["heuristic_prompt"],
     )
 
-    record = dataset["heuristic_prompt"][0]
+    record = next(
+        item
+        for item in dataset["heuristic_prompt"]
+        if item["Comparison"]["classification"] == "lost_baseline_solve"
+    )
     assert record["Comparison"]["mechanics_signature"] == "player-alias+portal"
     assert "Mechanics evidence for diagnosis only: player-alias+portal" in record["Feedback"]
     assert "rule-derived conditions" in record["Feedback"]
     assert "categories" in record["Feedback"]
     assert "abstract preconditions" in record["Feedback"]
     assert "observable mechanics" in record["Feedback"]
+
+
+def test_make_reflective_dataset_starts_with_aggregate_outcome_summary() -> None:
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=object(),  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    eval_batch = SimpleNamespace(
+        trajectories=[
+            {
+                "task": {
+                    "game": "beam-gain",
+                    "level": 0,
+                    "budget": 100,
+                    "env_description": "Rules mention beam and target crates.",
+                },
+                "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0\n",
+                "synthesis_error": None,
+                "result": {
+                    "score": 1.0,
+                    "solved": True,
+                    "baseline_score": 0.0,
+                    "baseline_solved": False,
+                    "adjusted_score": 4.0,
+                },
+            },
+            {
+                "task": {
+                    "game": "stable-loss",
+                    "level": 2,
+                    "budget": 100,
+                    "env_description": "Classic all target crate puzzle.",
+                },
+                "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 2.0\n",
+                "synthesis_error": None,
+                "result": {
+                    "score": 0.0,
+                    "solved": False,
+                    "baseline_score": 1.0,
+                    "baseline_solved": True,
+                    "adjusted_score": -8.0,
+                },
+            },
+        ]
+    )
+
+    dataset = adapter.make_reflective_dataset(
+        candidate={},
+        eval_batch=eval_batch,
+        components_to_update=["heuristic_prompt"],
+    )
+
+    aggregate = dataset["heuristic_prompt"][0]
+    assert aggregate["Comparison"]["classification"] == "aggregate_summary"
+    assert aggregate["Comparison"]["new_solve_count"] == 1
+    assert aggregate["Comparison"]["lost_baseline_solve_count"] == 1
+    assert "beam-gain" in aggregate["Feedback"]
+    assert "stable-loss" in aggregate["Feedback"]
+    assert "beam" in aggregate["Feedback"]
+    assert "code-side routing" in aggregate["Feedback"]
 
 
 def test_custom_proposer_requests_short_base_anchored_addendum() -> None:

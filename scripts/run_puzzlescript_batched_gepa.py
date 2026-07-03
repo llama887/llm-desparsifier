@@ -1784,6 +1784,153 @@ def build_comparison_payload(
     }
 
 
+def _format_outcome_groups(
+    groups: Mapping[str, Mapping[str, int]],
+    *,
+    prefer_losses: bool,
+    limit: int = 6,
+) -> str:
+    """Return a compact net/new/lost summary for games or mechanics labels.
+
+    The aggregate reflection record needs to tell GEPA which broad families a
+    candidate helped or damaged without turning those families into runner-side
+    buckets. This helper keeps the text bounded while retaining the direction of
+    the solve-rate evidence.
+    """
+    rows: list[tuple[int, int, int, str, Mapping[str, int]]] = []
+    for name, stats in groups.items():
+        new = int(stats.get("new", 0))
+        lost = int(stats.get("lost", 0))
+        if new == 0 and lost == 0:
+            continue
+        net = new - lost
+        rows.append((net, new, lost, name, stats))
+    if not rows:
+        return "<none>"
+    if prefer_losses:
+        rows.sort(key=lambda row: (row[0], -row[2], row[3]))
+    else:
+        rows.sort(key=lambda row: (row[0], row[1], row[3]), reverse=True)
+    parts: list[str] = []
+    for net, new, lost, name, stats in rows[:limit]:
+        parts.append(
+            f"{name} net={net:+d} new={new} lost={lost} "
+            f"solved={int(stats.get('solved', 0))}/base={int(stats.get('base_solved', 0))}"
+        )
+    return "; ".join(parts)
+
+
+def build_aggregate_reflection_record(
+    trajectories: Sequence[Mapping[str, Any]],
+    *,
+    selected_trace_count: int,
+    selection_note: str,
+) -> Optional[dict[str, Any]]:
+    """Return one candidate-level reflection summary for GEPA.
+
+    Per-level traces show concrete causes, but they can hide the candidate's
+    global shape: a prompt may gain several transformation games while damaging
+    stable push/path cases. This record summarizes the already-evaluated
+    train/dev traces by outcome, game, and mechanics signature. It is feedback
+    only; it does not route prompts or change scalar scores.
+    """
+    if not trajectories:
+        return None
+    outcome_counts = {
+        "new_solve": 0,
+        "lost_baseline_solve": 0,
+        "solved_regression": 0,
+        "candidate_error": 0,
+        "persistent_failure": 0,
+        "stable_or_improved": 0,
+    }
+    by_game: dict[str, dict[str, int]] = {}
+    by_mechanics: dict[str, dict[str, int]] = {}
+    solved = 0
+    baseline_solved = 0
+    adjusted_scores: list[float] = []
+
+    for trace in trajectories:
+        task = trace.get("task", {})
+        result = trace.get("result", {})
+        classification = trace_classification(trace)
+        outcome_counts[classification] = outcome_counts.get(classification, 0) + 1
+        game = str(task.get("game", "unknown"))
+        mechanics = trace_mechanics_signature(trace)
+        for groups, name in ((by_game, game), (by_mechanics, mechanics)):
+            stats = groups.setdefault(
+                name,
+                {"n": 0, "solved": 0, "base_solved": 0, "new": 0, "lost": 0},
+            )
+            stats["n"] += 1
+            if bool(result.get("solved", False)):
+                stats["solved"] += 1
+            if bool(result.get("baseline_solved", False)):
+                stats["base_solved"] += 1
+            if classification == "new_solve":
+                stats["new"] += 1
+            elif classification == "lost_baseline_solve":
+                stats["lost"] += 1
+        if bool(result.get("solved", False)):
+            solved += 1
+        if bool(result.get("baseline_solved", False)):
+            baseline_solved += 1
+        adjusted_scores.append(float(result.get("adjusted_score", result.get("score", 0.0))))
+
+    total = len(trajectories)
+    mean_adjusted = sum(adjusted_scores) / total
+    new_count = outcome_counts.get("new_solve", 0)
+    lost_count = outcome_counts.get("lost_baseline_solve", 0)
+    feedback = "\n".join(
+        [
+            (
+                "AGGREGATE CANDIDATE SUMMARY: "
+                f"evaluated={total} selected_trace_records={selected_trace_count} "
+                f"solved={solved} base_solved={baseline_solved} "
+                f"new_solves={new_count} lost_base_solves={lost_count} "
+                f"solved_efficiency_regressions={outcome_counts.get('solved_regression', 0)} "
+                f"candidate_errors={outcome_counts.get('candidate_error', 0)} "
+                f"mean_adjusted_score={mean_adjusted:.4f}"
+            ),
+            "Game gains: " + _format_outcome_groups(by_game, prefer_losses=False),
+            "Game losses: " + _format_outcome_groups(by_game, prefer_losses=True),
+            "Mechanics gains: " + _format_outcome_groups(by_mechanics, prefer_losses=False),
+            "Mechanics losses: " + _format_outcome_groups(by_mechanics, prefer_losses=True),
+            (
+                "Use this aggregate only to preserve broad rule-grounded wins and "
+                "repair broad losses. Express any category, decision tree, or "
+                "routing as prompt-internal observable preconditions; do not add "
+                "code-side routing or named-game exceptions."
+            ),
+        ]
+    )
+    return {
+        "Inputs": {
+            "evaluated_level_count": total,
+            "selected_trace_record_count": selected_trace_count,
+        },
+        "Comparison": {
+            "classification": "aggregate_summary",
+            "evaluated_level_count": total,
+            "solved_count": solved,
+            "baseline_solved_count": baseline_solved,
+            "new_solve_count": new_count,
+            "lost_baseline_solve_count": lost_count,
+            "net_new_solve_count": new_count - lost_count,
+            "solved_efficiency_regression_count": outcome_counts.get(
+                "solved_regression",
+                0,
+            ),
+            "candidate_error_count": outcome_counts.get("candidate_error", 0),
+        },
+        "Feedback": feedback,
+        "Selection": selection_note,
+        "score": mean_adjusted,
+        "raw_score": mean_adjusted,
+        "solved": solved >= baseline_solved and lost_count == 0,
+    }
+
+
 def _has_dangling_prompt_tail(text: str) -> bool:
     """Return True when prompt text appears cut at an unfinished list or heading.
 
@@ -2985,6 +3132,13 @@ class PuzzleScriptBatchedGEPAAdapter:
             "new solves, solved regressions, candidate errors, and persistent failures; "
             "all levels still contributed to the scalar score."
         )
+        aggregate_record = build_aggregate_reflection_record(
+            trajectories,
+            selected_trace_count=len(selected_traces),
+            selection_note=selection_note,
+        )
+        if aggregate_record is not None:
+            records.append(aggregate_record)
         for trace in selected_traces:
             task = trace["task"]
             result = trace["result"]
