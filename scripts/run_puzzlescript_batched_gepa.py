@@ -1903,6 +1903,16 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "needed assignment, queue, or memo logic with plain local loops and literals."
         )
     if "lost_baseline_solve" in classifications:
+        if _records_show_dropped_blocker_structure(records):
+            return (
+                "When RULES, COLLISIONLAYERS, aliases, or win text show movable blockers "
+                "such as crates, blocks, boxes, boulders, targets, flags, or goals, do not "
+                "collapse the heuristic to pure player-to-goal distance or generic counts. "
+                "Preserve the relevant interaction structure with crate-target or "
+                "block-goal matching, block-on-goal penalties, player-to-interaction "
+                "distance, and only finite rule-proven deadlock terms; use pure "
+                "player-to-goal distance only when movable blockers cannot affect progress."
+            )
         return (
             "For any added internal category, branch, role helper, deadlock test, or "
             "distance term, first state the observable precondition from WINCONDITIONS, "
@@ -1928,6 +1938,33 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "mechanics-reading fallback when the precondition is absent."
         )
     return ""
+
+
+def _records_show_dropped_blocker_structure(records: Sequence[Mapping[str, Any]]) -> bool:
+    """Return whether feedback shows a candidate discarded movable-object structure.
+
+    This helper only reads diagnostic code-shape booleans from reflection records.
+    It does not route prompts by game; it lets the no-op fallback express a
+    single prompt-level principle when lost-solve evidence says the base solved
+    by preserving blocker, matching, or deadlock terms that the candidate omitted.
+    """
+
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) != "lost_baseline_solve":
+            continue
+        baseline_output = cast(Mapping[str, Any], record.get("Baseline Output", {}))
+        generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
+        baseline_shape = cast(Mapping[str, Any], baseline_output.get("code_shape", {}))
+        generated_shape = cast(Mapping[str, Any], generated_output.get("code_shape", {}))
+        for key in (
+            "uses_pushable_object_terms",
+            "uses_target_terms",
+            "uses_deadlock_checks",
+        ):
+            if bool(baseline_shape.get(key)) and not bool(generated_shape.get(key)):
+                return True
+    return False
 
 
 def heuristic_code_shape(code: str) -> dict[str, bool]:
@@ -1981,6 +2018,13 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
                 "exit",
             )
         ),
+        "uses_pushable_object_terms": any(
+            term in lowered for term in ("crate", "block", "box", "boulder")
+        ),
+        "uses_target_terms": any(term in lowered for term in ("target", "flag", "goal")),
+        "uses_deadlock_checks": any(
+            term in lowered for term in ("deadlock", "dead-lock", "corner")
+        ),
     }
 
 
@@ -2010,6 +2054,19 @@ def _code_shape_diagnostic_line(
         parts.append(
             "the candidate used non-finite or huge penalties; keep penalties finite and "
             "low unless WINCONDITIONS and RULES prove an irreversible dead state"
+        )
+    if any(
+        bool(baseline_shape.get(key)) and not bool(generated_shape.get(key))
+        for key in (
+            "uses_pushable_object_terms",
+            "uses_target_terms",
+            "uses_deadlock_checks",
+        )
+    ):
+        parts.append(
+            "the base heuristic preserved movable-object, target/goal matching, or "
+            "deadlock structure that the candidate omitted; do not collapse such games "
+            "to player-goal distance or generic counts when movable blockers affect progress"
         )
     if not parts:
         return ""
