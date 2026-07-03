@@ -1566,7 +1566,8 @@ def build_reflection_feedback(result: Mapping[str, Any], classification: str) ->
                 "REGRESSION: the base prompt solved this level, but the candidate failed.",
                 _result_summary("Base result", result, baseline=True),
                 _result_summary("Candidate result", result),
-                "Reflection target: preserve the base behavior for this mechanics pattern while changing only the general rule that caused the regression.",
+                "Reflection target: preserve the base behavior by identifying the invalid assumption that caused the regression and converting it into a general precondition.",
+                "Single-prompt abstraction: do not write a named-game exception or route to a bucket; phrase the fix as one reusable rule about when target counts, distances, deadlocks, missing objects, or score fallback are justified.",
             ]
         )
     elif classification == "new_solve":
@@ -1576,6 +1577,7 @@ def build_reflection_feedback(result: Mapping[str, Any], classification: str) ->
                 _result_summary("Base result", result, baseline=True),
                 _result_summary("Candidate result", result),
                 "Reflection target: preserve the general insight that produced this new solve without adding narrow game-specific memorization.",
+                "Single-prompt abstraction: express the lesson as an abstract decision rule that should also apply to unseen games with similar rule properties.",
             ]
         )
     elif classification == "solved_regression":
@@ -1752,6 +1754,8 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
         return ""
     if not cleaned:
         return ""
+    if _proposed_addendum_scope_issue(cleaned) is not None:
+        return ""
     full_prompt_markers = (
         "You are writing a heuristic function",
         "Output exactly Python code defining",
@@ -1764,6 +1768,38 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
     if _has_dangling_prompt_tail(cleaned):
         return ""
     return cleaned
+
+
+def _proposed_addendum_scope_issue(text: str) -> str | None:
+    """Return why an addendum violates the single-prompt experiment contract.
+
+    The optimizer may use mechanic-stratified evidence, but the artifact being
+    optimized must remain one general prompt. This guard rejects proposal shapes
+    that would turn the addendum into prompt routing, buckets, or title-specific
+    dispatch while still allowing abstract mechanics preconditions.
+    """
+    lowered = text.lower()
+    routing_markers = (
+        "separate prompt",
+        "multiple prompts",
+        "prompt routing",
+        "route to",
+        "bucket-specific",
+        "bucket specific",
+        "prompt bucket",
+        "mechanic bucket",
+        "mechanics bucket",
+        "game-specific prompt",
+        "game specific prompt",
+        "if game_title",
+        "if game title",
+        "ctx.get('game_title')",
+        'ctx.get("game_title")',
+    )
+    for marker in routing_markers:
+        if marker in lowered:
+            return "addendum introduces prompt routing or title-specific dispatch"
+    return None
 
 
 def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> str:
@@ -1789,24 +1825,26 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
         )
     if "lost_baseline_solve" in classifications:
         return (
-            "When a change risks a base-solved level, keep exact WINCONDITIONS, RULES, "
-            "LEGEND names, and collision-layer mechanics primary; use score_normalized "
-            "only as a tie-breaker, do not treat missing goal objects as dead ends "
-            "unless RULES prove they cannot reappear, and skip other unproven deadlock penalties."
+            "Use one decision procedure before adding any strong term: first prove from "
+            "WINCONDITIONS, RULES, LEGEND, and COLLISIONLAYERS whether progress is "
+            "monotonic, objects are stable, and a deadlock or missing object is "
+            "irreversible. If not proved, keep only low-weight interaction distances "
+            "and score_normalized tie-breakers so base-solved mechanics are preserved."
         )
     if "new_solve" in classifications:
         return (
-            "Generalize new-solve evidence only through exact rule and win-condition "
-            "features: count unsatisfied objects by LEGEND name, prefer legal progress "
-            "moves, keep generic role fallback secondary, and audit missing goal objects "
-            "against aliases and transforms before adding any penalty."
+            "Generalize new-solve evidence as a preconditioned rule, not a named-game "
+            "feature: use explicit win-condition counts or distances only after the "
+            "rules show stable object roles and monotonic progress; otherwise keep the "
+            "new feature low weight and secondary to legal interaction distance and "
+            "score_normalized progress."
         )
     return (
-        "For base-unsolved levels, after reading WINCONDITIONS, RULES, and LEGEND, "
-        "add at most one low-weight win-condition distance feature using exact object "
-        "names and legal progress moves; if aliases, transforms, or collision layers "
-        "make missing goal objects ambiguous, preserve the base fallback and keep "
-        "score_normalized only as a tie-breaker."
+        "Use a reusable heuristic-design checklist: read WINCONDITIONS, RULES, LEGEND, "
+        "COLLISIONLAYERS, and the initial state; decide whether progress is monotonic "
+        "or reversible; then add at most one low-weight feature justified by that "
+        "decision, keeping score_normalized as a tie-breaker when the rule evidence is "
+        "ambiguous."
     )
 
 
@@ -2470,12 +2508,20 @@ class PuzzleScriptBatchedGEPAAdapter:
             reflection_prompt = f"""You are revising one global prompt used to generate PuzzleScript A* heuristics.
 
 The research goal is a single general prompt, not per-game routing or memorized examples.
+The desired artifact should behave like one human heuristic designer's reusable decision procedure for unseen games.
 The existing base prompt is already strong. Propose only a short addendum that will be attached after it.
 
 Hard requirements:
 - Do not rewrite the full base prompt. Output only the short addendum text.
 - Do not return the base prompt unchanged. The addendum must test one specific,
   conservative, generalizable hypothesis from the feedback.
+- Do not propose prompt routing, buckets, multiple modes, title-specific dispatch,
+  or separate prompts for mechanics families. Stratified evidence is only for
+  learning one reusable prompt.
+- Phrase the addendum as preconditioned reasoning: before using target counts,
+  distances, deadlocks, missing-object penalties, or score fallback, state what
+  the heuristic writer must verify from WINCONDITIONS, RULES, LEGEND,
+  COLLISIONLAYERS, and the initial state.
 - Preserve the exact function contract and safety constraints by leaving the base prompt unchanged.
 - Preserve the base prompt's instruction to read WINCONDITIONS, RULES,
   COLLISIONLAYERS, LEGEND aliases, and the initial level state before choosing
@@ -2488,6 +2534,9 @@ Hard requirements:
 - The revised prompt must not begin with `def`, `import`, or a
   `heuristic_cost_to_go` implementation.
 - Do not append long lists of named games, levels, examples, or mechanics inventories.
+  Mention a mechanic only to define an abstract precondition such as reversible
+  progress, staged progress, stable roles, legal interaction distance, or
+  provable irreversibility.
 - Prioritize preventing lost base solves over small expansion-count improvements.
 - Treat a candidate that loses base-solved levels as evidence to restore or
   strengthen the base mechanics-reading rule, not as evidence to add broader

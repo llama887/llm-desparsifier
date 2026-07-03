@@ -657,6 +657,9 @@ def test_make_reflective_dataset_includes_regression_comparison(tmp_path: Path) 
     assert "REGRESSION" in record["Feedback"]
     assert "base prompt solved" in record["Feedback"]
     assert "candidate failed" in record["Feedback"]
+    assert "general precondition" in record["Feedback"]
+    assert "Single-prompt abstraction" in record["Feedback"]
+    assert "do not write a named-game exception" in record["Feedback"]
     assert "base solved quickly" in record["Baseline Output"]["feedback"]
     assert "return 1.0" in record["Baseline Output"]["heuristic_code"]
 
@@ -694,6 +697,9 @@ def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
     assert "short addendum" in llm.prompts[0]
     assert "Do not rewrite the full base prompt" in llm.prompts[0]
     assert "Do not return the base prompt unchanged" in llm.prompts[0]
+    assert "one human heuristic designer's reusable decision procedure" in llm.prompts[0]
+    assert "Do not propose prompt routing" in llm.prompts[0]
+    assert "preconditioned reasoning" in llm.prompts[0]
     assert "missing goal objects" in llm.prompts[0]
     assert "REGRESSION" in llm.prompts[0]
 
@@ -749,8 +755,9 @@ def test_custom_proposer_uses_feedback_fallback_for_noop_output() -> None:
     )
 
     assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
-    assert "low-weight win-condition distance" in result["heuristic_prompt"]
-    assert "missing goal objects" in result["heuristic_prompt"]
+    assert "reusable heuristic-design checklist" in result["heuristic_prompt"]
+    assert "decide whether progress is monotonic or reversible" in result["heuristic_prompt"]
+    assert "score_normalized as a tie-breaker" in result["heuristic_prompt"]
 
 
 def test_custom_proposer_uses_code_contract_fallback_for_candidate_errors() -> None:
@@ -830,6 +837,30 @@ def test_custom_proposer_rejects_overlong_addendum_instead_of_truncating() -> No
 def test_custom_proposer_rejects_dangling_addendum_tail() -> None:
     current_prompt = PUZZLESCRIPT_HEURISTIC_CONTRACT
     llm = _FakeLLM("Use mechanics-specific blockers:\n-")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={"heuristic_prompt": []},
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] == current_prompt
+
+
+def test_custom_proposer_rejects_prompt_routing_addendum() -> None:
+    current_prompt = PUZZLESCRIPT_HEURISTIC_CONTRACT
+    llm = _FakeLLM(
+        "Use prompt routing: if game_title contains Sokoban, use a box-target prompt; "
+        "otherwise use a separate prompt for ice games."
+    )
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=llm,  # type: ignore[arg-type]
         state_root=Path("/tmp/gepa-state"),
