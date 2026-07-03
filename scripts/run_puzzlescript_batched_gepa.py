@@ -457,7 +457,6 @@ def reflection_trace_priority(trace: Mapping[str, Any]) -> tuple[int, float, str
     regressions and new solves are prioritized before ordinary weak cases.
     """
     task = trace.get("task", {})
-    result = trace.get("result", {})
     class_rank = {
         "lost_baseline_solve": 0,
         "new_solve": 1,
@@ -469,10 +468,31 @@ def reflection_trace_priority(trace: Mapping[str, Any]) -> tuple[int, float, str
     }.get(trace_classification(trace), 6)
     return (
         class_rank,
-        float(result.get("adjusted_score", result.get("score", 0.0))),
+        _reflection_trace_signal(trace),
         str(task.get("game", "")),
         _trace_level(trace),
     )
+
+
+def _reflection_trace_signal(trace: Mapping[str, Any]) -> float:
+    """Return the within-class sort signal for reflection trace selection.
+
+    Outcome class decides broad priority, but efficiency groups need their own
+    severity ordering. A tiny score improvement on a cheap common solve should
+    not crowd out a high-headroom example that cuts thousands of expansions,
+    because the latter is much more informative for the next prompt update.
+    """
+    result = cast(Mapping[str, Any], trace.get("result", {}))
+    classification = trace_classification(trace)
+    efficiency_delta = _common_solve_efficiency_log2_delta(result)
+    high_headroom_bonus = 1.0 if _is_high_headroom_common_solve(result) else 0.0
+    if classification == "solved_efficiency_gain" and efficiency_delta is not None:
+        return -(efficiency_delta + high_headroom_bonus)
+    if classification == "solved_regression" and efficiency_delta is not None:
+        return efficiency_delta - high_headroom_bonus
+    if classification == "new_solve":
+        return -float(result.get("score", 0.0))
+    return float(result.get("adjusted_score", result.get("score", 0.0)))
 
 
 def trace_mechanics_signature(trace: Mapping[str, Any]) -> str:
@@ -2591,6 +2611,16 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "reachable interaction distance plus a small score_normalized tie-breaker."
         )
     if "solved_regression" in classifications:
+        if _records_show_dropped_player_interaction_distance(records):
+            return (
+                "When both prompts solve but the candidate expands many more states after "
+                "collapsing a base player-to-interaction distance term, preserve that "
+                "bounded distance as a tie-breaker before count-only or score_normalized "
+                "fallback. Apply it only when WINCONDITIONS, RULES, aliases, or object "
+                "counts show the player must reach, clear, activate, enter, or move a "
+                "marked, goal, wall, switch, exit, crate, block, or similar interaction "
+                "object; otherwise keep count progress and score_normalized low weight."
+            )
         if "new_solve" in classifications:
             return (
                 "Preserve rule-grounded new-solve signals, but simplify expensive "
@@ -2754,6 +2784,39 @@ def _records_show_dropped_blocker_structure(records: Sequence[Mapping[str, Any]]
     return False
 
 
+def _records_show_dropped_player_interaction_distance(
+    records: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Return whether a candidate omitted base player-distance ordering.
+
+    This catches efficiency regressions where the candidate still solves but
+    collapses a useful distance-to-interaction signal into count-only or
+    score-only progress. The fallback remains prompt-level: it tells GEPA when
+    to preserve the feature, not which game to route.
+    """
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) not in {
+            "lost_baseline_solve",
+            "solved_regression",
+        }:
+            continue
+        baseline_output = cast(Mapping[str, Any], record.get("Baseline Output", {}))
+        generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
+        baseline_shape = cast(Mapping[str, Any], baseline_output.get("code_shape", {}))
+        generated_shape = cast(Mapping[str, Any], generated_output.get("code_shape", {}))
+        if bool(baseline_shape.get("uses_player_interaction_distance")) and not bool(
+            generated_shape.get("uses_player_interaction_distance")
+        ):
+            return True
+        feedback = str(record.get("Feedback", "")).lower()
+        if "player-to-interaction distance" in feedback and (
+            "count-only" in feedback or "score-only" in feedback
+        ):
+            return True
+    return False
+
+
 def _records_show_dropped_alias_gate_structure(records: Sequence[Mapping[str, Any]]) -> bool:
     """Return whether a lost solve dropped alias-specific or gate-state structure.
 
@@ -2841,6 +2904,55 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
             "impassable",
         )
     )
+    uses_player_terms = any(
+        term in lowered
+        for term in (
+            "player",
+            "avatar",
+            "hero",
+            "fighter",
+            "wizard",
+            "thief",
+            "controlplayer",
+            "dummy",
+        )
+    )
+    uses_distance_terms = any(
+        term in lowered
+        for term in (
+            "manhattan",
+            "abs(",
+            "min_dist",
+            "max_dist",
+            "nearest",
+            "closest",
+            "distance",
+            "_dist",
+        )
+    )
+    uses_interaction_object_terms = any(
+        term in lowered
+        for term in (
+            "marked",
+            "target",
+            "goal",
+            "flag",
+            "exit",
+            "crate",
+            "block",
+            "box",
+            "boulder",
+            "wall",
+            "dropwall",
+            "door",
+            "switch",
+            "portal",
+            "key",
+        )
+    )
+    uses_count_terms = bool(re.search(r"\blen\s*\(", lowered)) or any(
+        term in lowered for term in ("_count", "count_", "num_", "remaining")
+    )
     return {
         "uses_generic_role_helpers": "role_positions" in lowered or "role_keywords" in lowered,
         "uses_score_fallback": "score_normalized" in lowered,
@@ -2855,6 +2967,13 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
         "uses_reachability_search": uses_reachability_search,
         "uses_gate_aware_reachability": (
             uses_reachability_search and uses_gate_terms and uses_gate_state_terms
+        ),
+        "uses_player_terms": uses_player_terms,
+        "uses_distance_terms": uses_distance_terms,
+        "uses_interaction_object_terms": uses_interaction_object_terms,
+        "uses_count_terms": uses_count_terms,
+        "uses_player_interaction_distance": (
+            uses_player_terms and uses_distance_terms and uses_interaction_object_terms
         ),
         "mentions_mechanics_terms": any(
             term in lowered
@@ -2932,6 +3051,16 @@ def _code_shape_diagnostic_line(
     if (
         generated_shape.get("uses_reachability_search")
         and not baseline_shape.get("uses_reachability_search")
+        and classification == "solved_efficiency_gain"
+    ):
+        parts.append(
+            "the candidate added reachability/BFS and improved a common solve; preserve "
+            "that idea only as a prompt-internal branch when RULES, COLLISIONLAYERS, "
+            "terrain, blockers, doors, or one-way effects make plain distance misleading"
+        )
+    if (
+        generated_shape.get("uses_reachability_search")
+        and not baseline_shape.get("uses_reachability_search")
         and classification in {"lost_baseline_solve", "solved_regression"}
     ):
         parts.append(
@@ -2940,10 +3069,50 @@ def _code_shape_diagnostic_line(
             "rules and collision layers justify it and all state-changing objects are "
             "modeled conservatively"
         )
+    if (
+        baseline_shape.get("uses_player_interaction_distance")
+        and not generated_shape.get("uses_player_interaction_distance")
+    ):
+        count_note = (
+            " count-only or score-only progress"
+            if generated_shape.get("uses_count_terms") or generated_shape.get("uses_score_fallback")
+            else " weaker progress terms"
+        )
+        parts.append(
+            "the base heuristic used player-to-interaction distance that the candidate "
+            f"omitted; avoid{count_note} when the player must reach or activate marked, "
+            "goal, wall, switch, exit, or blocker objects"
+        )
+    if (
+        generated_shape.get("uses_player_interaction_distance")
+        and not baseline_shape.get("uses_player_interaction_distance")
+        and classification == "solved_efficiency_gain"
+    ):
+        parts.append(
+            "the candidate added player-to-interaction distance and improved a common "
+            "solve; preserve it as a bounded tie-breaker when object counts alone do "
+            "not order which reachable interaction should happen next"
+        )
     if generated_shape.get("uses_nonfinite_return") or generated_shape.get("uses_large_penalty"):
         parts.append(
             "the candidate used non-finite or huge penalties; keep penalties finite and "
             "low unless WINCONDITIONS and RULES prove an irreversible dead state"
+        )
+    if (
+        classification == "solved_efficiency_gain"
+        and (
+            baseline_shape.get("uses_nonfinite_return")
+            or baseline_shape.get("uses_large_penalty")
+        )
+        and not (
+            generated_shape.get("uses_nonfinite_return")
+            or generated_shape.get("uses_large_penalty")
+        )
+    ):
+        parts.append(
+            "the candidate avoided the base heuristic's non-finite or huge penalties "
+            "while solving faster; prefer bounded local penalties unless a dead state "
+            "is rule-proven"
         )
     if any(
         bool(baseline_shape.get(key)) and not bool(generated_shape.get(key))

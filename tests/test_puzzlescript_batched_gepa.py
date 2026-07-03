@@ -735,6 +735,23 @@ def test_heuristic_code_shape_flags_generic_fallback_and_mechanics_terms() -> No
     assert shape["uses_gate_aware_reachability"] is True
 
 
+def test_heuristic_code_shape_flags_player_interaction_distance() -> None:
+    shape = heuristic_code_shape(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    player_pos = ctx.get('object_positions', {}).get('player', [])\n"
+        "    marked = ctx.get('object_positions', {}).get('marked', [])\n"
+        "    if player_pos and marked:\n"
+        "        px, py = player_pos[0]\n"
+        "        return min(abs(px - mx) + abs(py - my) for mx, my in marked)\n"
+        "    return len(marked)\n"
+    )
+
+    assert shape["uses_player_terms"] is True
+    assert shape["uses_distance_terms"] is True
+    assert shape["uses_interaction_object_terms"] is True
+    assert shape["uses_player_interaction_distance"] is True
+
+
 def test_candidate_prompt_issue_rejects_code_but_allows_contract_signature() -> None:
     instruction_prompt = (
         "Output exactly Python code defining:\n"
@@ -942,6 +959,75 @@ def test_make_reflective_dataset_includes_regression_comparison(tmp_path: Path) 
     assert "Code-shape contrast" in record["Feedback"]
     assert "reachability" in record["Feedback"]
     assert "non-finite or huge penalties" in record["Feedback"]
+
+
+def test_make_reflective_dataset_reports_dropped_player_interaction_distance(
+    tmp_path: Path,
+) -> None:
+    base_code = tmp_path / "base.py"
+    base_code.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    marked = ctx.get('object_positions', {}).get('marked', [])\n"
+        "    players = ctx.get('object_positions', {}).get('player', [])\n"
+        "    if players and marked:\n"
+        "        px, py = players[0]\n"
+        "        return min(abs(px - mx) + abs(py - my) for mx, my in marked)\n"
+        "    return len(marked)\n",
+        encoding="utf-8",
+    )
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=object(),  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    eval_batch = SimpleNamespace(
+        trajectories=[
+            {
+                "task": {
+                    "game": "drop-swap-like",
+                    "level": 1,
+                    "budget": 10_000,
+                    "env_description": "Win conditions: no marked objects remain.",
+                },
+                "heuristic_code": (
+                    "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+                    "    marked = ctx.get('object_positions', {}).get('marked', [])\n"
+                    "    return len(marked) + (1.0 - ctx.get('score_normalized', 0.0))\n"
+                ),
+                "synthesis_error": None,
+                "result": {
+                    "feedback": "candidate solved slowly",
+                    "score": 0.78,
+                    "solved": True,
+                    "expanded": 2145,
+                    "baseline_score": 0.99,
+                    "baseline_solved": True,
+                    "baseline_expanded": 110,
+                    "baseline_heuristic_code_path": str(base_code),
+                    "baseline_feedback": "base solved quickly",
+                },
+            }
+        ]
+    )
+
+    dataset = adapter.make_reflective_dataset(
+        candidate={},
+        eval_batch=eval_batch,
+        components_to_update=["heuristic_prompt"],
+    )
+
+    record = next(
+        item
+        for item in dataset["heuristic_prompt"]
+        if item["Comparison"]["classification"] == "solved_regression"
+    )
+    assert record["Baseline Output"]["code_shape"]["uses_player_interaction_distance"] is True
+    assert record["Generated Outputs"]["code_shape"]["uses_player_interaction_distance"] is False
+    assert "player-to-interaction distance" in record["Feedback"]
+    assert "count-only" in record["Feedback"]
 
 
 def test_make_reflective_dataset_includes_mechanics_signature_as_diagnostic_only(
@@ -1368,6 +1454,48 @@ def test_custom_proposer_uses_regression_fallback_for_noop_output() -> None:
     assert "REGRESSION" not in result["heuristic_prompt"]
     assert "precondition" in result["heuristic_prompt"]
     assert "WINCONDITIONS" in result["heuristic_prompt"]
+
+
+def test_custom_proposer_uses_player_distance_fallback_for_solved_regression() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "solved_regression"},
+                    "Baseline Output": {
+                        "code_shape": {"uses_player_interaction_distance": True}
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_player_interaction_distance": False,
+                            "uses_count_terms": True,
+                        }
+                    },
+                    "Feedback": (
+                        "EFFICIENCY REGRESSION: base used player-to-interaction "
+                        "distance but candidate collapsed to count-only progress."
+                    ),
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
+    assert "player-to-interaction distance" in result["heuristic_prompt"]
+    assert "count-only" in result["heuristic_prompt"]
+    assert "score_normalized" in result["heuristic_prompt"]
 
 
 def test_custom_proposer_uses_code_contract_fallback_for_lost_solve_errors() -> None:
@@ -2345,6 +2473,33 @@ def test_select_reflection_traces_keeps_mechanics_diversity() -> None:
 
     assert len(selected) == DEFAULT_REFLECTION_MAX_RECORDS
     assert "portal-alias-case" in {trace["task"]["game"] for trace in selected}
+
+
+def test_select_reflection_traces_prefers_strong_efficiency_examples() -> None:
+    weak_gain = {
+        "task": {"game": "weak-gain", "level": 0},
+        "result": {
+            "score": 0.10,
+            "solved": True,
+            "baseline_solved": True,
+            "expanded": 500,
+            "baseline_expanded": 650,
+        },
+    }
+    strong_gain = {
+        "task": {"game": "strong-gain", "level": 0},
+        "result": {
+            "score": 0.95,
+            "solved": True,
+            "baseline_solved": True,
+            "expanded": 200,
+            "baseline_expanded": 4000,
+        },
+    }
+
+    selected = select_reflection_traces([weak_gain, strong_gain], max_records=1)
+
+    assert selected[0]["task"]["game"] == "strong-gain"
 
 
 def test_build_seed_candidate_attaches_initial_gepa_addendum() -> None:
