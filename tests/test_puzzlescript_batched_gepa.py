@@ -1286,6 +1286,84 @@ def test_seeded_prompt_reuse_can_score_against_original_base_outputs(tmp_path: P
     assert batch.scores[0] < -5.0
 
 
+def test_nonbaseline_candidate_evaluation_reuses_exact_candidate_task_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = build_seed_candidate("Use role guards before generic keyword helpers.")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=_FakeLLM(""),
+        state_root=tmp_path,
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    task = PuzzleScriptLevelTask(
+        task_id=0,
+        game="cache-game",
+        level=2,
+        budget=100,
+        env_description="Win conditions: all crates on targets",
+        game_text_path=str(tmp_path / "game.txt"),
+    )
+    code_path = tmp_path / "cached_heuristic.py"
+    code_path.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0\n",
+        encoding="utf-8",
+    )
+    calls = {"synthesize": 0, "search": 0}
+
+    def fake_synthesize_batch(**_kwargs: object) -> list[dict[str, object]]:
+        calls["synthesize"] += 1
+        return [
+            {
+                "task_id": 0,
+                "game": "cache-game",
+                "level": 2,
+                "budget": 100,
+                "env_description": task.env_description,
+                "game_text_path": task.game_text_path,
+                "heuristic_code_path": str(code_path),
+                "synthesis_error": None,
+            }
+        ]
+
+    def fake_run_search(**_kwargs: object) -> list[dict[str, object]]:
+        calls["search"] += 1
+        return [
+            {
+                "task_id": 0,
+                "game": "cache-game",
+                "level": 2,
+                "score": 0.75,
+                "solved": True,
+                "expanded": 12,
+                "generated": 18,
+                "solution_length": 4,
+                "partial_progress_score": 1.0,
+                "feedback": "candidate solved",
+                "error": None,
+                "heuristic_code_path": str(code_path),
+            }
+        ]
+
+    monkeypatch.setattr(adapter, "_synthesize_batch", fake_synthesize_batch)
+    monkeypatch.setattr(adapter, "_run_search", fake_run_search)
+
+    first = adapter.evaluate(batch=[task], candidate=candidate, capture_traces=False)
+    second = adapter.evaluate(batch=[task], candidate=candidate, capture_traces=True)
+
+    assert calls == {"synthesize": 1, "search": 1}
+    assert first.outputs[0]["score"] == 0.75
+    assert second.outputs[0]["score"] == 0.75
+    assert second.trajectories is not None
+    assert "return 1.0" in second.trajectories[0]["heuristic_code"]
+    eval_dirs = sorted((tmp_path / "candidate_evals").glob("eval-*"))
+    assert len(eval_dirs) == 2
+    assert (eval_dirs[1] / "candidate_reuse.json").exists()
+
+
 def test_build_reflection_feedback_includes_trace_diagnostics_for_solved_regression() -> None:
     feedback = build_reflection_feedback(
         {

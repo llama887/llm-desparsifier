@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import hashlib
 import json
 import math
@@ -2059,6 +2060,10 @@ class PuzzleScriptBatchedGEPAAdapter:
         self.baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
         self.reuse_baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
         self.baseline_prompt_text: Optional[str] = None
+        self.candidate_eval_cache: dict[
+            tuple[str, tuple[tuple[str, int], ...]],
+            list[dict[str, Any]],
+        ] = {}
         self.eval_counter = _initial_eval_counter(self.state_root / "candidate_evals")
 
     def set_baseline_outputs(
@@ -2122,6 +2127,96 @@ class PuzzleScriptBatchedGEPAAdapter:
         )
         eval_dir.mkdir(parents=True, exist_ok=True)
         return eval_dir
+
+    def _candidate_eval_cache_key(
+        self,
+        candidate: Mapping[str, str],
+        batch: Sequence[PuzzleScriptLevelTask],
+    ) -> tuple[str, tuple[tuple[str, int], ...]]:
+        """Return the in-run reuse key for exact prompt/task evaluations.
+
+        GEPA can ask for the same prompt on the same task batch several times
+        while exploring the Pareto front. Reusing the first synthesized/search
+        result removes LLM resampling noise from those exact repeats without
+        changing how distinct prompts or distinct train/validation batches are
+        scored.
+        """
+        candidate_hash = hashlib.sha256(
+            json.dumps(candidate, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return candidate_hash, tuple((task.game, task.level) for task in batch)
+
+    def _reuse_candidate_evaluation(
+        self,
+        *,
+        eval_dir: Path,
+        batch: Sequence[PuzzleScriptLevelTask],
+        cache_key: tuple[str, tuple[tuple[str, int], ...]],
+        capture_traces: bool,
+    ) -> Optional[tuple[list[dict[str, Any]], list[float], Optional[list[dict[str, Any]]]]]:
+        """Return cached outputs for an exact non-baseline candidate repeat."""
+        cached_outputs = self.candidate_eval_cache.get(cache_key)
+        if cached_outputs is None:
+            return None
+        if len(cached_outputs) != len(batch):
+            return None
+
+        outputs = copy.deepcopy(cached_outputs)
+        trajectories: list[dict[str, Any]] = []
+        for task, result in zip(batch, outputs, strict=True):
+            result["task_id"] = task.task_id
+            result["game"] = task.game
+            result["level"] = task.level
+            self._attach_baseline_metadata(result)
+            if capture_traces:
+                code_path = result.get("heuristic_code_path")
+                heuristic_code = _read_optional_text(code_path, max_chars=16_000)
+                trajectories.append(
+                    {
+                        "task": asdict(task),
+                        "heuristic_code_path": code_path,
+                        "heuristic_code": heuristic_code,
+                        "synthesis_error": result.get("synthesis_error"),
+                        "result": result,
+                    }
+                )
+
+        scores = adjusted_candidate_scores(
+            outputs,
+            lost_solve_penalty=self.lost_solve_penalty,
+            new_solve_bonus=self.new_solve_bonus,
+            error_penalty=self.candidate_error_penalty,
+            score_delta_weight=self.score_delta_weight,
+            score_delta_clip=self.score_delta_clip,
+            partial_progress_weight=self.partial_progress_weight,
+            global_lost_solve_gate_penalty=self.global_lost_solve_gate_penalty,
+            global_net_solve_loss_gate_penalty=self.global_net_solve_loss_gate_penalty,
+        )
+        for output, adjusted_score in zip(outputs, scores, strict=True):
+            output["adjusted_score"] = adjusted_score
+        (eval_dir / "candidate_reuse.json").write_text(
+            json.dumps(
+                {
+                    "reused": True,
+                    "n_outputs": len(outputs),
+                    "reason": "exact candidate prompt and ordered task set",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (eval_dir / "synthesis_manifest.json").write_text("[]\n", encoding="utf-8")
+        (eval_dir / "merged_results.json").write_text(
+            json.dumps(outputs, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        (eval_dir / "scored_results.json").write_text(
+            json.dumps(outputs, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        return outputs, scores, trajectories if capture_traces else None
 
     def _synthesize_batch(
         self,
@@ -2426,6 +2521,26 @@ class PuzzleScriptBatchedGEPAAdapter:
                     trajectories=trajectories_or_none,
                 )
 
+        cache_key = self._candidate_eval_cache_key(candidate, batch)
+        candidate_reuse = self._reuse_candidate_evaluation(
+            eval_dir=eval_dir,
+            batch=batch,
+            cache_key=cache_key,
+            capture_traces=capture_traces,
+        )
+        if candidate_reuse is not None:
+            reused_outputs, reused_scores, trajectories_or_none = candidate_reuse
+            print(
+                f"[adapter] reused candidate outputs for exact prompt/task set: "
+                f"{len(reused_outputs)} level(s)",
+                flush=True,
+            )
+            return EvaluationBatch(
+                outputs=reused_outputs,
+                scores=reused_scores,
+                trajectories=trajectories_or_none,
+            )
+
         task_rows = self._synthesize_batch(candidate=candidate, batch=batch, eval_dir=eval_dir)
         results_by_id = {
             int(row["task_id"]): row
@@ -2501,6 +2616,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             f"candidate_errors={candidate_errors}",
             flush=True,
         )
+        self.candidate_eval_cache[cache_key] = copy.deepcopy(outputs)
         return EvaluationBatch(
             outputs=outputs,
             scores=scores,
