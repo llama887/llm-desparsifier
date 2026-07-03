@@ -2574,6 +2574,15 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "state-changing object; otherwise keep base-style terms primary and use "
                 "reachability or score only as small tie-breakers."
             )
+        if _records_show_dropped_reachability_search(records):
+            return (
+                "When a base-solved level used reachability or BFS for legal paths, "
+                "do not replace that passability model with plain Manhattan distance, "
+                "generic counts, or score fallback. Preserve base reachability inside "
+                "the prompt-internal branch whose RULES, COLLISIONLAYERS, terrain, "
+                "doors, blockers, hazards, or one-way effects make straight-line "
+                "distance misleading; simplify only weights and tie-breakers around it."
+            )
         if _records_show_dropped_gate_reachability(records):
             return (
                 "When a base-solved level used gate-aware reachability through "
@@ -2620,6 +2629,16 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "counts show the player must reach, clear, activate, enter, or move a "
                 "marked, goal, wall, switch, exit, crate, block, or similar interaction "
                 "object; otherwise keep count progress and score_normalized low weight."
+            )
+        if _records_show_dropped_reachability_search(records):
+            return (
+                "When both prompts solve but the candidate expands many more states after "
+                "replacing base reachability or BFS with plain Manhattan distance, counts, "
+                "or score terms, preserve base reachability inside the prompt-internal "
+                "branch whose RULES, COLLISIONLAYERS, terrain, doors, blockers, hazards, "
+                "or one-way effects make straight-line distance misleading. Keep the "
+                "reachability finite and local; simplify only weights and tie-breakers "
+                "around the passability model."
             )
         if "new_solve" in classifications:
             return (
@@ -2813,6 +2832,39 @@ def _records_show_dropped_player_interaction_distance(
         feedback = str(record.get("Feedback", "")).lower()
         if "player-to-interaction distance" in feedback and (
             "count-only" in feedback or "score-only" in feedback
+        ):
+            return True
+    return False
+
+
+def _records_show_dropped_reachability_search(records: Sequence[Mapping[str, Any]]) -> bool:
+    """Return whether a slower/lost candidate omitted base reachability logic.
+
+    This catches cases where the base prompt generated useful local BFS or
+    reachability for passability-constrained puzzles, but the candidate replaced
+    it with plain Manhattan distance, counts, or score fallback. The resulting
+    guidance is still one prompt-level principle rather than code-side routing.
+    """
+
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) not in {
+            "lost_baseline_solve",
+            "solved_regression",
+        }:
+            continue
+        baseline_output = cast(Mapping[str, Any], record.get("Baseline Output", {}))
+        generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
+        baseline_shape = cast(Mapping[str, Any], baseline_output.get("code_shape", {}))
+        generated_shape = cast(Mapping[str, Any], generated_output.get("code_shape", {}))
+        if bool(baseline_shape.get("uses_reachability_search")) and not bool(
+            generated_shape.get("uses_reachability_search")
+        ):
+            return True
+        feedback = str(record.get("Feedback", "")).lower()
+        if (
+            "base heuristic used reachability" in feedback
+            and "plain manhattan" in feedback
         ):
             return True
     return False

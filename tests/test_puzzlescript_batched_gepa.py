@@ -1498,6 +1498,51 @@ def test_custom_proposer_uses_player_distance_fallback_for_solved_regression() -
     assert "score_normalized" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_preserves_base_reachability_for_solved_regression() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "solved_regression"},
+                    "Baseline Output": {
+                        "code_shape": {"uses_reachability_search": True}
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_reachability_search": False,
+                            "uses_count_terms": True,
+                            "uses_distance_terms": True,
+                        }
+                    },
+                    "Feedback": (
+                        "EFFICIENCY REGRESSION: both prompts solved, but the "
+                        "candidate expanded 971 states versus 95 for the base. "
+                        "Code-shape contrast: the base heuristic used "
+                        "reachability/BFS-style search, while the candidate "
+                        "used plain Manhattan/count terms."
+                    ),
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
+    assert "preserve base reachability" in result["heuristic_prompt"]
+    assert "plain Manhattan" in result["heuristic_prompt"]
+
+
 def test_custom_proposer_preserves_base_solves_when_combining_new_solve_and_efficiency() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
