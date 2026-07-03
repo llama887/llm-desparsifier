@@ -4,8 +4,8 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=128G
-#SBATCH --time=07:00:00
-#SBATCH --gres=gpu:h100:2
+#SBATCH --time=01:30:00
+#SBATCH --gres=gpu:h100:1
 #SBATCH --account=torch_pr_45_tandon_advanced
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=fyy2003@nyu.edu
