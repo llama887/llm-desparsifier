@@ -43,6 +43,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     select_training_guard_tasks,
     split_train_dev_jobs,
     strip_outer_markdown_fences,
+    trace_classification,
     validate_heuristic_code,
     wait_for_shards,
 )
@@ -229,6 +230,21 @@ def test_build_train_dev_tasks_reassigns_task_ids_after_split() -> None:
     assert [task.task_id for task in train_tasks] == list(range(len(train_tasks)))
     assert [task.task_id for task in dev_tasks] == list(range(len(dev_tasks)))
     assert {task.game for task in train_tasks}.isdisjoint({task.game for task in dev_tasks})
+
+
+def test_trace_classification_flags_moderate_solved_efficiency_regression() -> None:
+    trace = {
+        "result": {
+            "solved": True,
+            "baseline_solved": True,
+            "score": 0.84,
+            "baseline_score": 0.86,
+            "expanded": 1_600,
+            "baseline_expanded": 1_400,
+        }
+    }
+
+    assert trace_classification(trace) == "solved_regression"
 
 
 def test_candidate_score_can_apply_explicit_eval_wide_gate_for_lost_solves_and_errors() -> None:

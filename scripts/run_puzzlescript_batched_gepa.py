@@ -19,6 +19,7 @@ import argparse
 import ast
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import os
 import random
@@ -72,6 +73,9 @@ DEFAULT_CANDIDATE_ERROR_PENALTY = 2.0
 DEFAULT_SCORE_DELTA_WEIGHT = 1.0
 DEFAULT_SCORE_DELTA_CLIP = 0.5
 DEFAULT_PARTIAL_PROGRESS_WEIGHT = 0.05
+DEFAULT_SOLVED_REGRESSION_SCORE_MARGIN = 0.01
+DEFAULT_SOLVED_REGRESSION_EXPANSION_MARGIN = 100.0
+DEFAULT_SOLVED_REGRESSION_EXPANSION_RATIO = 1.2
 DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4200
 DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 900
 DEFAULT_REFLECTION_DATASET_CHARS = 24000
@@ -269,20 +273,58 @@ def _trace_level(trace: Mapping[str, Any]) -> int:
         return 0
 
 
+def _optional_result_float(result: Mapping[str, Any], key: str) -> Optional[float]:
+    """Return a finite numeric result field, or None when it is unavailable."""
+    value = result.get(key)
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _is_solved_efficiency_regression(result: Mapping[str, Any]) -> bool:
+    """Return True when a candidate still solves but is meaningfully slower.
+
+    Normalized search score can hide common-solve slowdowns when the expansion
+    budget is large. The score margin catches direct metric regressions, while
+    the expansion margin/ratio catches cases that GEPA should see in reflection
+    even if solve-count gains dominate the scalar objective.
+    """
+    raw_score = _optional_result_float(result, "score")
+    baseline_score = _optional_result_float(result, "baseline_score")
+    if (
+        raw_score is not None
+        and baseline_score is not None
+        and raw_score + DEFAULT_SOLVED_REGRESSION_SCORE_MARGIN < baseline_score
+    ):
+        return True
+
+    expanded = _optional_result_float(result, "expanded")
+    baseline_expanded = _optional_result_float(result, "baseline_expanded")
+    if expanded is None or baseline_expanded is None or baseline_expanded <= 0:
+        return False
+    expansion_delta = expanded - baseline_expanded
+    return (
+        expansion_delta >= DEFAULT_SOLVED_REGRESSION_EXPANSION_MARGIN
+        and expanded >= baseline_expanded * DEFAULT_SOLVED_REGRESSION_EXPANSION_RATIO
+    )
+
+
 def trace_classification(trace: Mapping[str, Any]) -> str:
     """Classify a trace by how it changes behavior relative to the base prompt."""
     result = trace.get("result", {})
     solved = bool(result.get("solved", False))
     baseline_solved = bool(result.get("baseline_solved", False))
-    raw_score = float(result.get("score", 0.0))
-    baseline_score = float(result.get("baseline_score", 0.0))
     if is_candidate_error(result):
         return "candidate_error"
     if baseline_solved and not solved:
         return "lost_baseline_solve"
     if not baseline_solved and solved:
         return "new_solve"
-    if baseline_solved and solved and raw_score + 0.05 < baseline_score:
+    if baseline_solved and solved and _is_solved_efficiency_regression(result):
         return "solved_regression"
     if not solved:
         return "persistent_failure"
