@@ -1942,6 +1942,16 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "needed assignment, queue, or memo logic with plain local loops and literals."
         )
     if "lost_baseline_solve" in classifications:
+        if _records_show_lost_candidate_errors(records):
+            return (
+                "When a base-solved level regresses through validation or execution errors, "
+                "first preserve the base code-generation contract. No import statements, "
+                "decorators, imported helpers, file access, cached library utilities, or "
+                "external modules are allowed; implement queues, matching, reachability, "
+                "memoization, and assignment with plain local lists, dicts, sets, and loops. "
+                "Only add a prompt-level mechanics term when it can be expressed with that "
+                "local code shape and rule-grounded preconditions."
+            )
         if _records_show_dropped_blocker_structure(records):
             return (
                 "When RULES, COLLISIONLAYERS, aliases, or win text show movable blockers "
@@ -1988,6 +1998,33 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "finite/nonnegative, and otherwise preserve the base prompt behavior."
         )
     return ""
+
+
+def _records_show_lost_candidate_errors(records: Sequence[Mapping[str, Any]]) -> bool:
+    """Return whether lost base solves were caused by invalid candidate code.
+
+    Lost-solve reflection should not only reason about puzzle mechanics. If the
+    candidate failed before search, GEPA needs a prompt-level reminder to keep
+    new helper logic inside the existing no-import generated-code contract.
+    """
+
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) != "lost_baseline_solve":
+            continue
+        if bool(comparison.get("candidate_error", False)):
+            return True
+        generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
+        if str(generated_output.get("synthesis_error", "")).strip():
+            return True
+        feedback = str(record.get("Feedback", "")).lower()
+        if (
+            "validation failed" in feedback
+            or "imports are not allowed" in feedback
+            or "heuristic error" in feedback
+        ):
+            return True
+    return False
 
 
 def _records_show_dropped_blocker_structure(records: Sequence[Mapping[str, Any]]) -> bool:
