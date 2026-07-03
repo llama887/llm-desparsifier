@@ -202,6 +202,10 @@ INITIAL_GEPA_ADDENDUM_FILE_ARG=()
 if [ -n "${INITIAL_GEPA_ADDENDUM_FILE:-}" ]; then
     INITIAL_GEPA_ADDENDUM_FILE_ARG=(--initial-gepa-addendum-file "$INITIAL_GEPA_ADDENDUM_FILE")
 fi
+SCORING_BASELINE_OUTPUTS_FILE_ARG=()
+if [ -n "${SCORING_BASELINE_OUTPUTS_FILE:-}" ]; then
+    SCORING_BASELINE_OUTPUTS_FILE_ARG=(--scoring-baseline-outputs-file "$SCORING_BASELINE_OUTPUTS_FILE")
+fi
 
 echo "[run] state_root=$RUN_STATE_ROOT"
 echo "[run] model=$LOCAL_LLM_MODEL base_url=$OPENAI_BASE_URL"
@@ -209,6 +213,7 @@ echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_A
 echo "[run] search_extra_sbatch_args=${SEARCH_EXTRA_SBATCH_ARGS:-}"
 echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
 echo "[run] initial_gepa_addendum_file=${INITIAL_GEPA_ADDENDUM_FILE:-}"
+echo "[run] scoring_baseline_outputs_file=${SCORING_BASELINE_OUTPUTS_FILE:-}"
 
 "$SD_PATH/.venv/bin/python" -u scripts/run_puzzlescript_batched_gepa.py \
     --env-grid "${ENV_GRID:-configs/gepa_puzzlescript_envs.yaml}" \
@@ -251,6 +256,7 @@ echo "[run] initial_gepa_addendum_file=${INITIAL_GEPA_ADDENDUM_FILE:-}"
     --reflection-minibatch-size "${REFLECTION_MINIBATCH_SIZE:-0}" \
     --initial-gepa-addendum "${INITIAL_GEPA_ADDENDUM:-}" \
     "${INITIAL_GEPA_ADDENDUM_FILE_ARG[@]}" \
+    "${SCORING_BASELINE_OUTPUTS_FILE_ARG[@]}" \
     --seed "${GEPA_SEED:-0}"
 
 if [ "${RUN_HOLDOUT_COMPARE:-1}" = "1" ]; then

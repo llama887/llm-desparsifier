@@ -36,6 +36,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     evaluate_manifest_shards_locally,
     evaluate_search_task_with_wall_timeout,
     heuristic_code_shape,
+    load_scoring_baseline_outputs,
     local_search_fallback_workers,
     merge_validation_guard_tasks,
     parse_guard_level_selection,
@@ -1941,6 +1942,39 @@ def test_initial_addendum_rejects_inline_and_file(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="either inline"):
         read_initial_gepa_addendum("Inline addendum.", addendum_path)
+
+
+def test_load_scoring_baseline_outputs_orders_current_tasks(tmp_path: Path) -> None:
+    baseline_path = tmp_path / "scoring_baseline_outputs.json"
+    baseline_path.write_text(
+        """[
+  {"game": "extra", "level": 0, "score": 0.1},
+  {"game": "b", "level": 2, "score": 0.8},
+  {"game": "a", "level": 1, "score": 0.7}
+]""",
+        encoding="utf-8",
+    )
+    tasks = [
+        PuzzleScriptLevelTask(0, "a", 1, 100, "env-a", "a.txt"),
+        PuzzleScriptLevelTask(1, "b", 2, 100, "env-b", "b.txt"),
+    ]
+
+    rows = load_scoring_baseline_outputs(baseline_path, tasks)
+
+    assert [(row["game"], row["level"]) for row in rows] == [("a", 1), ("b", 2)]
+    assert [row["score"] for row in rows] == [0.7, 0.8]
+
+
+def test_load_scoring_baseline_outputs_rejects_missing_task(tmp_path: Path) -> None:
+    baseline_path = tmp_path / "scoring_baseline_outputs.json"
+    baseline_path.write_text('[{"game": "a", "level": 1, "score": 0.7}]', encoding="utf-8")
+    tasks = [
+        PuzzleScriptLevelTask(0, "a", 1, 100, "env-a", "a.txt"),
+        PuzzleScriptLevelTask(1, "missing", 2, 100, "env-b", "b.txt"),
+    ]
+
+    with pytest.raises(RuntimeError, match="missing:2"):
+        load_scoring_baseline_outputs(baseline_path, tasks)
 
 
 def test_base_prompt_evaluation_reuses_stored_baseline_outputs(tmp_path: Path) -> None:

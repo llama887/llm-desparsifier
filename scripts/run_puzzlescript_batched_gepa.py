@@ -737,6 +737,54 @@ def task_key(task: Any) -> tuple[str, int]:
     return _task_game(task), _task_level(task)
 
 
+def load_scoring_baseline_outputs(
+    path: Path,
+    tasks: Sequence[PuzzleScriptLevelTask],
+) -> list[dict[str, Any]]:
+    """Load original-base results for the current task set from a prior run.
+
+    Seeded GEPA runs score candidates against the unchanged base prompt, but the
+    base prompt itself is deterministic enough that repeatedly synthesizing and
+    searching it wastes scarce GPU time. This loader accepts a prior
+    ``scoring_baseline_outputs.json`` file, validates that every current task is
+    covered by ``(game, level)``, and returns rows ordered to match the current
+    task list. Extra rows are ignored so runs with different train/dev orderings
+    can still share a superset cache.
+    """
+    try:
+        payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"Could not read scoring baseline outputs: {path}") from exc
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Scoring baseline outputs must be a JSON list: {path}")
+    by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    for row in payload:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            key = (str(row["game"]), int(row["level"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        by_key[key] = dict(row)
+    ordered: list[dict[str, Any]] = []
+    missing: list[tuple[str, int]] = []
+    for task in tasks:
+        key = task_key(task)
+        row = by_key.get(key)
+        if row is None:
+            missing.append(key)
+            continue
+        ordered.append(dict(row))
+    if missing:
+        preview = ", ".join(f"{game}:{level}" for game, level in missing[:12])
+        if len(missing) > 12:
+            preview += f", ... ({len(missing)} total)"
+        raise RuntimeError(
+            "Scoring baseline outputs do not cover current tasks: " + preview
+        )
+    return ordered
+
+
 def _with_task_id(task: Any, task_id: int) -> Any:
     if is_dataclass(task) and not isinstance(task, type):
         return replace(cast(PuzzleScriptLevelTask, task), task_id=task_id)
@@ -3948,18 +3996,30 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     ]
     scoring_baseline_outputs: Optional[list[dict[str, Any]]] = None
     if initial_gepa_addendum:
-        base_candidate = {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
-        print(
-            "[gepa] evaluating original base prompt for seeded-run scoring: "
-            f"tasks={len(baseline_tasks)}",
-            flush=True,
-        )
-        scoring_baseline_batch = adapter.evaluate(
-            batch=baseline_tasks,
-            candidate=base_candidate,
-            capture_traces=False,
-        )
-        scoring_baseline_outputs = [dict(row) for row in scoring_baseline_batch.outputs]
+        if args.scoring_baseline_outputs_file is not None:
+            scoring_baseline_outputs = load_scoring_baseline_outputs(
+                args.scoring_baseline_outputs_file,
+                baseline_tasks,
+            )
+            print(
+                "[gepa] loaded original base prompt scoring baseline: "
+                f"tasks={len(scoring_baseline_outputs)} "
+                f"path={args.scoring_baseline_outputs_file}",
+                flush=True,
+            )
+        else:
+            base_candidate = {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
+            print(
+                "[gepa] evaluating original base prompt for seeded-run scoring: "
+                f"tasks={len(baseline_tasks)}",
+                flush=True,
+            )
+            scoring_baseline_batch = adapter.evaluate(
+                batch=baseline_tasks,
+                candidate=base_candidate,
+                capture_traces=False,
+            )
+            scoring_baseline_outputs = [dict(row) for row in scoring_baseline_batch.outputs]
         (state_root / "scoring_baseline_outputs.json").write_text(
             json.dumps(scoring_baseline_outputs, indent=2, sort_keys=True, default=str) + "\n",
             encoding="utf-8",
@@ -4210,6 +4270,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional path containing the initial GEPA addendum. Prefer this "
             "for SLURM launches because --export splits comma-heavy text."
+        ),
+    )
+    parser.add_argument(
+        "--scoring-baseline-outputs-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional prior scoring_baseline_outputs.json for seeded runs. "
+            "When supplied, the runner validates coverage by game/level and "
+            "skips regenerating the unchanged original base prompt."
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
