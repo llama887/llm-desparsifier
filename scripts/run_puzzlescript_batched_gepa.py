@@ -1136,6 +1136,13 @@ def build_repair_prompt(
         build_synthesis_prompt(prompt_text, task)
         + "\n\nThe previous output failed validation. Repair it once.\n"
         + f"Validation issue: {issue}\n"
+        + "Repair requirements: output exactly one heuristic_cost_to_go function. "
+        + "No import statements, decorators, imported helpers, file access, or "
+        + "cached library utilities are allowed anywhere, including inside helper "
+        + "functions. Never return float('inf'), math.inf, nan, or any other "
+        + "non-finite value; use bounded finite constants and clamp the final "
+        + "return nonnegative. Implement any queue or memo logic with plain local "
+        + "lists, indexes, loops, dicts, and sets.\n"
         + "Previous output:\n"
         + truncate_text(strip_outer_markdown_fences(bad_code), 12_000)
     )
@@ -1980,21 +1987,24 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
         return (
             "No import statements, decorators, imported helpers, file access, or cached "
             "library utilities are allowed anywhere in generated code, including inside "
-            "helper functions; never use collections.deque. Implement any needed "
-            "assignment, queue, or memo logic with plain local lists, indexes, loops, "
-            "dicts, and sets."
+            "helper functions; never use collections.deque. Never return float('inf'), "
+            "math.inf, nan, or other non-finite values; use bounded finite constants "
+            "and clamp the final return nonnegative. Implement any needed assignment, "
+            "queue, or memo logic with plain local lists, indexes, loops, dicts, and sets."
         )
     if "lost_baseline_solve" in classifications:
         if _records_show_lost_candidate_errors(records):
             return (
-                "When a base-solved level regresses through validation or execution errors, "
-                "first preserve the base code-generation contract. No import statements, "
-                "decorators, imported helpers, file access, cached library utilities, or "
-                "external modules are allowed, including inside helper functions; never "
-                "use collections.deque. Implement queues, matching, reachability, "
-                "memoization, and assignment with plain local lists, indexes, dicts, "
-                "sets, and loops. Only add a prompt-level mechanics term when it can be "
-                "expressed with that local code shape and rule-grounded preconditions."
+                "When a base-solved level regresses via code errors, "
+                "preserve the code contract before changing mechanics. No import statements, "
+                "decorators, imported helpers, file access, external modules, or "
+                "collections.deque are allowed anywhere, including inside "
+                "helper functions. Never return float('inf'), math.inf, nan, or other "
+                "non-finite values; use bounded finite constants and clamp the final "
+                "return nonnegative. Implement queues, matching, reachability, memoization, "
+                "and assignment with plain local lists, indexes, dicts, sets, and loops. "
+                "Add mechanics terms only when this code shape supports rule-grounded "
+                "preconditions."
             )
         if _records_show_reachability_overfit(records):
             return (

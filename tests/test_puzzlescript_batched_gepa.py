@@ -26,6 +26,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     adjusted_candidate_scores,
     assigned_tasks,
     build_reflection_feedback,
+    build_repair_prompt,
     build_sbatch_array_command,
     build_seed_candidate,
     build_train_dev_tasks,
@@ -1150,6 +1151,46 @@ def test_custom_proposer_uses_code_contract_fallback_for_lost_solve_errors() -> 
     assert "base-solved" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_uses_finite_contract_fallback_for_lost_solve_errors() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {
+                        "classification": "lost_baseline_solve",
+                        "candidate_error": True,
+                    },
+                    "Feedback": (
+                        "REGRESSION: base prompt solved but candidate failed. "
+                        "Heuristic validation failed before search: "
+                        "direct non-finite heuristic returns are not allowed."
+                    ),
+                    "Generated Outputs": {
+                        "synthesis_error": "direct non-finite heuristic returns are not allowed"
+                    },
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
+    assert "non-finite" in result["heuristic_prompt"]
+    assert "float('inf')" in result["heuristic_prompt"]
+    assert "bounded finite" in result["heuristic_prompt"]
+
+
 def test_custom_proposer_uses_blocker_preservation_fallback_for_noop_output() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
@@ -1267,6 +1308,30 @@ def test_custom_proposer_uses_code_contract_fallback_for_candidate_errors() -> N
     assert "No import statements" in result["heuristic_prompt"]
     assert "collections.deque" in result["heuristic_prompt"]
     assert "decorators" in result["heuristic_prompt"]
+
+
+def test_repair_prompt_restates_code_contract_requirements() -> None:
+    task = PuzzleScriptLevelTask(
+        task_id=0,
+        game="FiniteRepair",
+        level=0,
+        budget=100,
+        env_description="WINCONDITIONS\nAll goal on target.",
+        game_text_path="/tmp/game.txt",
+    )
+
+    prompt = build_repair_prompt(
+        PUZZLESCRIPT_HEURISTIC_CONTRACT,
+        task,
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n    return float('inf')",
+        "direct non-finite heuristic returns are not allowed",
+    )
+
+    assert "No import statements" in prompt
+    assert "float('inf')" in prompt
+    assert "non-finite" in prompt
+    assert "bounded finite" in prompt
+    assert "plain local lists" in prompt
 
 
 def test_custom_proposer_rejects_code_as_revised_prompt() -> None:
