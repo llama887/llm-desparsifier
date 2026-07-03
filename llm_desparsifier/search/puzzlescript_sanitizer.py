@@ -5,7 +5,7 @@ for PuzzleScript where ctx is a plain dict and the LLM needs to access
 nested dicts (object_positions, etc.). This sanitizer validates:
   - Exactly one function named heuristic_cost_to_go(ts, env_params, ctx)
   - No imports, exec, eval, open, __builtins__, compile
-  - No non-finite constants or sentinels such as float("inf") or math.nan
+  - No direct non-finite returns such as return float("inf") or return math.nan
   - Only math is available in the namespace
 """
 
@@ -32,6 +32,37 @@ _NONFINITE_FLOAT_STRINGS = frozenset({
     "+nan",
     "-nan",
 })
+
+
+def _is_direct_nonfinite_expr(node: ast.AST) -> bool:
+    """Return True when an expression is an obvious non-finite literal value.
+
+    PuzzleScript heuristics may use ``float("inf")`` as an internal matching
+    sentinel and then replace it with a finite value. Runtime search already
+    rejects actual non-finite heuristic returns, so static validation only
+    rejects direct return expressions that are unambiguously non-finite.
+    """
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        return _is_direct_nonfinite_expr(node.operand)
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, float) and not math.isfinite(node.value)
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "math"
+        and node.attr in {"inf", "nan"}
+    ):
+        return True
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "float"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and node.args[0].value.strip().lower() in _NONFINITE_FLOAT_STRINGS
+    )
 
 
 def _strip_markdown_fences(code: str) -> str:
@@ -64,16 +95,6 @@ class _PuzzleScriptHeuristicValidator(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name) and node.func.id in _BANNED_NAMES:
             raise ValueError(f"'{node.func.id}' is not allowed")
-        if (
-            isinstance(node.func, ast.Name)
-            and node.func.id == "float"
-            and len(node.args) == 1
-            and not node.keywords
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-            and node.args[0].value.strip().lower() in _NONFINITE_FLOAT_STRINGS
-        ):
-            raise ValueError("non-finite float sentinels are not allowed")
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -81,18 +102,9 @@ class _PuzzleScriptHeuristicValidator(ast.NodeVisitor):
             raise ValueError(f"'{node.id}' is not allowed")
         self.generic_visit(node)
 
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        if (
-            isinstance(node.value, ast.Name)
-            and node.value.id == "math"
-            and node.attr in {"inf", "nan"}
-        ):
-            raise ValueError("non-finite math constants are not allowed")
-        self.generic_visit(node)
-
-    def visit_Constant(self, node: ast.Constant) -> None:
-        if isinstance(node.value, float) and not math.isfinite(node.value):
-            raise ValueError("non-finite numeric constants are not allowed")
+    def visit_Return(self, node: ast.Return) -> None:
+        if node.value is not None and _is_direct_nonfinite_expr(node.value):
+            raise ValueError("direct non-finite heuristic returns are not allowed")
         self.generic_visit(node)
 
 

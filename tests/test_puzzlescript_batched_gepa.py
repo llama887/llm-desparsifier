@@ -101,13 +101,27 @@ def heuristic_cost_to_go(ts, env_params, ctx):
     assert "imports are not allowed" in issue
 
 
-def test_validate_heuristic_code_rejects_non_finite_sentinels() -> None:
+def test_validate_heuristic_code_allows_internal_non_finite_sentinel() -> None:
     code = """
 def heuristic_cost_to_go(ts, env_params, ctx):
     if ctx.get("is_winning"):
         return 0.0
     best = float("inf")
+    best = min(best, 1.0)
     return best
+"""
+
+    issue = validate_heuristic_code(code)
+
+    assert issue is None
+
+
+def test_validate_heuristic_code_rejects_direct_non_finite_return() -> None:
+    code = """
+def heuristic_cost_to_go(ts, env_params, ctx):
+    if ctx.get("is_winning"):
+        return 0.0
+    return float("inf")
 """
 
     issue = validate_heuristic_code(code)
