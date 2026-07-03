@@ -150,7 +150,7 @@ if [ -z "${VLLM_TENSOR_PARALLEL_SIZE:-}" ]; then
         IFS=',' read -r -a _visible_gpu_ids <<< "$CUDA_VISIBLE_DEVICES"
         VLLM_TENSOR_PARALLEL_SIZE="${#_visible_gpu_ids[@]}"
     else
-        VLLM_TENSOR_PARALLEL_SIZE=2
+        VLLM_TENSOR_PARALLEL_SIZE=1
     fi
     export VLLM_TENSOR_PARALLEL_SIZE
 fi
