@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,8 +31,10 @@ from scripts.run_puzzlescript_batched_gepa import (
     candidate_prompt_issue,
     candidate_score,
     context_retry_max_tokens,
+    evaluate_manifest_shards_locally,
     evaluate_search_task_with_wall_timeout,
     heuristic_code_shape,
+    local_search_fallback_workers,
     merge_validation_guard_tasks,
     parse_guard_level_selection,
     select_reflection_traces,
@@ -138,6 +141,64 @@ def test_wait_for_shards_raises_with_missing_indices_on_stall(tmp_path: Path) ->
 
     assert exc_info.value.present_count == 1
     assert exc_info.value.missing_indices == [1, 2]
+
+
+def test_local_search_fallback_workers_uses_allocated_cpus() -> None:
+    assert local_search_fallback_workers(
+        missing_indices=[0, 1, 2, 3],
+        environ={"SLURM_CPUS_PER_TASK": "8"},
+    ) == 4
+    assert local_search_fallback_workers(
+        missing_indices=[0, 1, 2, 3],
+        environ={
+            "SLURM_CPUS_PER_TASK": "8",
+            "SEARCH_LOCAL_FALLBACK_WORKERS": "2",
+        },
+    ) == 2
+    assert local_search_fallback_workers(
+        missing_indices=[0, 1, 2, 3],
+        environ={"SLURM_CPUS_PER_TASK": "not-an-int"},
+    ) == 1
+
+
+def test_evaluate_manifest_shards_locally_uses_bounded_parallelism(tmp_path: Path) -> None:
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_evaluate_manifest_shard(
+        *,
+        manifest_path: Path,
+        array_index: int,
+        array_count: int,
+    ) -> Path:
+        nonlocal active, max_active
+        del manifest_path, array_count
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.02)
+        shard_path = tmp_path / f"task-{array_index:04d}-of-0004.json"
+        shard_path.write_text("{}\n", encoding="utf-8")
+        with lock:
+            active -= 1
+        return shard_path
+
+    paths = evaluate_manifest_shards_locally(
+        manifest_path=tmp_path / "manifest.json",
+        array_count=4,
+        missing_indices=[0, 1, 2, 3],
+        max_workers=2,
+        evaluate_fn=fake_evaluate_manifest_shard,
+    )
+
+    assert [path.name for path in paths] == [
+        "task-0000-of-0004.json",
+        "task-0001-of-0004.json",
+        "task-0002-of-0004.json",
+        "task-0003-of-0004.json",
+    ]
+    assert max_active == 2
 
 
 def test_split_train_dev_jobs_is_deterministic_and_non_overlapping() -> None:

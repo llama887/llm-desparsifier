@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from queue import Empty
-from typing import Any, Mapping, Optional, Protocol, Sequence, cast
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, cast
 
 import yaml
 
@@ -1316,6 +1316,83 @@ def evaluate_manifest_shard(
     return shard_path
 
 
+def local_search_fallback_workers(
+    *,
+    missing_indices: Sequence[int],
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    """Return the worker count for local search fallback after an array stall.
+
+    Slurm arrays are preferred for normal search work. When an array cannot
+    start soon enough, the GPU controller falls back to local shard evaluation
+    and should use the CPUs it was actually allocated. An explicit
+    SEARCH_LOCAL_FALLBACK_WORKERS override wins for manual runs; otherwise the
+    Slurm CPU allocation bounds parallelism. Invalid or absent values preserve
+    the old single-worker behavior.
+    """
+    missing_count = len(missing_indices)
+    if missing_count <= 0:
+        return 0
+    env = os.environ if environ is None else environ
+    for name in ("SEARCH_LOCAL_FALLBACK_WORKERS", "SLURM_CPUS_PER_TASK"):
+        value = env.get(name)
+        if value is None:
+            continue
+        try:
+            workers = int(value)
+        except ValueError:
+            continue
+        if workers > 0:
+            return min(missing_count, workers)
+    return 1
+
+
+def evaluate_manifest_shards_locally(
+    *,
+    manifest_path: Path,
+    array_count: int,
+    missing_indices: Sequence[int],
+    max_workers: int,
+    evaluate_fn: Callable[..., Path] = evaluate_manifest_shard,
+) -> list[Path]:
+    """Evaluate missing search shards in-process with bounded parallelism.
+
+    This is only a fallback for stalled Slurm arrays. The worker cap is kept
+    separate from the array concurrency because local fallback runs inside the
+    GPU controller allocation, where oversubscribing CPUs can slow both search
+    and LLM serving.
+    """
+    indices = list(missing_indices)
+    if not indices:
+        return []
+    worker_count = max(1, min(max_workers, len(indices)))
+    if worker_count == 1:
+        return [
+            evaluate_fn(
+                manifest_path=manifest_path,
+                array_index=index,
+                array_count=array_count,
+            )
+            for index in indices
+        ]
+
+    paths_by_index: dict[int, Path] = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = {
+            pool.submit(
+                evaluate_fn,
+                manifest_path=manifest_path,
+                array_index=index,
+                array_count=array_count,
+            ): index
+            for index in indices
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            paths_by_index[index] = future.result()
+    return [paths_by_index[index] for index in indices]
+
+
 def build_sbatch_array_command(
     *,
     manifest_path: Path,
@@ -1940,12 +2017,20 @@ class PuzzleScriptBatchedGEPAAdapter:
             if submitted_job_id:
                 subprocess.run(["scancel", submitted_job_id], check=False)
                 print(f"[search-array] cancelled stalled job_id={submitted_job_id}", flush=True)
-            for array_index in exc.missing_indices:
-                evaluate_manifest_shard(
-                    manifest_path=manifest_path,
-                    array_index=array_index,
-                    array_count=array_count,
-                )
+            fallback_workers = local_search_fallback_workers(
+                missing_indices=exc.missing_indices
+            )
+            print(
+                "[search-array] running local fallback for "
+                f"{len(exc.missing_indices)} shard(s) with {fallback_workers} worker(s)",
+                flush=True,
+            )
+            evaluate_manifest_shards_locally(
+                manifest_path=manifest_path,
+                array_count=array_count,
+                missing_indices=exc.missing_indices,
+                max_workers=fallback_workers,
+            )
             shard_paths = wait_for_shards(
                 shard_dir=shard_dir,
                 array_count=array_count,
