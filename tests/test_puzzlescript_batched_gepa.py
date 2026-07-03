@@ -873,7 +873,7 @@ def test_custom_proposer_extracts_addendum_from_full_prompt_output() -> None:
     assert "Prefer exact LEGEND names" in result["heuristic_prompt"]
 
 
-def test_custom_proposer_uses_feedback_fallback_for_noop_output() -> None:
+def test_custom_proposer_does_not_force_heuristic_policy_fallback_for_noop_output() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=llm,  # type: ignore[arg-type]
@@ -897,10 +897,34 @@ def test_custom_proposer_uses_feedback_fallback_for_noop_output() -> None:
         components_to_update=["heuristic_prompt"],
     )
 
-    assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
-    assert "reusable heuristic-design checklist" in result["heuristic_prompt"]
-    assert "decide whether progress is monotonic or reversible" in result["heuristic_prompt"]
-    assert "score_normalized as a tie-breaker" in result["heuristic_prompt"]
+    assert result["heuristic_prompt"] == PUZZLESCRIPT_HEURISTIC_CONTRACT
+
+
+def test_custom_proposer_does_not_force_lost_solve_fallback_for_noop_output() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "lost_baseline_solve"},
+                    "Feedback": "REGRESSION: base prompt solved but candidate failed.",
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] == PUZZLESCRIPT_HEURISTIC_CONTRACT
 
 
 def test_custom_proposer_uses_code_contract_fallback_for_candidate_errors() -> None:

@@ -1826,13 +1826,13 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
 
 
 def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> str:
-    """Return a conservative exploration addendum when the proposer no-ops.
+    """Return a narrow safety addendum when the proposer no-ops.
 
     Local LLMs sometimes answer the addendum prompt by restating the base prompt
-    or by producing code. Keeping the current prompt in that case makes GEPA
-    spend every iteration on an exact baseline reuse. This fallback creates one
-    safe, general candidate from the available feedback while preserving the
-    base prompt's mechanics-first contract.
+    or by producing code. For heuristic-policy feedback, forcing a broad
+    fallback addendum can over-shape the single-prompt search and has measured
+    regressions on base-solved levels. Keep only the code-contract repair path,
+    where the feedback is unambiguous and independent of puzzle mechanics.
     """
     if not records:
         return ""
@@ -1846,29 +1846,7 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "library utilities are allowed anywhere in generated code; implement any "
             "needed assignment, queue, or memo logic with plain local loops and literals."
         )
-    if "lost_baseline_solve" in classifications:
-        return (
-            "Use one decision procedure before adding any strong term: first prove from "
-            "WINCONDITIONS, RULES, LEGEND, and COLLISIONLAYERS whether progress is "
-            "monotonic, objects are stable, and a deadlock or missing object is "
-            "irreversible. If not proved, keep only low-weight interaction distances "
-            "and score_normalized tie-breakers so base-solved mechanics are preserved."
-        )
-    if "new_solve" in classifications:
-        return (
-            "Generalize new-solve evidence as a preconditioned rule, not a named-game "
-            "feature: use explicit win-condition counts or distances only after the "
-            "rules show stable object roles and monotonic progress; otherwise keep the "
-            "new feature low weight and secondary to legal interaction distance and "
-            "score_normalized progress."
-        )
-    return (
-        "Use a reusable heuristic-design checklist: read WINCONDITIONS, RULES, LEGEND, "
-        "COLLISIONLAYERS, and the initial state; decide whether progress is monotonic "
-        "or reversible; then add at most one low-weight feature justified by that "
-        "decision, keeping score_normalized as a tie-breaker when the rule evidence is "
-        "ambiguous."
-    )
+    return ""
 
 
 def heuristic_code_shape(code: str) -> dict[str, bool]:
