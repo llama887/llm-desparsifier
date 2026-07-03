@@ -2260,6 +2260,15 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "state-changing object; otherwise keep base-style terms primary and use "
                 "reachability or score only as small tie-breakers."
             )
+        if _records_show_dropped_gate_reachability(records):
+            return (
+                "When a base-solved level used gate-aware reachability through "
+                "open/closed doors, switches, or weighted switches, do not replace that "
+                "coupled passability model with plain Manhattan distance or a scalar "
+                "door penalty. Preserve the observable gate-state precondition from "
+                "RULES, COLLISIONLAYERS, aliases, and current object counts, and use "
+                "finite local BFS/reachability only inside that prompt-internal branch."
+            )
         if _records_show_dropped_blocker_structure(records):
             return (
                 "When RULES, COLLISIONLAYERS, aliases, or win text show movable blockers "
@@ -2474,6 +2483,30 @@ def _records_show_dropped_alias_gate_structure(records: Sequence[Mapping[str, An
     return False
 
 
+def _records_show_dropped_gate_reachability(records: Sequence[Mapping[str, Any]]) -> bool:
+    """Return whether a lost solve dropped reachability conditioned on gate state.
+
+    Plain Manhattan terms or scalar door penalties often look cheaper, but they
+    can erase the causal structure that let the base prompt solve switch/door
+    puzzles. This feedback remains prompt-level evidence; it does not create
+    runner-side game buckets.
+    """
+
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) != "lost_baseline_solve":
+            continue
+        baseline_output = cast(Mapping[str, Any], record.get("Baseline Output", {}))
+        generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
+        baseline_shape = cast(Mapping[str, Any], baseline_output.get("code_shape", {}))
+        generated_shape = cast(Mapping[str, Any], generated_output.get("code_shape", {}))
+        if bool(baseline_shape.get("uses_gate_aware_reachability")) and not bool(
+            generated_shape.get("uses_gate_aware_reachability")
+        ):
+            return True
+    return False
+
+
 def heuristic_code_shape(code: str) -> dict[str, bool]:
     """Return compact flags describing generated heuristic strategy shape.
 
@@ -2486,6 +2519,34 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
         re.search(r"\b(?:1_000_000|1000000|10000|5000|1000|500)(?:\.0)?\b", lowered)
         or re.search(r"\b1e[5-9]\b", lowered)
     )
+    uses_reachability_search = any(
+        marker in lowered
+        for marker in (
+            "while queue",
+            "q_index",
+            "visited",
+            "bfs",
+            "dist = [[",
+            "reachable",
+        )
+    )
+    uses_gate_terms = "door" in lowered and "switch" in lowered
+    uses_gate_state_terms = any(
+        term in lowered
+        for term in (
+            "closed_door",
+            "closed_doors",
+            "open_door",
+            "open_doors",
+            "yellowopen",
+            "purpleopen",
+            "weighted_switch",
+            "weighted_switches",
+            "unweighted",
+            "passable",
+            "impassable",
+        )
+    )
     return {
         "uses_generic_role_helpers": "role_positions" in lowered or "role_keywords" in lowered,
         "uses_score_fallback": "score_normalized" in lowered,
@@ -2497,16 +2558,9 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
             or re.search(r"\bmath\.inf\b", lowered)
             or re.search(r"\binf\b", lowered)
         ),
-        "uses_reachability_search": any(
-            marker in lowered
-            for marker in (
-                "while queue",
-                "q_index",
-                "visited",
-                "bfs",
-                "dist = [[",
-                "reachable",
-            )
+        "uses_reachability_search": uses_reachability_search,
+        "uses_gate_aware_reachability": (
+            uses_reachability_search and uses_gate_terms and uses_gate_state_terms
         ),
         "mentions_mechanics_terms": any(
             term in lowered
@@ -2625,6 +2679,14 @@ def _code_shape_diagnostic_line(
             "the base heuristic modeled weighted switch or door/switch gate state that "
             "the candidate omitted; preserve gate-state preconditions before reducing "
             "the game to distance terms"
+        )
+    if baseline_shape.get("uses_gate_aware_reachability") and not generated_shape.get(
+        "uses_gate_aware_reachability"
+    ):
+        parts.append(
+            "the base heuristic used gate-aware reachability through open/closed doors "
+            "or weighted switches; preserve that coupled passability model instead of "
+            "replacing it with Manhattan distance or a scalar door penalty"
         )
     if not parts:
         return ""

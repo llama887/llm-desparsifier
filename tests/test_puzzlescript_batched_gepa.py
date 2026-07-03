@@ -670,6 +670,8 @@ def test_heuristic_code_shape_flags_generic_fallback_and_mechanics_terms() -> No
         "    crate_keys = ['ncrate', 'mixcrate', 'matchcrate']\n"
         "    players = ['controlplayer', 'dummy']\n"
         "    weighted_switches = len(yellowswitches)\n"
+        "    closed_doors = door_cells - open_doors\n"
+        "    while queue: reachable = True\n"
         "    return 1000.0 if 'yellowdoor' else len(crate_positions) + len(targets) + corner_deadlock\n"
     )
 
@@ -682,6 +684,7 @@ def test_heuristic_code_shape_flags_generic_fallback_and_mechanics_terms() -> No
     assert shape["uses_deadlock_checks"] is True
     assert shape["uses_alias_specific_terms"] is True
     assert shape["uses_weighted_switch_terms"] is True
+    assert shape["uses_gate_aware_reachability"] is True
 
 
 def test_candidate_prompt_issue_rejects_code_but_allows_contract_signature() -> None:
@@ -1509,6 +1512,47 @@ def test_custom_proposer_uses_alias_gate_preservation_fallback_for_noop_output()
     assert "LEGEND aliases" in result["heuristic_prompt"]
     assert "weighted switch" in result["heuristic_prompt"]
     assert "prompt-internal" in result["heuristic_prompt"]
+
+
+def test_custom_proposer_uses_gate_reachability_fallback_for_noop_output() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "lost_baseline_solve"},
+                    "Feedback": "REGRESSION: base prompt solved but candidate failed.",
+                    "Baseline Output": {
+                        "code_shape": {
+                            "uses_gate_aware_reachability": True,
+                            "uses_weighted_switch_terms": True,
+                        }
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_gate_aware_reachability": False,
+                            "uses_weighted_switch_terms": True,
+                        }
+                    },
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "gate-aware reachability" in result["heuristic_prompt"]
+    assert "open/closed doors" in result["heuristic_prompt"]
+    assert "Manhattan" in result["heuristic_prompt"]
 
 
 def test_custom_proposer_rejects_overstrict_role_precondition_addendum() -> None:
