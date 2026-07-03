@@ -1376,6 +1376,8 @@ def test_custom_proposer_combines_remote_motion_loss_and_code_contract_fallback(
     assert "remote" in revised_prompt
     assert "carried" in revised_prompt
     assert "object names alone" in revised_prompt
+    assert "prompt-internal" in revised_prompt
+    assert "runner buckets" in revised_prompt
     assert "no imports" in revised_prompt.lower()
     assert "non-finite" in revised_prompt
 

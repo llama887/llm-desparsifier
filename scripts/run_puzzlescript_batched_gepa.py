@@ -2163,7 +2163,9 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
     Local LLMs sometimes answer the addendum prompt by restating the base prompt
     or by producing code. This fallback keeps GEPA moving with one conservative
     prompt-level hypothesis derived from comparison classes. It intentionally
-    avoids named games, code-side routing, and broad mechanics inventories.
+    avoids named games, runner-side routing, and broad mechanics inventories
+    while still allowing GEPA to express rule-grounded categories inside the
+    single prompt.
     """
     if not records:
         return ""
@@ -2184,25 +2186,27 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
         if _records_show_remote_motion_losses(records):
             if _records_show_lost_candidate_errors(records):
                 return (
-                    "When aggregate feedback shows losses on beam, laser, sensor, wrap, "
-                    "remote-pickup, carrying, pulling, swapping, or force-motion rules, "
-                    "do not infer hidden carried-object states, remote interaction "
-                    "distance, or irreversible effects from object names alone. Keep "
-                    "base-style target/object matching and player-to-interaction terms "
-                    "unless RULES plus ctx object_positions directly support the stronger "
-                    "term. Also preserve code safety: no imports, decorators, external "
-                    "helpers, collections.deque, float('inf'), math.inf, nan, or other "
-                    "non-finite returns; use bounded finite values and local lists, "
-                    "indexes, dicts, sets, and loops."
+                    "When feedback shows losses on beam/laser/sensor/wrap/"
+                    "remote-pickup/carrying/pulling/swapping/force-motion rules, do not "
+                    "infer hidden carried states, remote distances, or irreversible "
+                    "effects from object names alone. Keep base-style target/object "
+                    "matching/player-interaction terms unless RULES plus "
+                    "ctx object_positions support it. Preserve code safety: "
+                    "no imports/decorators/external helpers/collections.deque/"
+                    "float('inf')/math.inf/nan/non-finite returns; use bounded finite "
+                    "values and local lists/indexes/dicts/sets/loops. If "
+                    "categories are needed, keep them prompt-internal from observed "
+                    "rules/state; do not request runner buckets."
                 )
             return (
-                "When aggregate feedback shows losses on beam, laser, sensor, wrap, "
-                "remote-pickup, carrying, pulling, swapping, or force-motion rules, do "
-                "not infer hidden carried-object states, remote interaction distance, or "
-                "irreversible effects from object names alone. Preserve base-style "
-                "target/object matching and player-to-interaction terms unless RULES "
-                "plus ctx object_positions directly support the stronger term; use "
-                "score_normalized only as a low-weight fallback."
+                "When feedback shows losses on beam/laser/sensor/wrap/"
+                "remote-pickup/carrying/pulling/swapping/force-motion rules, do not "
+                "infer hidden carried states, remote distances, or irreversible effects "
+                "from object names alone. Preserve base-style target/object matching and "
+                "player-to-interaction terms unless RULES plus ctx object_positions "
+                "support a stronger term; use score_normalized only as a low-weight "
+                "fallback. If categories are needed, keep them prompt-internal from "
+                "observed rules/state; do not request runner buckets."
             )
         if _records_show_lost_candidate_errors(records):
             return (
