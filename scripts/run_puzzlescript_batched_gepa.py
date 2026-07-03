@@ -2181,6 +2181,29 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "queue, or memo logic with plain local lists, indexes, loops, dicts, and sets."
         )
     if "lost_baseline_solve" in classifications:
+        if _records_show_remote_motion_losses(records):
+            if _records_show_lost_candidate_errors(records):
+                return (
+                    "When aggregate feedback shows losses on beam, laser, sensor, wrap, "
+                    "remote-pickup, carrying, pulling, swapping, or force-motion rules, "
+                    "do not infer hidden carried-object states, remote interaction "
+                    "distance, or irreversible effects from object names alone. Keep "
+                    "base-style target/object matching and player-to-interaction terms "
+                    "unless RULES plus ctx object_positions directly support the stronger "
+                    "term. Also preserve code safety: no imports, decorators, external "
+                    "helpers, collections.deque, float('inf'), math.inf, nan, or other "
+                    "non-finite returns; use bounded finite values and local lists, "
+                    "indexes, dicts, sets, and loops."
+                )
+            return (
+                "When aggregate feedback shows losses on beam, laser, sensor, wrap, "
+                "remote-pickup, carrying, pulling, swapping, or force-motion rules, do "
+                "not infer hidden carried-object states, remote interaction distance, or "
+                "irreversible effects from object names alone. Preserve base-style "
+                "target/object matching and player-to-interaction terms unless RULES "
+                "plus ctx object_positions directly support the stronger term; use "
+                "score_normalized only as a low-weight fallback."
+            )
         if _records_show_lost_candidate_errors(records):
             return (
                 "When a base-solved level regresses via code errors, "
@@ -2285,6 +2308,51 @@ def _records_show_lost_candidate_errors(records: Sequence[Mapping[str, Any]]) ->
             or "imports are not allowed" in feedback
             or "heuristic error" in feedback
         ):
+            return True
+    return False
+
+
+def _records_show_remote_motion_losses(records: Sequence[Mapping[str, Any]]) -> bool:
+    """Return whether aggregate or trace feedback shows remote-motion losses.
+
+    This is a prompt-level repair signal, not a runner bucket. It fires only
+    when GEPA-visible feedback indicates that mechanics involving beams,
+    carrying, wrapping, swapping, pulling, or remote interaction coincided with
+    lost base solves, which has been a recurring failure mode for the otherwise
+    useful persistent-mechanics addendum.
+    """
+    remote_terms = (
+        "beam",
+        "laser",
+        "sensor",
+        "wrap",
+        "remote",
+        "pickup",
+        "carrying",
+        "carried",
+        "pull",
+        "swap",
+        "force-motion",
+        "force motion",
+        "tractor",
+    )
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        classification = str(comparison.get("classification", ""))
+        feedback = str(record.get("Feedback", "")).lower()
+        mechanics = str(comparison.get("mechanics_signature", "")).lower()
+        has_remote_term = any(term in feedback or term in mechanics for term in remote_terms)
+        if not has_remote_term:
+            continue
+        if classification == "aggregate_summary":
+            if "mechanics losses:" in feedback or "game losses:" in feedback:
+                lost = comparison.get("lost_baseline_solve_count")
+                new = comparison.get("new_solve_count")
+                try:
+                    return int(lost) > int(new)
+                except (TypeError, ValueError):
+                    return "net=-" in feedback or "lost=" in feedback
+        if classification == "lost_baseline_solve":
             return True
     return False
 
