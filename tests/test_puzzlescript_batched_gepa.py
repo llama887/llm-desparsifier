@@ -1757,6 +1757,19 @@ def test_initial_addendum_file_preserves_prompt_routing_text(tmp_path: Path) -> 
     assert "COLLISIONLAYERS, and state properties" in prompt
 
 
+def test_code_contract_seed_file_builds_valid_prompt() -> None:
+    addendum = Path("configs/gepa_seed_addenda/code_contract_repair.txt").read_text(
+        encoding="utf-8"
+    )
+
+    prompt = build_seed_candidate(addendum)["heuristic_prompt"]
+
+    assert "No import statements" in prompt
+    assert "collections.deque" in prompt
+    assert "non-finite" in prompt
+    assert "Additional GEPA guidance" in prompt
+
+
 def test_initial_addendum_rejects_inline_and_file(tmp_path: Path) -> None:
     addendum_path = tmp_path / "seed_addendum.txt"
     addendum_path.write_text("Use score_normalized only as a tie-breaker.", encoding="utf-8")
