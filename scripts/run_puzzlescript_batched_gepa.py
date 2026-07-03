@@ -952,8 +952,10 @@ def adjusted_candidate_scores(
     broad game generalization visible even when one game contributes many more
     levels than another. Per-level lost-solve penalties preserve base behavior,
     while the default evaluation-wide gate only fires when a candidate has a net
-    solve loss. An explicit any-lost-solve gate can still be enabled for stricter
-    regression-protection experiments.
+    solve gain. An explicit any-lost-solve gate can still be enabled for stricter
+    regression-protection experiments. By default, candidates with lost base
+    solves must produce strictly more new solves than losses before expansion
+    efficiency can make the aggregate positive.
     """
     rows = list(outputs)
     weights = _macro_game_weights(rows)
@@ -980,8 +982,13 @@ def adjusted_candidate_scores(
         if global_net_solve_loss_gate_penalty is None
         else global_net_solve_loss_gate_penalty
     )
+    nonpositive_net_loss_units = (
+        max(0, lost_solves - new_solves)
+        if lost_solves != new_solves
+        else int(lost_solves > 0)
+    )
     net_solve_loss_gate_penalty = (
-        max(0.0, net_gate_value) * max(0, lost_solves - new_solves)
+        max(0.0, net_gate_value) * nonpositive_net_loss_units
         if gate_penalty <= 0.0
         else 0.0
     )

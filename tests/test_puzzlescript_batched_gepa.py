@@ -343,7 +343,7 @@ def test_candidate_score_can_apply_explicit_eval_wide_gate_for_lost_solves_and_e
     assert score == pytest.approx(sum(scores) / len(scores))
 
 
-def test_candidate_score_defaults_to_net_solve_loss_gate_not_any_loss_gate() -> None:
+def test_candidate_score_defaults_to_nonpositive_net_solve_gate() -> None:
     outputs = [
         {
             "game": "a",
@@ -369,14 +369,14 @@ def test_candidate_score_defaults_to_net_solve_loss_gate_not_any_loss_gate() -> 
         score_delta_clip=0.5,
     )
 
-    assert scores == pytest.approx([-2.5, 3.5])
+    assert scores == pytest.approx([-4.5, 1.5])
     assert candidate_score(
         outputs,
         lost_solve_penalty=2.0,
         new_solve_bonus=3.0,
         score_delta_weight=1.0,
         score_delta_clip=0.5,
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(-1.5)
 
 
 def test_candidate_score_rewards_large_net_solve_gain_by_default() -> None:
@@ -425,7 +425,51 @@ def test_candidate_scores_penalize_common_solve_expansion_slowdowns() -> None:
     assert scores[0] < -0.1
 
 
-def test_candidate_score_can_disable_eval_wide_lost_solve_gate() -> None:
+def test_candidate_score_does_not_reward_equal_new_lost_from_efficiency() -> None:
+    outputs = [
+        {
+            "game": "loss",
+            "score": 0.0,
+            "solved": False,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "expanded": 10_000,
+            "baseline_expanded": 100,
+        },
+        {
+            "game": "gain",
+            "score": 0.9,
+            "solved": True,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+            "expanded": 100,
+            "baseline_expanded": 10_000,
+        },
+        *[
+            {
+                "game": f"fast-{idx}",
+                "score": 0.99,
+                "solved": True,
+                "expanded": 100,
+                "baseline_score": 0.95,
+                "baseline_solved": True,
+                "baseline_expanded": 10_000,
+            }
+            for idx in range(3)
+        ],
+    ]
+
+    assert candidate_score(
+        outputs,
+        lost_solve_penalty=4.0,
+        new_solve_bonus=4.0,
+        score_delta_weight=0.0,
+        common_solve_efficiency_weight=2.0,
+        common_solve_efficiency_clip=2.0,
+    ) < 0.0
+
+
+def test_candidate_score_can_disable_any_lost_gate_but_keeps_nonpositive_net_gate() -> None:
     outputs = [
         {
             "game": "a",
@@ -452,7 +496,7 @@ def test_candidate_score_can_disable_eval_wide_lost_solve_gate() -> None:
         global_lost_solve_gate_penalty=0.0,
     )
 
-    assert scores == pytest.approx([-2.5, 3.5])
+    assert scores == pytest.approx([-4.5, 1.5])
     assert candidate_score(
         outputs,
         lost_solve_penalty=2.0,
@@ -460,7 +504,7 @@ def test_candidate_score_can_disable_eval_wide_lost_solve_gate() -> None:
         score_delta_weight=1.0,
         score_delta_clip=0.5,
         global_lost_solve_gate_penalty=0.0,
-    ) == pytest.approx(0.5)
+    ) == pytest.approx(-1.5)
 
 
 def test_candidate_score_gates_net_solve_losses_when_lost_gate_is_disabled() -> None:
