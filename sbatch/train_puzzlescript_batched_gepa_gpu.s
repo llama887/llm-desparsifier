@@ -244,6 +244,8 @@ echo "[run] initial_gepa_addendum_file=${INITIAL_GEPA_ADDENDUM_FILE:-}"
     --score-delta-weight "${SCORE_DELTA_WEIGHT:-1.0}" \
     --score-delta-clip "${SCORE_DELTA_CLIP:-0.5}" \
     --partial-progress-weight "${PARTIAL_PROGRESS_WEIGHT:-0.05}" \
+    --common-solve-efficiency-weight "${COMMON_SOLVE_EFFICIENCY_WEIGHT:-0.75}" \
+    --common-solve-efficiency-clip "${COMMON_SOLVE_EFFICIENCY_CLIP:-1.0}" \
     --global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-0.0}" \
     --global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}" \
     --reflection-minibatch-size "${REFLECTION_MINIBATCH_SIZE:-0}" \

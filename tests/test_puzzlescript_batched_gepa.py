@@ -402,6 +402,28 @@ def test_candidate_score_rewards_large_net_solve_gain_by_default() -> None:
     assert candidate_score(outputs) > 0.0
 
 
+def test_candidate_scores_penalize_common_solve_expansion_slowdowns() -> None:
+    outputs = [
+        {
+            "game": "same-solve",
+            "score": 0.84,
+            "solved": True,
+            "expanded": 1_600,
+            "baseline_score": 0.86,
+            "baseline_solved": True,
+            "baseline_expanded": 1_400,
+        }
+    ]
+
+    scores = adjusted_candidate_scores(
+        outputs,
+        score_delta_weight=1.0,
+        score_delta_clip=1.0,
+    )
+
+    assert scores[0] < -0.1
+
+
 def test_candidate_score_can_disable_eval_wide_lost_solve_gate() -> None:
     outputs = [
         {

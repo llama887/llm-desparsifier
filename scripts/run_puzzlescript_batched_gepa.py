@@ -74,6 +74,8 @@ DEFAULT_CANDIDATE_ERROR_PENALTY = 2.0
 DEFAULT_SCORE_DELTA_WEIGHT = 1.0
 DEFAULT_SCORE_DELTA_CLIP = 0.5
 DEFAULT_PARTIAL_PROGRESS_WEIGHT = 0.05
+DEFAULT_COMMON_SOLVE_EFFICIENCY_WEIGHT = 0.75
+DEFAULT_COMMON_SOLVE_EFFICIENCY_CLIP = 1.0
 DEFAULT_SOLVED_REGRESSION_SCORE_MARGIN = 0.01
 DEFAULT_SOLVED_REGRESSION_EXPANSION_MARGIN = 100.0
 DEFAULT_SOLVED_REGRESSION_EXPANSION_RATIO = 1.2
@@ -793,6 +795,28 @@ def _row_partial_progress_score(row: Mapping[str, Any], *, prefix: str = "") -> 
     return 0.0
 
 
+def _common_solve_efficiency_delta(row: Mapping[str, Any], *, clip: float) -> float:
+    """Return a bounded relative expansion delta for levels both prompts solve.
+
+    Raw A* score deltas are normalized by the full expansion budget, which makes
+    frequent moderate slowdowns nearly invisible to GEPA. This term compares
+    expansions directly on paired common solves: positive means the candidate is
+    faster than the base prompt, negative means it is slower. The logarithmic
+    ratio treats 2x faster and 2x slower symmetrically, while clipping keeps the
+    signal subordinate to solve/loss events.
+    """
+    if not bool(row.get("solved", False)) or not bool(row.get("baseline_solved", False)):
+        return 0.0
+    expanded = _optional_result_float(row, "expanded")
+    baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    if expanded is None or baseline_expanded is None:
+        return 0.0
+    if expanded < 0 or baseline_expanded < 0:
+        return 0.0
+    ratio_delta = math.log2((baseline_expanded + 1.0) / (expanded + 1.0))
+    return _clamp(ratio_delta, max(0.0, clip))
+
+
 def _macro_game_weights(rows: Sequence[Mapping[str, Any]]) -> list[float]:
     """Return per-row weights whose mean is one and games contribute equally."""
     if not rows:
@@ -819,6 +843,8 @@ def _base_relative_score(
     score_delta_weight: float,
     score_delta_clip: float,
     partial_progress_weight: float,
+    common_solve_efficiency_weight: float,
+    common_solve_efficiency_clip: float,
 ) -> float:
     """Score one result by robust improvement over the stored base prompt.
 
@@ -847,6 +873,11 @@ def _base_relative_score(
             score -= max(0.0, lost_solve_penalty)
         elif not baseline_solved and solved:
             score += max(0.0, new_solve_bonus)
+        elif baseline_solved and solved:
+            score += max(0.0, common_solve_efficiency_weight) * _common_solve_efficiency_delta(
+                row,
+                clip=common_solve_efficiency_clip,
+            )
     if is_candidate_error(row):
         score -= max(0.0, error_penalty)
     return score
@@ -869,6 +900,8 @@ def candidate_score(
     score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
     score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
     partial_progress_weight: float = DEFAULT_PARTIAL_PROGRESS_WEIGHT,
+    common_solve_efficiency_weight: float = DEFAULT_COMMON_SOLVE_EFFICIENCY_WEIGHT,
+    common_solve_efficiency_clip: float = DEFAULT_COMMON_SOLVE_EFFICIENCY_CLIP,
     global_lost_solve_gate_penalty: float | None = None,
     global_net_solve_loss_gate_penalty: float | None = None,
 ) -> float:
@@ -890,6 +923,8 @@ def candidate_score(
         score_delta_weight=score_delta_weight,
         score_delta_clip=score_delta_clip,
         partial_progress_weight=partial_progress_weight,
+        common_solve_efficiency_weight=common_solve_efficiency_weight,
+        common_solve_efficiency_clip=common_solve_efficiency_clip,
         global_lost_solve_gate_penalty=global_lost_solve_gate_penalty,
         global_net_solve_loss_gate_penalty=global_net_solve_loss_gate_penalty,
     )
@@ -905,6 +940,8 @@ def adjusted_candidate_scores(
     score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
     score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
     partial_progress_weight: float = DEFAULT_PARTIAL_PROGRESS_WEIGHT,
+    common_solve_efficiency_weight: float = DEFAULT_COMMON_SOLVE_EFFICIENCY_WEIGHT,
+    common_solve_efficiency_clip: float = DEFAULT_COMMON_SOLVE_EFFICIENCY_CLIP,
     global_lost_solve_gate_penalty: float | None = None,
     global_net_solve_loss_gate_penalty: float | None = None,
 ) -> list[float]:
@@ -958,6 +995,8 @@ def adjusted_candidate_scores(
             score_delta_weight=score_delta_weight,
             score_delta_clip=score_delta_clip,
             partial_progress_weight=partial_progress_weight,
+            common_solve_efficiency_weight=common_solve_efficiency_weight,
+            common_solve_efficiency_clip=common_solve_efficiency_clip,
         )
         scores.append(score * weight - gate_penalty - net_solve_loss_gate_penalty)
     return scores
@@ -2124,6 +2163,8 @@ class PuzzleScriptBatchedGEPAAdapter:
         score_delta_weight: float = DEFAULT_SCORE_DELTA_WEIGHT,
         score_delta_clip: float = DEFAULT_SCORE_DELTA_CLIP,
         partial_progress_weight: float = DEFAULT_PARTIAL_PROGRESS_WEIGHT,
+        common_solve_efficiency_weight: float = DEFAULT_COMMON_SOLVE_EFFICIENCY_WEIGHT,
+        common_solve_efficiency_clip: float = DEFAULT_COMMON_SOLVE_EFFICIENCY_CLIP,
         global_lost_solve_gate_penalty: float | None = None,
         global_net_solve_loss_gate_penalty: float | None = None,
     ) -> None:
@@ -2139,6 +2180,8 @@ class PuzzleScriptBatchedGEPAAdapter:
         self.score_delta_weight = max(0.0, score_delta_weight)
         self.score_delta_clip = max(0.0, score_delta_clip)
         self.partial_progress_weight = max(0.0, partial_progress_weight)
+        self.common_solve_efficiency_weight = max(0.0, common_solve_efficiency_weight)
+        self.common_solve_efficiency_clip = max(0.0, common_solve_efficiency_clip)
         self.global_lost_solve_gate_penalty = (
             None
             if global_lost_solve_gate_penalty is None
@@ -2281,6 +2324,8 @@ class PuzzleScriptBatchedGEPAAdapter:
             score_delta_weight=self.score_delta_weight,
             score_delta_clip=self.score_delta_clip,
             partial_progress_weight=self.partial_progress_weight,
+            common_solve_efficiency_weight=self.common_solve_efficiency_weight,
+            common_solve_efficiency_clip=self.common_solve_efficiency_clip,
             global_lost_solve_gate_penalty=self.global_lost_solve_gate_penalty,
             global_net_solve_loss_gate_penalty=self.global_net_solve_loss_gate_penalty,
         )
@@ -2484,6 +2529,8 @@ class PuzzleScriptBatchedGEPAAdapter:
             score_delta_weight=self.score_delta_weight,
             score_delta_clip=self.score_delta_clip,
             partial_progress_weight=self.partial_progress_weight,
+            common_solve_efficiency_weight=self.common_solve_efficiency_weight,
+            common_solve_efficiency_clip=self.common_solve_efficiency_clip,
             global_lost_solve_gate_penalty=self.global_lost_solve_gate_penalty,
             global_net_solve_loss_gate_penalty=self.global_net_solve_loss_gate_penalty,
         )
@@ -2574,6 +2621,8 @@ class PuzzleScriptBatchedGEPAAdapter:
                 score_delta_weight=self.score_delta_weight,
                 score_delta_clip=self.score_delta_clip,
                 partial_progress_weight=self.partial_progress_weight,
+                common_solve_efficiency_weight=self.common_solve_efficiency_weight,
+                common_solve_efficiency_clip=self.common_solve_efficiency_clip,
                 global_lost_solve_gate_penalty=self.global_lost_solve_gate_penalty,
                 global_net_solve_loss_gate_penalty=self.global_net_solve_loss_gate_penalty,
             )
@@ -2680,6 +2729,8 @@ class PuzzleScriptBatchedGEPAAdapter:
             score_delta_weight=self.score_delta_weight,
             score_delta_clip=self.score_delta_clip,
             partial_progress_weight=self.partial_progress_weight,
+            common_solve_efficiency_weight=self.common_solve_efficiency_weight,
+            common_solve_efficiency_clip=self.common_solve_efficiency_clip,
             global_lost_solve_gate_penalty=self.global_lost_solve_gate_penalty,
             global_net_solve_loss_gate_penalty=self.global_net_solve_loss_gate_penalty,
         )
@@ -3039,6 +3090,8 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         score_delta_weight=args.score_delta_weight,
         score_delta_clip=args.score_delta_clip,
         partial_progress_weight=args.partial_progress_weight,
+        common_solve_efficiency_weight=args.common_solve_efficiency_weight,
+        common_solve_efficiency_clip=args.common_solve_efficiency_clip,
         global_lost_solve_gate_penalty=args.global_lost_solve_gate_penalty,
         global_net_solve_loss_gate_penalty=args.global_net_solve_loss_gate_penalty,
     )
@@ -3087,6 +3140,8 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         f"candidate_error_penalty={args.candidate_error_penalty} "
         f"score_delta_weight={args.score_delta_weight} score_delta_clip={args.score_delta_clip} "
         f"partial_progress_weight={args.partial_progress_weight} "
+        f"common_solve_efficiency_weight={args.common_solve_efficiency_weight} "
+        f"common_solve_efficiency_clip={args.common_solve_efficiency_clip} "
         f"global_lost_solve_gate_penalty={args.global_lost_solve_gate_penalty} "
         f"global_net_solve_loss_gate_penalty={args.global_net_solve_loss_gate_penalty} "
         f"initial_gepa_addendum_chars={len(initial_gepa_addendum)}",
@@ -3114,6 +3169,8 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
             score_delta_weight=adapter.score_delta_weight,
             score_delta_clip=adapter.score_delta_clip,
             partial_progress_weight=adapter.partial_progress_weight,
+            common_solve_efficiency_weight=adapter.common_solve_efficiency_weight,
+            common_solve_efficiency_clip=adapter.common_solve_efficiency_clip,
             global_lost_solve_gate_penalty=adapter.global_lost_solve_gate_penalty,
             global_net_solve_loss_gate_penalty=adapter.global_net_solve_loss_gate_penalty,
         )
@@ -3260,6 +3317,25 @@ def parse_args() -> argparse.Namespace:
         "--partial-progress-weight",
         type=float,
         default=DEFAULT_PARTIAL_PROGRESS_WEIGHT,
+    )
+    parser.add_argument(
+        "--common-solve-efficiency-weight",
+        type=float,
+        default=DEFAULT_COMMON_SOLVE_EFFICIENCY_WEIGHT,
+        help=(
+            "Weight for the log expansion-ratio term on tasks both base and "
+            "candidate solve. Positive values reward faster common solves and "
+            "penalize slower common solves without changing solve/loss bonuses."
+        ),
+    )
+    parser.add_argument(
+        "--common-solve-efficiency-clip",
+        type=float,
+        default=DEFAULT_COMMON_SOLVE_EFFICIENCY_CLIP,
+        help=(
+            "Absolute clip for the common-solve log expansion-ratio term before "
+            "weighting."
+        ),
     )
     parser.add_argument(
         "--global-lost-solve-gate-penalty",
