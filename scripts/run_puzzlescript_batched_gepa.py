@@ -66,18 +66,6 @@ DEFAULT_REFLECTION_MAX_RECORDS = 24
 DEFAULT_SEARCH_TASK_WALL_TIMEOUT_S = 120.0
 DEFAULT_DEV_FRACTION = 0.25
 DEFAULT_MAX_GEPA_ITERATIONS = 16
-DEFAULT_GUARD_LEVELS = (
-    "Aperture_Science_Sokoban_Testing_Initiative:5;"
-    "Beam_Islands:3;"
-    "Gravity_Sokoban:6,9;"
-    "Ice_Cubes:5,7,14,26;"
-    "Inswaption:7,18;"
-    "Memory_Push:0,2;"
-    "Not_Normal_Crates:5,11,12;"
-    "Sokoban_Dungeon:1;"
-    "Sokocross:0,5;"
-    "where_did_all_this_ice_come_from_:3,6"
-)
 DEFAULT_LOST_SOLVE_PENALTY = 8.0
 DEFAULT_NEW_SOLVE_BONUS = 4.0
 DEFAULT_CANDIDATE_ERROR_PENALTY = 2.0
@@ -645,6 +633,31 @@ def unique_tasks_by_key(tasks: Sequence[PuzzleScriptLevelTask]) -> list[PuzzleSc
     return unique
 
 
+def select_training_guard_tasks(
+    tasks: Sequence[PuzzleScriptLevelTask],
+    levels_by_game: Mapping[str, Sequence[int]],
+) -> list[PuzzleScriptLevelTask]:
+    """Return requested guard levels from materialized GEPA training tasks.
+
+    Guard levels are a GEPA-visible development guardrail, not a heldout audit.
+    Resolving them from the already-loaded training grid prevents eval-only
+    games from entering the optimization metric when `--guard-levels` is set.
+    """
+    if not levels_by_game:
+        return []
+    wanted = {
+        (str(game), int(level))
+        for game, levels in levels_by_game.items()
+        for level in levels
+    }
+    selected = [
+        task
+        for task in unique_tasks_by_key(tasks)
+        if task_key(task) in wanted
+    ]
+    return cast(list[PuzzleScriptLevelTask], reassign_task_ids(selected))
+
+
 def merge_validation_guard_tasks(
     validation_tasks: Sequence[PuzzleScriptLevelTask],
     guard_tasks: Sequence[PuzzleScriptLevelTask],
@@ -652,9 +665,10 @@ def merge_validation_guard_tasks(
     """Return validation tasks plus non-duplicate guard tasks with dense ids.
 
     The guard set augments, rather than replaces, the normal development split.
-    When a configured guard level already appears in validation, the original
-    validation task wins so the split remains stable and task ids are reassigned
-    only after deduplication.
+    Guard tasks should already come from GEPA-visible training data, not the
+    heldout eval split. When a configured guard level already appears in
+    validation, the original validation task wins so the split remains stable
+    and task ids are reassigned only after deduplication.
     """
     return cast(
         list[PuzzleScriptLevelTask],
@@ -2687,14 +2701,23 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     guard_level_selection = parse_guard_level_selection(args.guard_levels)
     guard_tasks: list[PuzzleScriptLevelTask] = []
     if guard_level_selection:
-        guard_tasks = build_level_tasks(
-            evaluator=evaluator,
-            jobs=eval_jobs,
-            script_doctor=args.script_doctor,
-            levels_per_game=0,
-            budget=max(1, args.max_expansions),
-            selected_levels_by_game=guard_level_selection,
-        )
+        guard_tasks = select_training_guard_tasks(all_train_tasks, guard_level_selection)
+        requested_guard_keys = {
+            (str(game), int(level))
+            for game, levels in guard_level_selection.items()
+            for level in levels
+        }
+        selected_guard_keys = {task_key(task) for task in guard_tasks}
+        missing_guard_keys = sorted(requested_guard_keys - selected_guard_keys)
+        if missing_guard_keys:
+            missing_preview = ", ".join(f"{game}:{level}" for game, level in missing_guard_keys[:12])
+            if len(missing_guard_keys) > 12:
+                missing_preview += f", ... ({len(missing_guard_keys)} total)"
+            print(
+                "[inputs] skipped guard levels not present in GEPA training tasks: "
+                + missing_preview,
+                flush=True,
+            )
         val_tasks = merge_validation_guard_tasks(
             [cast(PuzzleScriptLevelTask, task) for task in val_tasks],
             guard_tasks,
@@ -2960,8 +2983,10 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help=(
-            "Optional semicolon-separated game:level,level exact holdout guard set "
-            "added to validation for base-solve regression protection."
+            "Optional semicolon-separated game:level,level exact training guard set "
+            "added to validation for base-solve regression protection. Guard levels "
+            "are resolved only from GEPA training jobs so heldout eval jobs stay "
+            "outside the optimization metric."
         ),
     )
     parser.add_argument("--max-gepa-iterations", type=int, default=DEFAULT_MAX_GEPA_ITERATIONS)

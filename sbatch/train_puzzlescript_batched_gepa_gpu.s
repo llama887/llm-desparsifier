@@ -235,7 +235,7 @@ echo "[run] initial_gepa_addendum_file=${INITIAL_GEPA_ADDENDUM_FILE:-}"
     --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}" \
     --val-split "${VAL_SPLIT:-dev}" \
     --dev-fraction "${DEV_FRACTION:-0.25}" \
-    --guard-levels "${GUARD_LEVELS:-Aperture_Science_Sokoban_Testing_Initiative:5;Beam_Islands:3;Gravity_Sokoban:6,9;Ice_Cubes:5,7,14,26;Inswaption:7,18;Memory_Push:0,2;Not_Normal_Crates:5,11,12;Sokoban_Dungeon:1;Sokocross:0,5;where_did_all_this_ice_come_from_:3,6}" \
+    --guard-levels "${GUARD_LEVELS:-}" \
     --max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}" \
     --max-metric-calls "${MAX_METRIC_CALLS:-0}" \
     --lost-solve-penalty "${LOST_SOLVE_PENALTY:-8.0}" \

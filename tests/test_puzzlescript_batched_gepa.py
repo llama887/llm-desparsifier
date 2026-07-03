@@ -40,6 +40,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     parse_guard_level_selection,
     read_initial_gepa_addendum,
     select_reflection_traces,
+    select_training_guard_tasks,
     split_train_dev_jobs,
     strip_outer_markdown_fences,
     validate_heuristic_code,
@@ -511,6 +512,23 @@ def test_parse_guard_level_selection_accepts_exact_game_levels() -> None:
 def test_parse_guard_level_selection_rejects_malformed_entries() -> None:
     with pytest.raises(ValueError, match="game:level"):
         parse_guard_level_selection("Not_Normal_Crates")
+
+
+def test_select_training_guard_tasks_ignores_eval_only_games() -> None:
+    tasks = [
+        PuzzleScriptLevelTask(7, "train_game", 2, 10, "train2", "train.txt"),
+        PuzzleScriptLevelTask(8, "train_game", 3, 10, "train3", "train.txt"),
+    ]
+    selection = {
+        "train_game": [3],
+        "heldout_game": [0],
+    }
+
+    selected = select_training_guard_tasks(tasks, selection)
+
+    assert [(task.task_id, task.game, task.level, task.env_description) for task in selected] == [
+        (0, "train_game", 3, "train3")
+    ]
 
 
 def test_merge_validation_guard_tasks_deduplicates_and_reassigns_ids() -> None:
@@ -1380,7 +1398,8 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert '--score-delta-weight "${SCORE_DELTA_WEIGHT:-1.0}"' in launcher
     assert '--global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}"' in launcher
     assert '--initial-gepa-addendum "${INITIAL_GEPA_ADDENDUM:-}"' in launcher
-    assert '--guard-levels "${GUARD_LEVELS:-' in launcher
+    assert '--guard-levels "${GUARD_LEVELS:-}"' in launcher
+    assert "Aperture_Science_Sokoban_Testing_Initiative:5" not in launcher
     assert 'RUN_HOLDOUT_COMPARE:-1' in launcher
     assert "scripts/compare_puzzlescript_batched_prompts.py" in launcher
 
