@@ -1144,6 +1144,8 @@ def test_custom_proposer_uses_code_contract_fallback_for_lost_solve_errors() -> 
     )
 
     assert "No import statements" in result["heuristic_prompt"]
+    assert "including inside" in result["heuristic_prompt"]
+    assert "collections.deque" in result["heuristic_prompt"]
     assert "local lists" in result["heuristic_prompt"]
     assert "base-solved" in result["heuristic_prompt"]
 
@@ -1191,6 +1193,52 @@ def test_custom_proposer_uses_blocker_preservation_fallback_for_noop_output() ->
     assert "crate-target" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_uses_reachability_overfit_fallback_for_noop_output() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "lost_baseline_solve"},
+                    "Feedback": (
+                        "REGRESSION: base prompt solved but candidate exhausted search "
+                        "after adding approximate push reachability."
+                    ),
+                    "Baseline Output": {
+                        "code_shape": {
+                            "uses_reachability_search": False,
+                            "uses_pushable_object_terms": True,
+                            "uses_target_terms": True,
+                        }
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_reachability_search": True,
+                            "uses_pushable_object_terms": True,
+                            "uses_target_terms": True,
+                        }
+                    },
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "simple base-style distance" in result["heuristic_prompt"]
+    assert "reachability" in result["heuristic_prompt"]
+    assert "player-only" in result["heuristic_prompt"]
+
+
 def test_custom_proposer_uses_code_contract_fallback_for_candidate_errors() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
@@ -1217,6 +1265,7 @@ def test_custom_proposer_uses_code_contract_fallback_for_candidate_errors() -> N
 
     assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
     assert "No import statements" in result["heuristic_prompt"]
+    assert "collections.deque" in result["heuristic_prompt"]
     assert "decorators" in result["heuristic_prompt"]
 
 

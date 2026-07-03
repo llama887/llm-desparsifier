@@ -1979,8 +1979,10 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
     if "candidate_error" in classifications and classifications <= {"candidate_error"}:
         return (
             "No import statements, decorators, imported helpers, file access, or cached "
-            "library utilities are allowed anywhere in generated code; implement any "
-            "needed assignment, queue, or memo logic with plain local loops and literals."
+            "library utilities are allowed anywhere in generated code, including inside "
+            "helper functions; never use collections.deque. Implement any needed "
+            "assignment, queue, or memo logic with plain local lists, indexes, loops, "
+            "dicts, and sets."
         )
     if "lost_baseline_solve" in classifications:
         if _records_show_lost_candidate_errors(records):
@@ -1988,10 +1990,21 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "When a base-solved level regresses through validation or execution errors, "
                 "first preserve the base code-generation contract. No import statements, "
                 "decorators, imported helpers, file access, cached library utilities, or "
-                "external modules are allowed; implement queues, matching, reachability, "
-                "memoization, and assignment with plain local lists, dicts, sets, and loops. "
-                "Only add a prompt-level mechanics term when it can be expressed with that "
-                "local code shape and rule-grounded preconditions."
+                "external modules are allowed, including inside helper functions; never "
+                "use collections.deque. Implement queues, matching, reachability, "
+                "memoization, and assignment with plain local lists, indexes, dicts, "
+                "sets, and loops. Only add a prompt-level mechanics term when it can be "
+                "expressed with that local code shape and rule-grounded preconditions."
+            )
+        if _records_show_reachability_overfit(records):
+            return (
+                "When a base-solved level regresses after adding reachability, BFS, or "
+                "push simulation, do not replace simple base-style distance, matching, "
+                "blocker, or deadlock terms with player-only reachability. Use "
+                "reachability only when RULES or COLLISIONLAYERS make Manhattan distance "
+                "misleading and the heuristic can conservatively account for every "
+                "state-changing object; otherwise keep base-style terms primary and use "
+                "reachability or score only as small tie-breakers."
             )
         if _records_show_dropped_blocker_structure(records):
             return (
@@ -2063,6 +2076,31 @@ def _records_show_lost_candidate_errors(records: Sequence[Mapping[str, Any]]) ->
             "validation failed" in feedback
             or "imports are not allowed" in feedback
             or "heuristic error" in feedback
+        ):
+            return True
+    return False
+
+
+def _records_show_reachability_overfit(records: Sequence[Mapping[str, Any]]) -> bool:
+    """Return whether a candidate regressed by adding reachability absent from base.
+
+    Approximate BFS can be harmful when it models only player position or a single
+    push without the full mutable puzzle state. These records indicate GEPA should
+    preserve simpler base distance/matching terms unless rule evidence justifies
+    the extra reachability machinery.
+    """
+
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) != "lost_baseline_solve":
+            continue
+        baseline_output = cast(Mapping[str, Any], record.get("Baseline Output", {}))
+        generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
+        baseline_shape = cast(Mapping[str, Any], baseline_output.get("code_shape", {}))
+        generated_shape = cast(Mapping[str, Any], generated_output.get("code_shape", {}))
+        if (
+            not bool(baseline_shape.get("uses_reachability_search"))
+            and bool(generated_shape.get("uses_reachability_search"))
         ):
             return True
     return False
@@ -2177,6 +2215,17 @@ def _code_shape_diagnostic_line(
             "the base heuristic used reachability/BFS-style search, so do not replace "
             "it with plain Manhattan/count terms when terrain, blockers, doors, water, "
             "or collision layers affect legal paths"
+        )
+    if (
+        generated_shape.get("uses_reachability_search")
+        and not baseline_shape.get("uses_reachability_search")
+        and classification in {"lost_baseline_solve", "solved_regression"}
+    ):
+        parts.append(
+            "the candidate added reachability/BFS where the base solved without it; "
+            "avoid player-only reachability or approximate push simulation unless the "
+            "rules and collision layers justify it and all state-changing objects are "
+            "modeled conservatively"
         )
     if generated_shape.get("uses_nonfinite_return") or generated_shape.get("uses_large_penalty"):
         parts.append(
