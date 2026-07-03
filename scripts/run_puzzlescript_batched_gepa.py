@@ -1912,6 +1912,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             else max(0.0, global_net_solve_loss_gate_penalty)
         )
         self.baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+        self.reuse_baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
         self.baseline_prompt_text: Optional[str] = None
         self.eval_counter = _initial_eval_counter(self.state_root / "candidate_evals")
 
@@ -1920,19 +1921,28 @@ class PuzzleScriptBatchedGEPAAdapter:
         outputs: Sequence[Mapping[str, Any]],
         *,
         candidate: Optional[Mapping[str, str]] = None,
+        scoring_outputs: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> None:
-        """Store baseline outcomes and the exact prompt that produced them.
+        """Store deterministic reuse outputs and base-relative scoring outputs.
 
         Standard runs use the canonical PuzzleScript contract as the baseline.
         Seeded GEPA runs intentionally start from that contract plus an initial
         addendum, so reuse must key off the exact seeded prompt rather than only
         the canonical base text. This keeps repeated evaluations of the
         baseline candidate deterministic and prevents LLM resampling noise from
-        appearing as prompt quality changes.
+        appearing as prompt quality changes. When `scoring_outputs` is supplied,
+        candidate scores are measured against those outputs instead of the exact
+        reuse outputs; this supports seeded optimization while keeping the
+        original base prompt as the objective baseline.
         """
-        self.baseline_by_key = {
+        self.reuse_baseline_by_key = {
             (str(row["game"]), int(row["level"])): dict(row)
             for row in outputs
+        }
+        scoring_rows = outputs if scoring_outputs is None else scoring_outputs
+        self.baseline_by_key = {
+            (str(row["game"]), int(row["level"])): dict(row)
+            for row in scoring_rows
         }
         baseline_candidate = candidate or {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
         self.baseline_prompt_text = baseline_candidate.get(
@@ -2105,12 +2115,12 @@ class PuzzleScriptBatchedGEPAAdapter:
         regression metric while leaving all non-baseline candidate prompts on
         the normal synthesis/search path.
         """
-        if not self.baseline_by_key:
+        if not self.reuse_baseline_by_key:
             return None
         outputs: list[dict[str, Any]] = []
         trajectories: list[dict[str, Any]] = []
         for task in batch:
-            baseline = self.baseline_by_key.get((task.game, task.level))
+            baseline = self.reuse_baseline_by_key.get((task.game, task.level))
             if baseline is None:
                 return None
             result = dict(baseline)
@@ -2647,8 +2657,26 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         cast(PuzzleScriptLevelTask, task)
         for task in reassign_task_ids(unique_tasks_by_key([*train_tasks, *val_tasks]))
     ]
+    scoring_baseline_outputs: Optional[list[dict[str, Any]]] = None
+    if args.initial_gepa_addendum.strip():
+        base_candidate = {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
+        print(
+            "[gepa] evaluating original base prompt for seeded-run scoring: "
+            f"tasks={len(baseline_tasks)}",
+            flush=True,
+        )
+        scoring_baseline_batch = adapter.evaluate(
+            batch=baseline_tasks,
+            candidate=base_candidate,
+            capture_traces=False,
+        )
+        scoring_baseline_outputs = [dict(row) for row in scoring_baseline_batch.outputs]
+        (state_root / "scoring_baseline_outputs.json").write_text(
+            json.dumps(scoring_baseline_outputs, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
     print(
-        "[gepa] evaluating base prompt baseline for regression scoring: "
+        "[gepa] evaluating seed prompt baseline for deterministic reuse: "
         f"tasks={len(baseline_tasks)} lost_solve_penalty={args.lost_solve_penalty} "
         f"new_solve_bonus={args.new_solve_bonus} "
         f"candidate_error_penalty={args.candidate_error_penalty} "
@@ -2665,7 +2693,27 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         capture_traces=False,
     )
     baseline_outputs = [dict(row) for row in baseline_batch.outputs]
-    adapter.set_baseline_outputs(baseline_outputs, candidate=seed_candidate)
+    adapter.set_baseline_outputs(
+        baseline_outputs,
+        candidate=seed_candidate,
+        scoring_outputs=scoring_baseline_outputs,
+    )
+    if scoring_baseline_outputs is not None:
+        for row in baseline_outputs:
+            adapter._attach_baseline_metadata(row)  # noqa: SLF001 - runner owns adapter wiring.
+        baseline_adjusted_scores = adjusted_candidate_scores(
+            baseline_outputs,
+            lost_solve_penalty=adapter.lost_solve_penalty,
+            new_solve_bonus=adapter.new_solve_bonus,
+            error_penalty=adapter.candidate_error_penalty,
+            score_delta_weight=adapter.score_delta_weight,
+            score_delta_clip=adapter.score_delta_clip,
+            partial_progress_weight=adapter.partial_progress_weight,
+            global_lost_solve_gate_penalty=adapter.global_lost_solve_gate_penalty,
+            global_net_solve_loss_gate_penalty=adapter.global_net_solve_loss_gate_penalty,
+        )
+        for row, adjusted_score in zip(baseline_outputs, baseline_adjusted_scores, strict=True):
+            row["adjusted_score"] = adjusted_score
     baseline_score_mean = (
         sum(_result_float(row, "score") for row in baseline_outputs) / len(baseline_outputs)
         if baseline_outputs
