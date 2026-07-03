@@ -27,6 +27,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     assigned_tasks,
     build_reflection_feedback,
     build_sbatch_array_command,
+    build_seed_candidate,
     build_train_dev_tasks,
     candidate_prompt_issue,
     candidate_score,
@@ -994,6 +995,17 @@ def test_select_reflection_traces_keeps_mechanics_diversity() -> None:
     assert "portal-alias-case" in {trace["task"]["game"] for trace in selected}
 
 
+def test_build_seed_candidate_attaches_initial_gepa_addendum() -> None:
+    addendum = "Prefer relation pairs, but keep alias-aware fallback secondary."
+
+    candidate = build_seed_candidate(addendum)
+
+    prompt = candidate["heuristic_prompt"]
+    assert prompt.startswith(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    assert f"\n\n{GEPA_ADDENDUM_HEADER}\n" in prompt
+    assert prompt.endswith(addendum)
+
+
 def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     launcher = Path("sbatch/train_puzzlescript_batched_gepa_gpu.s").read_text(encoding="utf-8")
 
@@ -1018,6 +1030,7 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert '--score-delta-weight "${SCORE_DELTA_WEIGHT:-1.0}"' in launcher
     assert '--global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}"' in launcher
     assert '--global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}"' in launcher
+    assert '--initial-gepa-addendum "${INITIAL_GEPA_ADDENDUM:-}"' in launcher
     assert '--guard-levels "${GUARD_LEVELS:-' in launcher
     assert 'RUN_HOLDOUT_COMPARE:-1' in launcher
     assert "scripts/compare_puzzlescript_batched_prompts.py" in launcher

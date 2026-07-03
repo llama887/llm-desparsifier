@@ -1673,6 +1673,33 @@ def _compose_prompt_with_addendum(base_prompt: str, addendum: str) -> str:
     return f"{_strip_gepa_addendum(base_prompt)}\n\n{GEPA_ADDENDUM_HEADER}\n{addendum.strip()}"
 
 
+def build_seed_candidate(initial_addendum: str = "") -> dict[str, str]:
+    """Return the initial GEPA candidate, optionally seeded with one addendum.
+
+    The normal optimizer starts from the stable PuzzleScript heuristic contract.
+    This helper adds a controlled experiment hook for follow-up runs where a
+    specific general prompt hypothesis should be evaluated immediately instead
+    of waiting for GEPA's proposer to rediscover it. It differs from GEPA's
+    reflection updates by validating the addendum before the expensive run
+    starts and by keeping the canonical base prompt unchanged.
+    """
+    addendum = initial_addendum.strip()
+    if not addendum:
+        return {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
+    cleaned = _clean_proposed_addendum(
+        addendum,
+        max_chars=DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS,
+    )
+    if not cleaned:
+        raise ValueError("Initial GEPA addendum failed prompt-shape validation.")
+    return {
+        HEURISTIC_COMPONENT: _compose_prompt_with_addendum(
+            PUZZLESCRIPT_HEURISTIC_CONTRACT,
+            cleaned,
+        )
+    }
+
+
 def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
     cleaned = strip_outer_markdown_fences(text).strip()
     cleaned = re.sub(
@@ -2596,7 +2623,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         if args.max_metric_calls > 0
         else len(val_tasks) + args.max_gepa_iterations * len(train_tasks) * 2
     )
-    seed_candidate = {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
+    seed_candidate = build_seed_candidate(args.initial_gepa_addendum)
     baseline_tasks = [
         cast(PuzzleScriptLevelTask, task)
         for task in reassign_task_ids(unique_tasks_by_key([*train_tasks, *val_tasks]))
@@ -2609,7 +2636,8 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         f"score_delta_weight={args.score_delta_weight} score_delta_clip={args.score_delta_clip} "
         f"partial_progress_weight={args.partial_progress_weight} "
         f"global_lost_solve_gate_penalty={args.global_lost_solve_gate_penalty} "
-        f"global_net_solve_loss_gate_penalty={args.global_net_solve_loss_gate_penalty}",
+        f"global_net_solve_loss_gate_penalty={args.global_net_solve_loss_gate_penalty} "
+        f"initial_gepa_addendum_chars={len(args.initial_gepa_addendum.strip())}",
         flush=True,
     )
     baseline_batch = adapter.evaluate(
@@ -2784,6 +2812,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Use <=0 to evaluate all active levels per GEPA reflection round.",
+    )
+    parser.add_argument(
+        "--initial-gepa-addendum",
+        type=str,
+        default="",
+        help=(
+            "Optional initial GEPA addendum attached to the base PuzzleScript "
+            "heuristic prompt before optimization starts."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()

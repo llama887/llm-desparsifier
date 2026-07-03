@@ -242,6 +242,7 @@ echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
     --global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}" \
     --global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}" \
     --reflection-minibatch-size "${REFLECTION_MINIBATCH_SIZE:-0}" \
+    --initial-gepa-addendum "${INITIAL_GEPA_ADDENDUM:-}" \
     --seed "${GEPA_SEED:-0}"
 
 if [ "${RUN_HOLDOUT_COMPARE:-1}" = "1" ]; then
