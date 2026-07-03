@@ -277,6 +277,21 @@ def test_trace_classification_flags_moderate_solved_efficiency_regression() -> N
     assert trace_classification(trace) == "solved_regression"
 
 
+def test_trace_classification_flags_solved_efficiency_gain() -> None:
+    trace = {
+        "result": {
+            "solved": True,
+            "baseline_solved": True,
+            "score": 0.88,
+            "baseline_score": 0.86,
+            "expanded": 900,
+            "baseline_expanded": 1_400,
+        }
+    }
+
+    assert trace_classification(trace) == "solved_efficiency_gain"
+
+
 def test_candidate_score_can_apply_explicit_eval_wide_gate_for_lost_solves_and_errors() -> None:
     outputs = [
         {
@@ -983,12 +998,31 @@ def test_make_reflective_dataset_starts_with_aggregate_outcome_summary() -> None
                     "baseline_score": 0.0,
                     "baseline_solved": False,
                     "adjusted_score": 4.0,
-                },
             },
-            {
-                "task": {
-                    "game": "stable-loss",
-                    "level": 2,
+        },
+        {
+            "task": {
+                "game": "efficient-stable",
+                "level": 1,
+                "budget": 100,
+                "env_description": "All target crate puzzle with useful ordering.",
+            },
+            "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 0.5\n",
+            "synthesis_error": None,
+            "result": {
+                "score": 0.92,
+                "solved": True,
+                "expanded": 80,
+                "baseline_score": 0.88,
+                "baseline_solved": True,
+                "baseline_expanded": 500,
+                "adjusted_score": 0.7,
+            },
+        },
+        {
+            "task": {
+                "game": "stable-loss",
+                "level": 2,
                     "budget": 100,
                     "env_description": "Classic all target crate puzzle.",
                 },
@@ -1015,6 +1049,9 @@ def test_make_reflective_dataset_starts_with_aggregate_outcome_summary() -> None
     assert aggregate["Comparison"]["classification"] == "aggregate_summary"
     assert aggregate["Comparison"]["new_solve_count"] == 1
     assert aggregate["Comparison"]["lost_baseline_solve_count"] == 1
+    assert aggregate["Comparison"]["solved_efficiency_gain_count"] == 1
+    assert "solved_efficiency_gains=1" in aggregate["Feedback"]
+    assert "efficient-stable" in aggregate["Feedback"]
     assert "beam-gain" in aggregate["Feedback"]
     assert "stable-loss" in aggregate["Feedback"]
     assert "beam" in aggregate["Feedback"]
@@ -2149,6 +2186,26 @@ def test_build_reflection_feedback_includes_trace_diagnostics_for_solved_regress
     assert "Candidate trace diagnostics" in feedback
     assert "progress_range=0.200..0.500" in feedback
     assert "open_set_size_at_end=17" in feedback
+
+
+def test_build_reflection_feedback_includes_solved_efficiency_gain_guidance() -> None:
+    feedback = build_reflection_feedback(
+        {
+            "score": 0.91,
+            "solved": True,
+            "expanded": 300,
+            "baseline_score": 0.86,
+            "baseline_solved": True,
+            "baseline_expanded": 900,
+        },
+        "solved_efficiency_gain",
+    )
+
+    assert "EFFICIENCY GAIN" in feedback
+    assert "both prompts solved" in feedback
+    assert "preserve the structural ordering" in feedback
+    assert "expanded=900" in feedback
+    assert "expanded=300" in feedback
 
 
 def test_select_reflection_traces_prioritizes_regressions_and_new_solves() -> None:

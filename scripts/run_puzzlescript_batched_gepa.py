@@ -79,6 +79,9 @@ DEFAULT_COMMON_SOLVE_EFFICIENCY_CLIP = 1.0
 DEFAULT_SOLVED_REGRESSION_SCORE_MARGIN = 0.01
 DEFAULT_SOLVED_REGRESSION_EXPANSION_MARGIN = 100.0
 DEFAULT_SOLVED_REGRESSION_EXPANSION_RATIO = 1.2
+DEFAULT_SOLVED_GAIN_SCORE_MARGIN = 0.01
+DEFAULT_SOLVED_GAIN_EXPANSION_MARGIN = 100.0
+DEFAULT_SOLVED_GAIN_EXPANSION_RATIO = 1.2
 DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4200
 DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 1200
 DEFAULT_REFLECTION_DATASET_CHARS = 24000
@@ -316,6 +319,36 @@ def _is_solved_efficiency_regression(result: Mapping[str, Any]) -> bool:
     )
 
 
+def _is_solved_efficiency_gain(result: Mapping[str, Any]) -> bool:
+    """Return True when a candidate preserves a solve while searching less.
+
+    GEPA's scalar score already rewards common-solve expansion savings, but the
+    reflection prompt also needs positive examples of efficient state ordering.
+    This predicate is the mirror of solved-regression detection: it surfaces
+    materially better both-solved traces without treating tiny score or expansion
+    jitter as a prompt lesson.
+    """
+
+    raw_score = _optional_result_float(result, "score")
+    baseline_score = _optional_result_float(result, "baseline_score")
+    if (
+        raw_score is not None
+        and baseline_score is not None
+        and raw_score >= baseline_score + DEFAULT_SOLVED_GAIN_SCORE_MARGIN
+    ):
+        return True
+
+    expanded = _optional_result_float(result, "expanded")
+    baseline_expanded = _optional_result_float(result, "baseline_expanded")
+    if expanded is None or baseline_expanded is None or expanded <= 0:
+        return False
+    expansion_delta = baseline_expanded - expanded
+    return (
+        expansion_delta >= DEFAULT_SOLVED_GAIN_EXPANSION_MARGIN
+        and baseline_expanded >= expanded * DEFAULT_SOLVED_GAIN_EXPANSION_RATIO
+    )
+
+
 def trace_classification(trace: Mapping[str, Any]) -> str:
     """Classify a trace by how it changes behavior relative to the base prompt."""
     result = trace.get("result", {})
@@ -329,6 +362,8 @@ def trace_classification(trace: Mapping[str, Any]) -> str:
         return "new_solve"
     if baseline_solved and solved and _is_solved_efficiency_regression(result):
         return "solved_regression"
+    if baseline_solved and solved and _is_solved_efficiency_gain(result):
+        return "solved_efficiency_gain"
     if not solved:
         return "persistent_failure"
     return "stable_or_improved"
@@ -347,10 +382,11 @@ def reflection_trace_priority(trace: Mapping[str, Any]) -> tuple[int, float, str
     class_rank = {
         "lost_baseline_solve": 0,
         "new_solve": 1,
-        "solved_regression": 2,
-        "candidate_error": 3,
-        "persistent_failure": 4,
-        "stable_or_improved": 5,
+        "solved_efficiency_gain": 2,
+        "solved_regression": 3,
+        "candidate_error": 4,
+        "persistent_failure": 5,
+        "stable_or_improved": 6,
     }.get(trace_classification(trace), 6)
     return (
         class_rank,
@@ -427,6 +463,7 @@ def select_reflection_traces(
     priority_groups = (
         "lost_baseline_solve",
         "new_solve",
+        "solved_efficiency_gain",
         "solved_regression",
         "candidate_error",
         "persistent_failure",
@@ -1719,6 +1756,16 @@ def build_reflection_feedback(
                 "Reflection target: keep the solve but avoid the extra search caused by the candidate heuristic.",
             ]
         )
+    elif classification == "solved_efficiency_gain":
+        lines.extend(
+            [
+                "EFFICIENCY GAIN: both prompts solved this level, and the candidate searched materially less.",
+                _result_summary("Base result", result, baseline=True),
+                _result_summary("Candidate result", result),
+                "Reflection target: preserve the structural ordering signal that reduced expansions without making it a named-game exception.",
+                "Generalization target: express the efficient ordering as an observable precondition over WINCONDITIONS, RULES, LEGEND aliases, COLLISIONLAYERS, or current state properties.",
+            ]
+        )
     elif classification == "candidate_error":
         lines.extend(
             [
@@ -1772,6 +1819,14 @@ def build_comparison_payload(
     """
     raw_score = float(result.get("score", 0.0))
     baseline_score = float(result.get("baseline_score", 0.0))
+    expanded = _optional_result_float(result, "expanded")
+    baseline_expanded = _optional_result_float(result, "baseline_expanded")
+    expansion_delta = None
+    expansion_ratio = None
+    if expanded is not None and baseline_expanded is not None:
+        expansion_delta = expanded - baseline_expanded
+        if baseline_expanded > 0:
+            expansion_ratio = expanded / baseline_expanded
     return {
         "classification": classification,
         "mechanics_signature": mechanics_signature or "generic",
@@ -1780,6 +1835,10 @@ def build_comparison_payload(
         "candidate_score": raw_score,
         "baseline_score": baseline_score,
         "score_delta": raw_score - baseline_score,
+        "candidate_expanded": expanded,
+        "baseline_expanded": baseline_expanded,
+        "expansion_delta": expansion_delta,
+        "expansion_ratio": expansion_ratio,
         "candidate_error": is_candidate_error(result),
     }
 
@@ -1820,6 +1879,36 @@ def _format_outcome_groups(
     return "; ".join(parts)
 
 
+def _format_efficiency_groups(
+    groups: Mapping[str, Mapping[str, int]],
+    *,
+    prefer_losses: bool,
+    limit: int = 6,
+) -> str:
+    """Return a compact summary of both-solved efficiency wins and losses."""
+    rows: list[tuple[int, int, int, str, Mapping[str, int]]] = []
+    for name, stats in groups.items():
+        gains = int(stats.get("efficiency_gain", 0))
+        regressions = int(stats.get("efficiency_regression", 0))
+        if gains == 0 and regressions == 0:
+            continue
+        net = gains - regressions
+        rows.append((net, gains, regressions, name, stats))
+    if not rows:
+        return "<none>"
+    if prefer_losses:
+        rows.sort(key=lambda row: (row[0], -row[2], row[3]))
+    else:
+        rows.sort(key=lambda row: (row[0], row[1], row[3]), reverse=True)
+    parts: list[str] = []
+    for net, gains, regressions, name, stats in rows[:limit]:
+        parts.append(
+            f"{name} net_eff={net:+d} gains={gains} regressions={regressions} "
+            f"solved={int(stats.get('solved', 0))}/base={int(stats.get('base_solved', 0))}"
+        )
+    return "; ".join(parts)
+
+
 def build_aggregate_reflection_record(
     trajectories: Sequence[Mapping[str, Any]],
     *,
@@ -1839,6 +1928,7 @@ def build_aggregate_reflection_record(
     outcome_counts = {
         "new_solve": 0,
         "lost_baseline_solve": 0,
+        "solved_efficiency_gain": 0,
         "solved_regression": 0,
         "candidate_error": 0,
         "persistent_failure": 0,
@@ -1860,7 +1950,15 @@ def build_aggregate_reflection_record(
         for groups, name in ((by_game, game), (by_mechanics, mechanics)):
             stats = groups.setdefault(
                 name,
-                {"n": 0, "solved": 0, "base_solved": 0, "new": 0, "lost": 0},
+                {
+                    "n": 0,
+                    "solved": 0,
+                    "base_solved": 0,
+                    "new": 0,
+                    "lost": 0,
+                    "efficiency_gain": 0,
+                    "efficiency_regression": 0,
+                },
             )
             stats["n"] += 1
             if bool(result.get("solved", False)):
@@ -1871,6 +1969,10 @@ def build_aggregate_reflection_record(
                 stats["new"] += 1
             elif classification == "lost_baseline_solve":
                 stats["lost"] += 1
+            elif classification == "solved_efficiency_gain":
+                stats["efficiency_gain"] += 1
+            elif classification == "solved_regression":
+                stats["efficiency_regression"] += 1
         if bool(result.get("solved", False)):
             solved += 1
         if bool(result.get("baseline_solved", False)):
@@ -1888,14 +1990,21 @@ def build_aggregate_reflection_record(
                 f"evaluated={total} selected_trace_records={selected_trace_count} "
                 f"solved={solved} base_solved={baseline_solved} "
                 f"new_solves={new_count} lost_base_solves={lost_count} "
+                f"solved_efficiency_gains={outcome_counts.get('solved_efficiency_gain', 0)} "
                 f"solved_efficiency_regressions={outcome_counts.get('solved_regression', 0)} "
                 f"candidate_errors={outcome_counts.get('candidate_error', 0)} "
                 f"mean_adjusted_score={mean_adjusted:.4f}"
             ),
             "Game gains: " + _format_outcome_groups(by_game, prefer_losses=False),
             "Game losses: " + _format_outcome_groups(by_game, prefer_losses=True),
+            "Game efficiency gains: " + _format_efficiency_groups(by_game, prefer_losses=False),
+            "Game efficiency losses: " + _format_efficiency_groups(by_game, prefer_losses=True),
             "Mechanics gains: " + _format_outcome_groups(by_mechanics, prefer_losses=False),
             "Mechanics losses: " + _format_outcome_groups(by_mechanics, prefer_losses=True),
+            "Mechanics efficiency gains: "
+            + _format_efficiency_groups(by_mechanics, prefer_losses=False),
+            "Mechanics efficiency losses: "
+            + _format_efficiency_groups(by_mechanics, prefer_losses=True),
             (
                 "Use this aggregate only to preserve broad rule-grounded wins and "
                 "repair broad losses. Express any category, decision tree, or "
@@ -1917,6 +2026,10 @@ def build_aggregate_reflection_record(
             "new_solve_count": new_count,
             "lost_baseline_solve_count": lost_count,
             "net_new_solve_count": new_count - lost_count,
+            "solved_efficiency_gain_count": outcome_counts.get(
+                "solved_efficiency_gain",
+                0,
+            ),
             "solved_efficiency_regression_count": outcome_counts.get(
                 "solved_regression",
                 0,
@@ -3364,7 +3477,8 @@ class PuzzleScriptBatchedGEPAAdapter:
         selection_note = (
             f"Selected {len(selected_traces)} comparison-focused traces out of "
             f"{len(trajectories)} evaluated levels, prioritizing lost base solves, "
-            "new solves, solved regressions, candidate errors, and persistent failures; "
+            "new solves, solved efficiency gains/regressions, candidate errors, and "
+            "persistent failures; "
             "all levels still contributed to the scalar score."
         )
         aggregate_record = build_aggregate_reflection_record(
