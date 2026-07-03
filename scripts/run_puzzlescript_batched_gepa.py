@@ -2623,12 +2623,13 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             )
         if "new_solve" in classifications:
             return (
-                "Preserve rule-grounded new-solve signals, but simplify expensive "
-                "tie-breakers behind each prompt-internal branch. Prefer cheap counts, "
-                "matching, and interaction distances; use reachability search only when "
-                "RULES or COLLISIONLAYERS show terrain, doors, blockers, one-way motion, "
-                "or other effects make Manhattan distance misleading. Do not replace a "
-                "new-solve branch with score-only fallback."
+                "Preserve rule-grounded new-solve signals, but preserve base-solved "
+                "behavior before simplifying expensive tie-breakers behind each "
+                "prompt-internal branch. Prefer cheap counts, matching, and interaction "
+                "distances; use reachability search only when RULES or COLLISIONLAYERS "
+                "show terrain, doors, blockers, one-way motion, or other effects make "
+                "Manhattan distance misleading. Do not replace a new-solve branch or a "
+                "base-solved branch with score-only fallback."
             )
         return (
             "When a candidate still solves but expands many more states, simplify the "
