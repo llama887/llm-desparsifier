@@ -936,7 +936,7 @@ def test_custom_proposer_does_not_force_heuristic_policy_fallback_for_noop_outpu
     assert result["heuristic_prompt"] == PUZZLESCRIPT_HEURISTIC_CONTRACT
 
 
-def test_custom_proposer_does_not_force_lost_solve_fallback_for_noop_output() -> None:
+def test_custom_proposer_uses_regression_fallback_for_noop_output() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=llm,  # type: ignore[arg-type]
@@ -960,7 +960,10 @@ def test_custom_proposer_does_not_force_lost_solve_fallback_for_noop_output() ->
         components_to_update=["heuristic_prompt"],
     )
 
-    assert result["heuristic_prompt"] == PUZZLESCRIPT_HEURISTIC_CONTRACT
+    assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
+    assert "REGRESSION" not in result["heuristic_prompt"]
+    assert "precondition" in result["heuristic_prompt"]
+    assert "WINCONDITIONS" in result["heuristic_prompt"]
 
 
 def test_custom_proposer_uses_code_contract_fallback_for_candidate_errors() -> None:

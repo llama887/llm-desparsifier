@@ -1886,10 +1886,9 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
     """Return a narrow safety addendum when the proposer no-ops.
 
     Local LLMs sometimes answer the addendum prompt by restating the base prompt
-    or by producing code. For heuristic-policy feedback, forcing a broad
-    fallback addendum can over-shape the single-prompt search and has measured
-    regressions on base-solved levels. Keep only the code-contract repair path,
-    where the feedback is unambiguous and independent of puzzle mechanics.
+    or by producing code. This fallback keeps GEPA moving with one conservative
+    prompt-level hypothesis derived from comparison classes. It intentionally
+    avoids named games, code-side routing, and broad mechanics inventories.
     """
     if not records:
         return ""
@@ -1902,6 +1901,31 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "No import statements, decorators, imported helpers, file access, or cached "
             "library utilities are allowed anywhere in generated code; implement any "
             "needed assignment, queue, or memo logic with plain local loops and literals."
+        )
+    if "lost_baseline_solve" in classifications:
+        return (
+            "For any added internal category, branch, role helper, deadlock test, or "
+            "distance term, first state the observable precondition from WINCONDITIONS, "
+            "RULES, LEGEND aliases, COLLISIONLAYERS, and current object counts. If the "
+            "win text does not name that role or the rules allow the object to be "
+            "created/transformed later, omit the risky term and fall back to finite "
+            "reachable interaction distance plus a small score_normalized tie-breaker."
+        )
+    if "solved_regression" in classifications:
+        return (
+            "When a candidate still solves but expands many more states, simplify the "
+            "heuristic terms behind any prompt-internal branch: prefer cheap counts, "
+            "matching, and interaction distances; use reachability search only when "
+            "RULES or COLLISIONLAYERS show walls, doors, terrain, or one-way motion make "
+            "plain Manhattan distance misleading."
+        )
+    if "new_solve" in classifications:
+        return (
+            "Preserve a new-solve idea only as an observable if-statement over "
+            "WINCONDITIONS, RULES, LEGEND aliases, COLLISIONLAYERS, and state counts. "
+            "The branch should describe why the same rule property should hold on "
+            "unseen games, then keep all estimates finite and revert to the base "
+            "mechanics-reading fallback when the precondition is absent."
         )
     return ""
 
