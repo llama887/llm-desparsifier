@@ -2079,6 +2079,8 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
         ).strip()
     if candidate_prompt_issue(cleaned) is not None:
         return ""
+    if _has_overstrict_role_precondition(cleaned):
+        return ""
     if not cleaned:
         return ""
     full_prompt_markers = (
@@ -2093,6 +2095,33 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
     if _has_dangling_prompt_tail(cleaned):
         return ""
     return cleaned
+
+
+def _has_overstrict_role_precondition(text: str) -> bool:
+    """Return whether a prompt addendum would discard valid persistent roles.
+
+    Some GEPA repairs overreact to lost solves by requiring every heuristic role
+    to both appear in WINCONDITIONS and be creatable by a rule RHS. That is not a
+    sound PuzzleScript criterion: many relevant blockers, doors, switches, and
+    transformed aliases are present initially or affect paths without being win
+    objects. Rejecting this shape lets the conservative fallback preserve
+    base-solved mechanics instead.
+    """
+
+    lowered = text.lower()
+    has_role_gate = "role" in lowered and "wincondition" in lowered
+    has_creation_gate = (
+        "right-hand side" in lowered
+        or "right hand side" in lowered
+        or "rhs" in lowered
+        or "can produce" in lowered
+    )
+    has_both_requirement = (
+        "both checks" in lowered
+        or "both preconditions" in lowered
+        or "only when both" in lowered
+    )
+    return has_role_gate and has_creation_gate and has_both_requirement
 
 
 def _compact_code_contract_fallback(fallback_addendum: str) -> str:

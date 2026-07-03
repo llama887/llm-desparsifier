@@ -1511,6 +1511,53 @@ def test_custom_proposer_uses_alias_gate_preservation_fallback_for_noop_output()
     assert "prompt-internal" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_rejects_overstrict_role_precondition_addendum() -> None:
+    bad_addendum = (
+        "Before adding any role-specific term, require the role name to appear in "
+        "WINCONDITIONS and require RULES to have a right-hand side that can produce "
+        "that role. Only when both checks succeed may the heuristic use distance or "
+        "reachability for the role."
+    )
+    llm = _FakeLLM(bad_addendum)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "lost_baseline_solve"},
+                    "Feedback": "REGRESSION: base prompt solved but candidate failed.",
+                    "Baseline Output": {
+                        "code_shape": {
+                            "uses_alias_specific_terms": True,
+                            "uses_weighted_switch_terms": True,
+                        }
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_alias_specific_terms": False,
+                            "uses_weighted_switch_terms": False,
+                        }
+                    },
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "both checks succeed" not in result["heuristic_prompt"]
+    assert "right-hand side" not in result["heuristic_prompt"]
+    assert "weighted switch" in result["heuristic_prompt"]
+
+
 def test_custom_proposer_uses_reachability_overfit_fallback_for_noop_output() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
