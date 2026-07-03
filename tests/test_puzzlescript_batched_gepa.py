@@ -667,7 +667,10 @@ def test_heuristic_code_shape_flags_generic_fallback_and_mechanics_terms() -> No
         "def heuristic_cost_to_go(ts, env_params, ctx):\n"
         "    role_positions = {}\n"
         "    if not role_positions: return (1.0 - ctx.get('score_normalized', 0.0)) * 10.0\n"
-        "    return 1000.0 if 'door' else len(crate_positions) + len(targets) + corner_deadlock\n"
+        "    crate_keys = ['ncrate', 'mixcrate', 'matchcrate']\n"
+        "    players = ['controlplayer', 'dummy']\n"
+        "    weighted_switches = len(yellowswitches)\n"
+        "    return 1000.0 if 'yellowdoor' else len(crate_positions) + len(targets) + corner_deadlock\n"
     )
 
     assert shape["uses_generic_role_helpers"] is True
@@ -677,6 +680,8 @@ def test_heuristic_code_shape_flags_generic_fallback_and_mechanics_terms() -> No
     assert shape["uses_pushable_object_terms"] is True
     assert shape["uses_target_terms"] is True
     assert shape["uses_deadlock_checks"] is True
+    assert shape["uses_alias_specific_terms"] is True
+    assert shape["uses_weighted_switch_terms"] is True
 
 
 def test_candidate_prompt_issue_rejects_code_but_allows_contract_signature() -> None:
@@ -1463,6 +1468,47 @@ def test_custom_proposer_uses_blocker_preservation_fallback_for_noop_output() ->
     assert "movable blockers" in result["heuristic_prompt"]
     assert "player-to-goal" in result["heuristic_prompt"]
     assert "crate-target" in result["heuristic_prompt"]
+
+
+def test_custom_proposer_uses_alias_gate_preservation_fallback_for_noop_output() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "lost_baseline_solve"},
+                    "Feedback": "REGRESSION: base prompt solved but candidate failed.",
+                    "Baseline Output": {
+                        "code_shape": {
+                            "uses_alias_specific_terms": True,
+                            "uses_weighted_switch_terms": True,
+                        }
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_alias_specific_terms": False,
+                            "uses_weighted_switch_terms": False,
+                        }
+                    },
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "LEGEND aliases" in result["heuristic_prompt"]
+    assert "weighted switch" in result["heuristic_prompt"]
+    assert "prompt-internal" in result["heuristic_prompt"]
 
 
 def test_custom_proposer_uses_reachability_overfit_fallback_for_noop_output() -> None:

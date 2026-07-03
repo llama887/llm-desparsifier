@@ -2241,6 +2241,15 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "distance, and only finite rule-proven deadlock terms; use pure "
                 "player-to-goal distance only when movable blockers cannot affect progress."
             )
+        if _records_show_dropped_alias_gate_structure(records):
+            return (
+                "When a base-solved level used exact LEGEND aliases, transformed object "
+                "variants, weighted switch state, or door/switch gating, do not replace "
+                "that structure with generic substring roles or plain Manhattan terms. "
+                "Preserve those details as prompt-internal preconditions from RULES, "
+                "COLLISIONLAYERS, aliases, and current object counts; fall back only when "
+                "the observable gate or alias is absent."
+            )
         return (
             "For any added internal category, branch, role helper, deadlock test, or "
             "distance term, first state the observable precondition from WINCONDITIONS, "
@@ -2413,6 +2422,29 @@ def _records_show_dropped_blocker_structure(records: Sequence[Mapping[str, Any]]
     return False
 
 
+def _records_show_dropped_alias_gate_structure(records: Sequence[Mapping[str, Any]]) -> bool:
+    """Return whether a lost solve dropped alias-specific or gate-state structure.
+
+    This is diagnostic prompt feedback only. It captures regressions like the
+    current best persistent prompt losing base-solved Heroes/Push levels by
+    simplifying exact LEGEND aliases, transformed variants, or weighted
+    switch/door state into generic role guesses.
+    """
+
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) != "lost_baseline_solve":
+            continue
+        baseline_output = cast(Mapping[str, Any], record.get("Baseline Output", {}))
+        generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
+        baseline_shape = cast(Mapping[str, Any], baseline_output.get("code_shape", {}))
+        generated_shape = cast(Mapping[str, Any], generated_output.get("code_shape", {}))
+        for key in ("uses_alias_specific_terms", "uses_weighted_switch_terms"):
+            if bool(baseline_shape.get(key)) and not bool(generated_shape.get(key)):
+                return True
+    return False
+
+
 def heuristic_code_shape(code: str) -> dict[str, bool]:
     """Return compact flags describing generated heuristic strategy shape.
 
@@ -2471,6 +2503,30 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
         "uses_deadlock_checks": any(
             term in lowered for term in ("deadlock", "dead-lock", "corner")
         ),
+        "uses_alias_specific_terms": any(
+            term in lowered
+            for term in (
+                "controlplayer",
+                "dummy",
+                "ncrate",
+                "mixcrate",
+                "jcrate",
+                "lightcrate",
+                "matchcrate",
+                "rmatchcrate",
+                "bmatchcrate",
+                "ymatchcrate",
+                "pmatchcrate",
+                "gmatchcrate",
+                "sfighter",
+                "swizard",
+                "sthief",
+            )
+        ),
+        "uses_weighted_switch_terms": (
+            "switch" in lowered
+            and any(term in lowered for term in ("weighted", "unweighted", "weighting"))
+        ),
     }
 
 
@@ -2524,6 +2580,22 @@ def _code_shape_diagnostic_line(
             "the base heuristic preserved movable-object, target/goal matching, or "
             "deadlock structure that the candidate omitted; do not collapse such games "
             "to player-goal distance or generic counts when movable blockers affect progress"
+        )
+    if baseline_shape.get("uses_alias_specific_terms") and not generated_shape.get(
+        "uses_alias_specific_terms"
+    ):
+        parts.append(
+            "the base heuristic used exact LEGEND aliases or transformed object variants "
+            "that the candidate omitted; preserve alias-specific roles before using "
+            "substring role guesses"
+        )
+    if baseline_shape.get("uses_weighted_switch_terms") and not generated_shape.get(
+        "uses_weighted_switch_terms"
+    ):
+        parts.append(
+            "the base heuristic modeled weighted switch or door/switch gate state that "
+            "the candidate omitted; preserve gate-state preconditions before reducing "
+            "the game to distance terms"
         )
     if not parts:
         return ""
