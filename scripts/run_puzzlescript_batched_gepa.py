@@ -82,6 +82,7 @@ DEFAULT_SOLVED_REGRESSION_EXPANSION_RATIO = 1.2
 DEFAULT_SOLVED_GAIN_SCORE_MARGIN = 0.01
 DEFAULT_SOLVED_GAIN_EXPANSION_MARGIN = 100.0
 DEFAULT_SOLVED_GAIN_EXPANSION_RATIO = 1.2
+DEFAULT_EFFICIENCY_HEADROOM_EXPANSIONS = 500.0
 DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4200
 DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 1200
 DEFAULT_REFLECTION_DATASET_CHARS = 24000
@@ -289,6 +290,63 @@ def _optional_result_float(result: Mapping[str, Any], key: str) -> Optional[floa
     except (TypeError, ValueError):
         return None
     return numeric if math.isfinite(numeric) else None
+
+
+def _common_solve_efficiency_log2_delta(row: Mapping[str, Any]) -> Optional[float]:
+    """Return paired common-solve expansion savings as a log2 ratio.
+
+    Positive values mean the candidate expanded fewer states than the base
+    prompt; negative values mean it expanded more. The value is unavailable for
+    non-common solves or rows without finite expansion metadata.
+    """
+    if not bool(row.get("solved", False)) or not bool(row.get("baseline_solved", False)):
+        return None
+    expanded = _optional_result_float(row, "expanded")
+    baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    if expanded is None or baseline_expanded is None:
+        return None
+    if expanded < 0 or baseline_expanded < 0:
+        return None
+    return math.log2((baseline_expanded + 1.0) / (expanded + 1.0))
+
+
+def _is_high_headroom_common_solve(
+    row: Mapping[str, Any],
+    *,
+    threshold: float = DEFAULT_EFFICIENCY_HEADROOM_EXPANSIONS,
+) -> bool:
+    """Return whether a common solve has enough base search to teach efficiency.
+
+    Tiny solved levels often produce large ratios from small absolute changes
+    but leave little practical room for a better heuristic. High-headroom
+    examples are the common-solve cases where the base prompt expanded enough
+    states that an efficiency lesson is worth highlighting to GEPA.
+    """
+    if _common_solve_efficiency_log2_delta(row) is None:
+        return False
+    baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    return baseline_expanded is not None and baseline_expanded >= max(0.0, threshold)
+
+
+def _efficiency_headroom_feedback_line(result: Mapping[str, Any]) -> str:
+    """Return a compact explanation of common-solve efficiency headroom."""
+    delta = _common_solve_efficiency_log2_delta(result)
+    baseline_expanded = _optional_result_float(result, "baseline_expanded")
+    if delta is None or baseline_expanded is None:
+        return ""
+    if _is_high_headroom_common_solve(result):
+        return (
+            "Efficiency headroom: high-headroom common-solve example "
+            f"(base_expanded={baseline_expanded:.0f}, "
+            f"log2_base_over_candidate={delta:+.3f}); prioritize this over "
+            "low-expansion jitter when extracting prompt lessons."
+        )
+    return (
+        "Efficiency headroom: low-headroom common-solve example "
+        f"(base_expanded={baseline_expanded:.0f}, "
+        f"log2_base_over_candidate={delta:+.3f}); treat this as a weak "
+        "tie-breaker unless it reveals a clear mechanics-grounded rule."
+    )
 
 
 def _is_solved_efficiency_regression(result: Mapping[str, Any]) -> bool:
@@ -842,15 +900,9 @@ def _common_solve_efficiency_delta(row: Mapping[str, Any], *, clip: float) -> fl
     ratio treats 2x faster and 2x slower symmetrically, while clipping keeps the
     signal subordinate to solve/loss events.
     """
-    if not bool(row.get("solved", False)) or not bool(row.get("baseline_solved", False)):
+    ratio_delta = _common_solve_efficiency_log2_delta(row)
+    if ratio_delta is None:
         return 0.0
-    expanded = _optional_result_float(row, "expanded")
-    baseline_expanded = _optional_result_float(row, "baseline_expanded")
-    if expanded is None or baseline_expanded is None:
-        return 0.0
-    if expanded < 0 or baseline_expanded < 0:
-        return 0.0
-    ratio_delta = math.log2((baseline_expanded + 1.0) / (expanded + 1.0))
     return _clamp(ratio_delta, max(0.0, clip))
 
 
@@ -1756,6 +1808,9 @@ def build_reflection_feedback(
                 "Reflection target: keep the solve but avoid the extra search caused by the candidate heuristic.",
             ]
         )
+        headroom_line = _efficiency_headroom_feedback_line(result)
+        if headroom_line:
+            lines.append(headroom_line)
     elif classification == "solved_efficiency_gain":
         lines.extend(
             [
@@ -1766,6 +1821,9 @@ def build_reflection_feedback(
                 "Generalization target: express the efficient ordering as an observable precondition over WINCONDITIONS, RULES, LEGEND aliases, COLLISIONLAYERS, or current state properties.",
             ]
         )
+        headroom_line = _efficiency_headroom_feedback_line(result)
+        if headroom_line:
+            lines.append(headroom_line)
     elif classification == "candidate_error":
         lines.extend(
             [
@@ -1827,6 +1885,7 @@ def build_comparison_payload(
         expansion_delta = expanded - baseline_expanded
         if baseline_expanded > 0:
             expansion_ratio = expanded / baseline_expanded
+    common_solve_efficiency_log2_delta = _common_solve_efficiency_log2_delta(result)
     return {
         "classification": classification,
         "mechanics_signature": mechanics_signature or "generic",
@@ -1839,6 +1898,8 @@ def build_comparison_payload(
         "baseline_expanded": baseline_expanded,
         "expansion_delta": expansion_delta,
         "expansion_ratio": expansion_ratio,
+        "common_solve_efficiency_log2_delta": common_solve_efficiency_log2_delta,
+        "high_headroom_common_solve": _is_high_headroom_common_solve(result),
         "candidate_error": is_candidate_error(result),
     }
 
@@ -1904,9 +1965,16 @@ def _format_efficiency_groups(
     for net, gains, regressions, name, stats in rows[:limit]:
         parts.append(
             f"{name} net_eff={net:+d} gains={gains} regressions={regressions} "
+            f"high_headroom_gains={int(stats.get('high_headroom_efficiency_gain', 0))} "
+            f"high_headroom_regressions={int(stats.get('high_headroom_efficiency_regression', 0))} "
             f"solved={int(stats.get('solved', 0))}/base={int(stats.get('base_solved', 0))}"
         )
     return "; ".join(parts)
+
+
+def _mean_or_zero(values: Sequence[float]) -> float:
+    """Return the arithmetic mean for a non-empty sequence, otherwise zero."""
+    return sum(values) / len(values) if values else 0.0
 
 
 def build_aggregate_reflection_record(
@@ -1939,6 +2007,11 @@ def build_aggregate_reflection_record(
     solved = 0
     baseline_solved = 0
     adjusted_scores: list[float] = []
+    common_solve_efficiency_deltas: list[float] = []
+    high_headroom_efficiency_deltas: list[float] = []
+    high_headroom_common_solves = 0
+    high_headroom_efficiency_gains = 0
+    high_headroom_efficiency_regressions = 0
 
     for trace in trajectories:
         task = trace.get("task", {})
@@ -1947,6 +2020,17 @@ def build_aggregate_reflection_record(
         outcome_counts[classification] = outcome_counts.get(classification, 0) + 1
         game = str(task.get("game", "unknown"))
         mechanics = trace_mechanics_signature(trace)
+        efficiency_delta = _common_solve_efficiency_log2_delta(result)
+        high_headroom = _is_high_headroom_common_solve(result)
+        if efficiency_delta is not None:
+            common_solve_efficiency_deltas.append(efficiency_delta)
+            if high_headroom:
+                high_headroom_common_solves += 1
+                high_headroom_efficiency_deltas.append(efficiency_delta)
+        if high_headroom and classification == "solved_efficiency_gain":
+            high_headroom_efficiency_gains += 1
+        elif high_headroom and classification == "solved_regression":
+            high_headroom_efficiency_regressions += 1
         for groups, name in ((by_game, game), (by_mechanics, mechanics)):
             stats = groups.setdefault(
                 name,
@@ -1958,6 +2042,8 @@ def build_aggregate_reflection_record(
                     "lost": 0,
                     "efficiency_gain": 0,
                     "efficiency_regression": 0,
+                    "high_headroom_efficiency_gain": 0,
+                    "high_headroom_efficiency_regression": 0,
                 },
             )
             stats["n"] += 1
@@ -1971,8 +2057,12 @@ def build_aggregate_reflection_record(
                 stats["lost"] += 1
             elif classification == "solved_efficiency_gain":
                 stats["efficiency_gain"] += 1
+                if high_headroom:
+                    stats["high_headroom_efficiency_gain"] += 1
             elif classification == "solved_regression":
                 stats["efficiency_regression"] += 1
+                if high_headroom:
+                    stats["high_headroom_efficiency_regression"] += 1
         if bool(result.get("solved", False)):
             solved += 1
         if bool(result.get("baseline_solved", False)):
@@ -1994,6 +2084,16 @@ def build_aggregate_reflection_record(
                 f"solved_efficiency_regressions={outcome_counts.get('solved_regression', 0)} "
                 f"candidate_errors={outcome_counts.get('candidate_error', 0)} "
                 f"mean_adjusted_score={mean_adjusted:.4f}"
+            ),
+            (
+                "Efficiency headroom: "
+                f"threshold_base_expanded>={DEFAULT_EFFICIENCY_HEADROOM_EXPANSIONS:.0f} "
+                f"common_solves={len(common_solve_efficiency_deltas)} "
+                f"high_headroom_common_solves={high_headroom_common_solves} "
+                f"high_headroom_efficiency_gains={high_headroom_efficiency_gains} "
+                f"high_headroom_efficiency_regressions={high_headroom_efficiency_regressions} "
+                f"mean_log2_base_over_candidate={_mean_or_zero(common_solve_efficiency_deltas):+.3f} "
+                f"high_headroom_mean_log2_base_over_candidate={_mean_or_zero(high_headroom_efficiency_deltas):+.3f}"
             ),
             "Game gains: " + _format_outcome_groups(by_game, prefer_losses=False),
             "Game losses: " + _format_outcome_groups(by_game, prefer_losses=True),
@@ -2033,6 +2133,16 @@ def build_aggregate_reflection_record(
             "solved_efficiency_regression_count": outcome_counts.get(
                 "solved_regression",
                 0,
+            ),
+            "common_solve_efficiency_count": len(common_solve_efficiency_deltas),
+            "high_headroom_common_solve_count": high_headroom_common_solves,
+            "high_headroom_efficiency_gain_count": high_headroom_efficiency_gains,
+            "high_headroom_efficiency_regression_count": high_headroom_efficiency_regressions,
+            "mean_common_solve_efficiency_log2_delta": _mean_or_zero(
+                common_solve_efficiency_deltas
+            ),
+            "high_headroom_mean_common_solve_efficiency_log2_delta": _mean_or_zero(
+                high_headroom_efficiency_deltas
             ),
             "candidate_error_count": outcome_counts.get("candidate_error", 0),
         },

@@ -1050,7 +1050,12 @@ def test_make_reflective_dataset_starts_with_aggregate_outcome_summary() -> None
     assert aggregate["Comparison"]["new_solve_count"] == 1
     assert aggregate["Comparison"]["lost_baseline_solve_count"] == 1
     assert aggregate["Comparison"]["solved_efficiency_gain_count"] == 1
+    assert aggregate["Comparison"]["high_headroom_common_solve_count"] == 1
+    assert aggregate["Comparison"]["high_headroom_efficiency_gain_count"] == 1
+    assert aggregate["Comparison"]["high_headroom_efficiency_regression_count"] == 0
     assert "solved_efficiency_gains=1" in aggregate["Feedback"]
+    assert "high_headroom_common_solves=1" in aggregate["Feedback"]
+    assert "high_headroom_efficiency_gains=1" in aggregate["Feedback"]
     assert "efficient-stable" in aggregate["Feedback"]
     assert "beam-gain" in aggregate["Feedback"]
     assert "stable-loss" in aggregate["Feedback"]
@@ -2204,6 +2209,7 @@ def test_build_reflection_feedback_includes_solved_efficiency_gain_guidance() ->
     assert "EFFICIENCY GAIN" in feedback
     assert "both prompts solved" in feedback
     assert "preserve the structural ordering" in feedback
+    assert "high-headroom common-solve" in feedback
     assert "expanded=900" in feedback
     assert "expanded=300" in feedback
 
