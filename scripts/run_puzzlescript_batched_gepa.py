@@ -1937,6 +1937,17 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "unseen games, then keep all estimates finite and revert to the base "
             "mechanics-reading fallback when the precondition is absent."
         )
+    if "persistent_failure" in classifications:
+        return (
+            "For persistent failures, test exactly one conservative prompt-level "
+            "exploration hypothesis: before falling back to score alone, inspect "
+            "WINCONDITIONS, RULES, LEGEND aliases, COLLISIONLAYERS, and object counts "
+            "for a mechanics-grounded progress signal such as object-goal matching, "
+            "player-to-interaction reachability, blocker or terrain distance, staged "
+            "transformation progress, or score_normalized as a small tie-breaker. "
+            "Use the signal only when its observable precondition is present, keep it "
+            "finite/nonnegative, and otherwise preserve the base prompt behavior."
+        )
     return ""
 
 

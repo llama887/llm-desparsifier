@@ -941,7 +941,7 @@ def test_custom_proposer_extracts_addendum_from_full_prompt_output() -> None:
     assert "Prefer exact LEGEND names" in result["heuristic_prompt"]
 
 
-def test_custom_proposer_does_not_force_heuristic_policy_fallback_for_noop_output() -> None:
+def test_custom_proposer_uses_persistent_failure_exploration_for_noop_output() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=llm,  # type: ignore[arg-type]
@@ -965,7 +965,10 @@ def test_custom_proposer_does_not_force_heuristic_policy_fallback_for_noop_outpu
         components_to_update=["heuristic_prompt"],
     )
 
-    assert result["heuristic_prompt"] == PUZZLESCRIPT_HEURISTIC_CONTRACT
+    assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
+    assert "persistent failures" in result["heuristic_prompt"]
+    assert "mechanics-grounded progress signal" in result["heuristic_prompt"]
+    assert "WINCONDITIONS" in result["heuristic_prompt"]
 
 
 def test_custom_proposer_uses_regression_fallback_for_noop_output() -> None:
