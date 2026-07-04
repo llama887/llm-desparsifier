@@ -2823,6 +2823,23 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "RULES, COLLISIONLAYERS, aliases, and current object counts, and use "
                 "finite local BFS/reachability only inside that prompt-internal branch."
             )
+        if _records_show_dropped_action_transition_terms(records):
+            return (
+                "When a base-solved level modeled action transitions such as push, pull, "
+                "swap, slide, water/fill, portal, beam, or gravity effects, do not "
+                "replace that structure with player-only distance, generic counts, or "
+                "score fallback. Preserve the transition-aware cost inside the "
+                "prompt-internal branch whose RULES and COLLISIONLAYERS expose that "
+                "state-changing mechanic; keep the term finite and move-scale."
+            )
+        if _records_show_dropped_assignment_matching(records):
+            return (
+                "When a base-solved level used object-target assignment or matching for "
+                "multiple crates, blocks, boxes, boulders, targets, flags, or goals, do "
+                "not collapse it to nearest-object counts or score fallback. Preserve "
+                "explicit matching inside the prompt-internal branch whose WINCONDITIONS "
+                "and object counts show multiple movable objects compete for goals."
+            )
         if _records_show_dropped_blocker_structure(records):
             return (
                 "When RULES, COLLISIONLAYERS, aliases, or win text show movable blockers "
@@ -2880,6 +2897,23 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "COLLISIONLAYERS make Manhattan distance misleading and every "
                 "state-changing object can be modeled conservatively; otherwise use it "
                 "only as a small tie-breaker or omit it."
+            )
+        if _records_show_dropped_action_transition_terms(records):
+            return (
+                "When both prompts solve but the candidate expands many more states after "
+                "omitting base action-transition costs, preserve finite move-scale terms "
+                "for push, pull, swap, slide, water/fill, portal, beam, gravity, or other "
+                "state-changing RULES. Do not replace those transitions with player-only "
+                "distance, count-only progress, or score_normalized fallback unless the "
+                "observable transition precondition is absent."
+            )
+        if _records_show_dropped_assignment_matching(records):
+            return (
+                "When both prompts solve but the candidate expands many more states after "
+                "omitting base object-target assignment or matching, preserve explicit "
+                "matching for multiple movable objects and goals. Use nearest-object "
+                "or count terms only as cheap fallbacks when WINCONDITIONS and current "
+                "object counts show there is no meaningful assignment choice."
             )
         if "new_solve" in classifications:
             return (
@@ -2945,6 +2979,68 @@ def _records_show_lost_candidate_errors(records: Sequence[Mapping[str, Any]]) ->
             or "imports are not allowed" in feedback
             or "heuristic error" in feedback
         ):
+            return True
+    return False
+
+
+def _records_show_dropped_action_transition_terms(
+    records: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Return whether a candidate omitted base action-transition modeling.
+
+    Some efficient base heuristics are not just distances; they approximate the
+    cost of pushing, pulling, sliding, filling water, swapping, portals, beams,
+    or other state-changing mechanics. Losing those terms can preserve solves
+    while damaging A* ordering, so no-op fallback proposals should keep them
+    available as one prompt-level principle.
+    """
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) not in {
+            "lost_baseline_solve",
+            "solved_regression",
+        }:
+            continue
+        baseline_output = cast(Mapping[str, Any], record.get("Baseline Output", {}))
+        generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
+        baseline_shape = cast(Mapping[str, Any], baseline_output.get("code_shape", {}))
+        generated_shape = cast(Mapping[str, Any], generated_output.get("code_shape", {}))
+        if bool(baseline_shape.get("uses_action_transition_terms")) and not bool(
+            generated_shape.get("uses_action_transition_terms")
+        ):
+            return True
+        feedback = str(record.get("Feedback", "")).lower()
+        if "base modeled action transitions" in feedback and "candidate omitted" in feedback:
+            return True
+    return False
+
+
+def _records_show_dropped_assignment_matching(
+    records: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Return whether a candidate omitted base object-target matching.
+
+    Multi-object puzzles often need assignment/matching to avoid plateaus where
+    every successor has the same count or nearest-object score. This is a
+    reflection-only signal for fallback prompt repair, not a code-side bucket.
+    """
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) not in {
+            "lost_baseline_solve",
+            "solved_regression",
+        }:
+            continue
+        baseline_output = cast(Mapping[str, Any], record.get("Baseline Output", {}))
+        generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
+        baseline_shape = cast(Mapping[str, Any], baseline_output.get("code_shape", {}))
+        generated_shape = cast(Mapping[str, Any], generated_output.get("code_shape", {}))
+        if bool(baseline_shape.get("uses_assignment_matching")) and not bool(
+            generated_shape.get("uses_assignment_matching")
+        ):
+            return True
+        feedback = str(record.get("Feedback", "")).lower()
+        if "base used explicit object-target assignment" in feedback and "candidate weakened" in feedback:
             return True
     return False
 

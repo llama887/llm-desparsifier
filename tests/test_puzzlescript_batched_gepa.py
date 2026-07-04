@@ -2415,6 +2415,95 @@ def test_custom_proposer_uses_reachability_overfit_fallback_for_solved_regressio
     assert "simple base-style distance" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_uses_transition_fallback_for_solved_regression() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "solved_regression"},
+                    "Feedback": (
+                        "Common-solve efficiency diagnosis: base modeled action "
+                        "transitions such as push and water/fill effects that the "
+                        "candidate omitted."
+                    ),
+                    "Baseline Output": {
+                        "code_shape": {
+                            "uses_action_transition_terms": True,
+                            "uses_reachability_search": False,
+                        }
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_action_transition_terms": False,
+                            "uses_reachability_search": False,
+                        }
+                    },
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "action-transition costs" in result["heuristic_prompt"]
+    assert "state-changing RULES" in result["heuristic_prompt"]
+    assert "player-only distance" in result["heuristic_prompt"]
+
+
+def test_custom_proposer_uses_assignment_fallback_for_solved_regression() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "solved_regression"},
+                    "Feedback": (
+                        "Common-solve efficiency diagnosis: base used explicit "
+                        "object-target assignment/matching that the candidate weakened."
+                    ),
+                    "Baseline Output": {
+                        "code_shape": {
+                            "uses_assignment_matching": True,
+                            "uses_reachability_search": False,
+                        }
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_assignment_matching": False,
+                            "uses_reachability_search": False,
+                        }
+                    },
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "object-target assignment or matching" in result["heuristic_prompt"]
+    assert "multiple movable objects and goals" in result["heuristic_prompt"]
+    assert "nearest-object" in result["heuristic_prompt"]
+
+
 def test_custom_proposer_preserves_new_solve_when_efficiency_feedback_is_mixed() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
