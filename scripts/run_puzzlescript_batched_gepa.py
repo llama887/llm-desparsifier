@@ -2471,11 +2471,9 @@ def _compact_code_contract_fallback(fallback_addendum: str) -> str:
     if "non-finite" not in lowered and "collections.deque" not in lowered:
         return ""
     return (
-        "Preserve the current mechanics guidance, but enforce code safety: no "
-        "imports, decorators, imported helpers, file access, external modules, "
-        "collections.deque, float('inf'), math.inf, nan, or other non-finite "
-        "returns; use bounded finite values and local lists, indexes, dicts, sets, "
-        "and loops."
+        "Preserve current mechanics guidance, but enforce code safety: no "
+        "imports/decorators/collections.deque or non-finite returns; use bounded "
+        "finite values and local lists/dicts/sets/loops."
     )
 
 
@@ -2517,6 +2515,15 @@ def _merge_current_addendum_with_fallback(
             )
             if compact_cleaned:
                 return compact_cleaned
+            available_current_chars = max_chars - len(compact) - 1
+            if available_current_chars > 0:
+                trimmed_current = current[:available_current_chars].rstrip()
+                trimmed_combined = _clean_proposed_addendum(
+                    f"{trimmed_current} {compact}",
+                    max_chars=max_chars,
+                )
+                if trimmed_combined:
+                    return trimmed_combined
     return fallback
 
 

@@ -1372,6 +1372,50 @@ def test_custom_proposer_compacts_code_repair_to_preserve_long_addendum() -> Non
     assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
 
 
+def test_custom_proposer_preserves_near_budget_addendum_when_repairing_code_errors() -> None:
+    current_addendum = (
+        "Preserve smooth ranking signal and reachability retention. "
+        + "Keep the current rule-grounded efficiency preconditions. " * 18
+    ).strip()
+    assert len(current_addendum) < DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+    current_prompt = build_seed_candidate(current_addendum)["heuristic_prompt"]
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {
+                        "classification": "lost_baseline_solve",
+                        "candidate_error": True,
+                    },
+                    "Feedback": (
+                        "REGRESSION: base prompt solved but candidate failed. "
+                        "Heuristic validation failed before search: imports are not allowed."
+                    ),
+                    "Generated Outputs": {"synthesis_error": "imports are not allowed"},
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    revised_addendum = result["heuristic_prompt"].split(GEPA_ADDENDUM_HEADER, 1)[1].strip()
+    assert "Preserve smooth ranking signal" in revised_addendum
+    assert "no imports" in revised_addendum
+    assert "non-finite" in revised_addendum
+    assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+
+
 def test_custom_proposer_extracts_addendum_from_full_prompt_output() -> None:
     llm = _FakeLLM(
         PUZZLESCRIPT_HEURISTIC_CONTRACT
