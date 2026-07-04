@@ -2198,6 +2198,54 @@ def test_custom_proposer_uses_reachability_overfit_fallback_for_noop_output() ->
     assert "player-only" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_uses_reachability_overfit_fallback_for_solved_regression() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "solved_regression"},
+                    "Feedback": (
+                        "EFFICIENCY REGRESSION: both prompts solved, but the candidate "
+                        "expanded 2186 states versus 313 for the base after adding BFS."
+                    ),
+                    "Baseline Output": {
+                        "code_shape": {
+                            "uses_reachability_search": False,
+                            "uses_pushable_object_terms": True,
+                            "uses_target_terms": True,
+                            "uses_player_interaction_distance": True,
+                        }
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_reachability_search": True,
+                            "uses_pushable_object_terms": True,
+                            "uses_target_terms": True,
+                            "uses_player_interaction_distance": True,
+                        }
+                    },
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "base solved without it" in result["heuristic_prompt"]
+    assert "approximate reachability" in result["heuristic_prompt"]
+    assert "simple base-style distance" in result["heuristic_prompt"]
+
+
 def test_custom_proposer_preserves_new_solve_when_efficiency_feedback_is_mixed() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
@@ -2450,6 +2498,23 @@ def test_adaptive_causal_code_safety_seed_file_builds_valid_prompt() -> None:
     assert "rule-grounded regime" in prompt
     assert "no imports" in prompt
     assert "non-finite returns" in prompt
+    assert "Additional GEPA guidance" in prompt
+
+
+def test_sharp_interaction_reach_code_safety_seed_file_builds_valid_prompt() -> None:
+    addendum = Path(
+        "configs/gepa_seed_addenda/sharp_interaction_reach_code_safety_probe.txt"
+    ).read_text(encoding="utf-8")
+
+    prompt = build_seed_candidate(addendum)["heuristic_prompt"]
+
+    assert "base-simple ranking primary" in prompt
+    assert "player-to-interaction" in prompt
+    assert "Add reachability/BFS only when" in prompt
+    assert "observable WINCONDITIONS/RULES preconditions" in prompt
+    assert "no imports" in prompt
+    assert "non-finite returns" in prompt
+    assert len(addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
     assert "Additional GEPA guidance" in prompt
 
 

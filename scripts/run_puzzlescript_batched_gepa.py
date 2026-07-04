@@ -2814,6 +2814,16 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "reachability finite and local; simplify only weights and tie-breakers "
                 "around the passability model."
             )
+        if _records_show_reachability_overfit(records):
+            return (
+                "When both prompts solve but the candidate slows down after adding "
+                "approximate reachability, BFS, or push simulation where the base solved "
+                "without it, keep simple base-style distance, matching, blocker, or "
+                "deadlock terms primary. Add reachability only when RULES or "
+                "COLLISIONLAYERS make Manhattan distance misleading and every "
+                "state-changing object can be modeled conservatively; otherwise use it "
+                "only as a small tie-breaker or omit it."
+            )
         if "new_solve" in classifications:
             return (
                 "Preserve rule-grounded new-solve signals, but preserve base-solved "
@@ -2937,7 +2947,10 @@ def _records_show_reachability_overfit(records: Sequence[Mapping[str, Any]]) -> 
 
     for record in records:
         comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
-        if str(comparison.get("classification", "")) != "lost_baseline_solve":
+        if str(comparison.get("classification", "")) not in {
+            "lost_baseline_solve",
+            "solved_regression",
+        }:
             continue
         baseline_output = cast(Mapping[str, Any], record.get("Baseline Output", {}))
         generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
