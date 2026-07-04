@@ -91,6 +91,19 @@ DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 1200
 DEFAULT_REFLECTION_DATASET_CHARS = 24000
 DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 300.0
 DEFAULT_LLM_TEMPERATURE = 0.0
+ACTIONABLE_CODE_SHAPE_LOSS_WEIGHTS: dict[str, float] = {
+    "uses_transformed_object_terms": 4.0,
+    "uses_gate_aware_reachability": 4.0,
+    "uses_assignment_matching": 4.0,
+    "uses_action_transition_terms": 4.0,
+    "uses_player_interaction_distance": 3.0,
+    "uses_reachability_search": 3.0,
+    "uses_alias_specific_terms": 3.0,
+    "uses_weighted_switch_terms": 3.0,
+    "uses_pushable_object_terms": 2.0,
+    "uses_target_terms": 2.0,
+    "uses_deadlock_checks": 2.0,
+}
 
 HEURISTIC_COMPONENT = "heuristic_prompt"
 GEPA_ADDENDUM_HEADER = "Additional GEPA guidance:"
@@ -539,23 +552,10 @@ def _trace_actionable_shape_loss_bonus(trace: Mapping[str, Any]) -> float:
     if shapes is None:
         return 0.0
     baseline_shape, generated_shape = shapes
-    weighted_flags = {
-        "uses_transformed_object_terms": 4.0,
-        "uses_gate_aware_reachability": 4.0,
-        "uses_assignment_matching": 4.0,
-        "uses_action_transition_terms": 4.0,
-        "uses_player_interaction_distance": 3.0,
-        "uses_reachability_search": 3.0,
-        "uses_alias_specific_terms": 3.0,
-        "uses_weighted_switch_terms": 3.0,
-        "uses_pushable_object_terms": 2.0,
-        "uses_target_terms": 2.0,
-        "uses_deadlock_checks": 2.0,
-    }
     return max(
         (
             weight
-            for key, weight in weighted_flags.items()
+            for key, weight in ACTIONABLE_CODE_SHAPE_LOSS_WEIGHTS.items()
             if bool(baseline_shape.get(key)) and not bool(generated_shape.get(key))
         ),
         default=0.0,
@@ -2259,6 +2259,35 @@ def _mean_or_zero(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _aggregate_actionable_shape_losses(
+    trajectories: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Return counts of repairable base-vs-candidate code-shape losses."""
+    counts: dict[str, int] = {}
+    for trace in trajectories:
+        shapes = _trace_code_shape_pair(trace)
+        if shapes is None:
+            continue
+        baseline_shape, generated_shape = shapes
+        for key in ACTIONABLE_CODE_SHAPE_LOSS_WEIGHTS:
+            if bool(baseline_shape.get(key)) and not bool(generated_shape.get(key)):
+                counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _format_shape_loss_counts(counts: Mapping[str, int], *, limit: int = 8) -> str:
+    """Return compact aggregate code-shape loss text for reflection."""
+    rows = [
+        (key, int(value))
+        for key, value in counts.items()
+        if int(value) > 0
+    ]
+    if not rows:
+        return "<none>"
+    rows.sort(key=lambda item: (-item[1], item[0]))
+    return "; ".join(f"{key}={value}" for key, value in rows[:limit])
+
+
 def build_aggregate_reflection_record(
     trajectories: Sequence[Mapping[str, Any]],
     *,
@@ -2295,6 +2324,7 @@ def build_aggregate_reflection_record(
     high_headroom_common_solves = 0
     high_headroom_efficiency_gains = 0
     high_headroom_efficiency_regressions = 0
+    code_shape_loss_counts = _aggregate_actionable_shape_losses(trajectories)
 
     for trace in trajectories:
         task = trace.get("task", {})
@@ -2395,6 +2425,7 @@ def build_aggregate_reflection_record(
             + _format_efficiency_groups(by_mechanics, prefer_losses=False),
             "Mechanics efficiency losses: "
             + _format_efficiency_groups(by_mechanics, prefer_losses=True),
+            "Code-shape losses: " + _format_shape_loss_counts(code_shape_loss_counts),
             (
                 "Use this aggregate only to preserve broad rule-grounded wins and "
                 "repair broad losses. Express any category, decision tree, or "
@@ -2437,6 +2468,7 @@ def build_aggregate_reflection_record(
             "high_headroom_mean_common_solve_efficiency_log2_delta": _mean_or_zero(
                 high_headroom_efficiency_deltas
             ),
+            "code_shape_loss_counts": code_shape_loss_counts,
             "candidate_error_count": outcome_counts.get("candidate_error", 0),
         },
         "Feedback": feedback,

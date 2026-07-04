@@ -1442,6 +1442,73 @@ def test_make_reflective_dataset_starts_with_aggregate_outcome_summary() -> None
     assert "code-side routing" in aggregate["Feedback"]
 
 
+def test_make_reflective_dataset_aggregate_reports_code_shape_losses(
+    tmp_path: Path,
+) -> None:
+    base_code = tmp_path / "base_assignment.py"
+    base_code.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    remaining_crates = ctx.get('object_positions', {}).get('crate', [])\n"
+        "    remaining_targets = ctx.get('object_positions', {}).get('target', [])\n"
+        "    best_sum = 0\n"
+        "    for perm in permutations(remaining_crates):\n"
+        "        best_sum += len(remaining_targets)\n"
+        "    # push/pull transition cost remains explicit\n"
+        "    return float(best_sum)\n",
+        encoding="utf-8",
+    )
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=object(),  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    eval_batch = SimpleNamespace(
+        trajectories=[
+            {
+                "task": {
+                    "game": "assignment-drop",
+                    "level": 0,
+                    "budget": 100,
+                    "env_description": "All target on crate with pull rules.",
+                },
+                "heuristic_code": (
+                    "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+                    "    crates = ctx.get('object_positions', {}).get('crate', [])\n"
+                    "    return float(len(crates))\n"
+                ),
+                "synthesis_error": None,
+                "result": {
+                    "score": 0.60,
+                    "solved": True,
+                    "expanded": 500,
+                    "baseline_score": 0.90,
+                    "baseline_solved": True,
+                    "baseline_expanded": 100,
+                    "baseline_heuristic_code_path": str(base_code),
+                    "adjusted_score": -0.4,
+                },
+            }
+        ]
+    )
+
+    dataset = adapter.make_reflective_dataset(
+        candidate={},
+        eval_batch=eval_batch,
+        components_to_update=["heuristic_prompt"],
+    )
+
+    aggregate = dataset["heuristic_prompt"][0]
+    shape_losses = aggregate["Comparison"]["code_shape_loss_counts"]
+    assert shape_losses["uses_assignment_matching"] == 1
+    assert shape_losses["uses_action_transition_terms"] == 1
+    assert "Code-shape losses:" in aggregate["Feedback"]
+    assert "uses_assignment_matching=1" in aggregate["Feedback"]
+    assert "uses_action_transition_terms=1" in aggregate["Feedback"]
+
+
 def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
     llm = _FakeLLM(
         "Addendum: keep mechanics-specific object names primary and use score only as a tie-breaker."
