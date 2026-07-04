@@ -2879,7 +2879,8 @@ def _records_show_lost_candidate_errors(records: Sequence[Mapping[str, Any]]) ->
         if bool(comparison.get("candidate_error", False)):
             return True
         generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
-        if str(generated_output.get("synthesis_error", "")).strip():
+        synthesis_error = generated_output.get("synthesis_error")
+        if synthesis_error is not None and str(synthesis_error).strip():
             return True
         feedback = str(record.get("Feedback", "")).lower()
         if (

@@ -1883,6 +1883,41 @@ def test_custom_proposer_uses_code_contract_fallback_for_lost_solve_errors() -> 
     assert "base-solved" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_does_not_treat_none_synthesis_error_as_code_error() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {
+                        "classification": "lost_baseline_solve",
+                        "candidate_error": False,
+                    },
+                    "Feedback": (
+                        "REGRESSION: base prompt solved but candidate exhausted "
+                        "the expansion budget without validation errors."
+                    ),
+                    "Generated Outputs": {"synthesis_error": None},
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "No import statements" not in result["heuristic_prompt"]
+    assert "observable precondition" in result["heuristic_prompt"]
+
+
 def test_custom_proposer_combines_remote_motion_loss_and_code_contract_fallback() -> None:
     current_addendum = Path(
         "configs/gepa_seed_addenda/persistent_mechanics_probe.txt"
