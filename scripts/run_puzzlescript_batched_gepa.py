@@ -2509,6 +2509,23 @@ def _compact_code_contract_fallback(fallback_addendum: str) -> str:
     )
 
 
+def _has_code_safety_guidance(addendum: str) -> bool:
+    """Return whether an addendum already contains the compact code contract.
+
+    GEPA may phrase the same code-safety repair as ``Code safety: ...`` or as a
+    fallback suffix. Treating only exact substring matches as duplicates lets the
+    fallback append a second repair and can force a mid-sentence trim of the
+    mechanics guidance.
+    """
+
+    lowered = addendum.lower()
+    has_import_guard = "no import" in lowered or "no imports" in lowered
+    has_finite_guard = "non-finite" in lowered or "nan" in lowered
+    has_local_guard = "local lists" in lowered or "bounded finite" in lowered
+    has_external_guard = "collections.deque" in lowered or "decorator" in lowered
+    return has_import_guard and has_finite_guard and has_local_guard and has_external_guard
+
+
 def _compact_noncode_fallback(fallback_addendum: str) -> str:
     """Return a short mechanics repair that can fit beside a long seed addendum.
 
@@ -2608,7 +2625,7 @@ def _merge_current_addendum_with_fallback(
     if compact_fallback:
         compact = _clean_proposed_addendum(compact_fallback, max_chars=max_chars)
         if compact:
-            if compact in current:
+            if compact in current or _has_code_safety_guidance(current):
                 return current
             compact_combined = f"{current} {compact}"
             compact_cleaned = _clean_proposed_addendum(
@@ -2619,7 +2636,10 @@ def _merge_current_addendum_with_fallback(
                 return compact_cleaned
             available_current_chars = max_chars - len(compact) - 1
             if available_current_chars > 0:
-                trimmed_current = current[:available_current_chars].rstrip()
+                trimmed_current = _trim_addendum_to_sentence_budget(
+                    current,
+                    max_chars=available_current_chars,
+                )
                 trimmed_combined = _clean_proposed_addendum(
                     f"{trimmed_current} {compact}",
                     max_chars=max_chars,

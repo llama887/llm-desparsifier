@@ -1533,6 +1533,43 @@ def test_custom_proposer_does_not_duplicate_existing_compact_code_repair() -> No
     assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
 
 
+def test_custom_proposer_does_not_duplicate_semantic_code_safety_seed() -> None:
+    current_addendum = Path(
+        "configs/gepa_seed_addenda/interaction_alias_code_safety_probe.txt"
+    ).read_text(encoding="utf-8")
+    current_prompt = build_seed_candidate(current_addendum)["heuristic_prompt"]
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "candidate_error"},
+                    "Feedback": "CANDIDATE ERROR: imports are not allowed.",
+                    "Generated Outputs": {"synthesis_error": "imports are not allowed"},
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    revised_addendum = result["heuristic_prompt"].split(GEPA_ADDENDUM_HEADER, 1)[1].strip()
+    assert revised_addendum.count("no imports/decorators") == 1
+    assert "Preserve current mechanics guidance" not in revised_addendum
+    assert "bounded finite values and l " not in revised_addendum
+    assert "local lists/dicts/sets/loops" in revised_addendum
+    assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+
+
 def test_custom_proposer_preserves_long_seed_when_merging_noncode_fallback() -> None:
     current_addendum = (
         "For efficiency improvements, preserve local ordering signals that the base "
