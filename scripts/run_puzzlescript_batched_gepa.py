@@ -492,6 +492,13 @@ def _reflection_trace_signal(trace: Mapping[str, Any]) -> float:
     classification = trace_classification(trace)
     efficiency_delta = _common_solve_efficiency_log2_delta(result)
     high_headroom_bonus = 1.0 if _is_high_headroom_common_solve(result) else 0.0
+    if classification == "lost_baseline_solve":
+        shape_loss_bonus = _trace_actionable_shape_loss_bonus(trace)
+        if shape_loss_bonus > 0.0:
+            return -100.0 - shape_loss_bonus
+        return (
+            float(result.get("adjusted_score", result.get("score", 0.0)))
+        )
     if classification == "solved_efficiency_gain" and efficiency_delta is not None:
         return -(efficiency_delta + high_headroom_bonus)
     if classification == "solved_regression" and efficiency_delta is not None:

@@ -3701,6 +3701,58 @@ def test_select_reflection_traces_prefers_dropped_assignment_regression(
     assert selected[0]["task"]["game"] == "assignment-regression"
 
 
+def test_select_reflection_traces_prefers_actionable_lost_solve_shape_loss(
+    tmp_path: Path,
+) -> None:
+    base_code = tmp_path / "base_lost_assignment.py"
+    base_code.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    remaining_crates = ctx.get('object_positions', {}).get('crate', [])\n"
+        "    remaining_targets = ctx.get('object_positions', {}).get('target', [])\n"
+        "    best_sum = 0\n"
+        "    for perm in permutations(remaining_crates):\n"
+        "        best_sum += len(remaining_targets)\n"
+        "    return float(best_sum)\n",
+        encoding="utf-8",
+    )
+    generic_loss = {
+        "task": {"game": "generic-loss", "level": 0},
+        "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0\n",
+        "result": {
+            "score": -20.0,
+            "adjusted_score": -20.0,
+            "solved": False,
+            "baseline_solved": True,
+            "expanded": 10_000,
+            "baseline_expanded": 500,
+        },
+    }
+    actionable_loss = {
+        "task": {"game": "assignment-loss", "level": 0},
+        "heuristic_code": (
+            "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+            "    crates = ctx.get('object_positions', {}).get('crate', [])\n"
+            "    return float(len(crates))\n"
+        ),
+        "result": {
+            "score": -1.0,
+            "adjusted_score": -1.0,
+            "solved": False,
+            "baseline_solved": True,
+            "expanded": 10_000,
+            "baseline_expanded": 500,
+            "baseline_heuristic_code_path": str(base_code),
+        },
+    }
+
+    selected = select_reflection_traces(
+        [generic_loss, actionable_loss],
+        max_records=1,
+    )
+
+    assert selected[0]["task"]["game"] == "assignment-loss"
+
+
 def test_common_solve_diagnostic_reports_dropped_transformed_variants() -> None:
     line = _common_solve_code_shape_diagnostic_line(
         {
