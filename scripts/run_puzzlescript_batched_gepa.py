@@ -2229,6 +2229,7 @@ def build_aggregate_reflection_record(
     baseline_solved = 0
     adjusted_scores: list[float] = []
     common_solve_efficiency_deltas: list[float] = []
+    weighted_common_solve_efficiency_deltas: list[float] = []
     high_headroom_efficiency_deltas: list[float] = []
     high_headroom_common_solves = 0
     high_headroom_efficiency_gains = 0
@@ -2245,6 +2246,12 @@ def build_aggregate_reflection_record(
         high_headroom = _is_high_headroom_common_solve(result)
         if efficiency_delta is not None:
             common_solve_efficiency_deltas.append(efficiency_delta)
+            weighted_common_solve_efficiency_deltas.append(
+                _common_solve_efficiency_delta(
+                    result,
+                    clip=DEFAULT_COMMON_SOLVE_EFFICIENCY_CLIP,
+                )
+            )
             if high_headroom:
                 high_headroom_common_solves += 1
                 high_headroom_efficiency_deltas.append(efficiency_delta)
@@ -2314,7 +2321,8 @@ def build_aggregate_reflection_record(
                 f"high_headroom_efficiency_gains={high_headroom_efficiency_gains} "
                 f"high_headroom_efficiency_regressions={high_headroom_efficiency_regressions} "
                 f"mean_log2_base_over_candidate={_mean_or_zero(common_solve_efficiency_deltas):+.3f} "
-                f"high_headroom_mean_log2_base_over_candidate={_mean_or_zero(high_headroom_efficiency_deltas):+.3f}"
+                f"high_headroom_mean_log2_base_over_candidate={_mean_or_zero(high_headroom_efficiency_deltas):+.3f} "
+                f"weighted_mean_common_solve_efficiency_delta={_mean_or_zero(weighted_common_solve_efficiency_deltas):+.3f}"
             ),
             "Game gains: " + _format_outcome_groups(by_game, prefer_losses=False),
             "Game losses: " + _format_outcome_groups(by_game, prefer_losses=True),
@@ -2361,6 +2369,9 @@ def build_aggregate_reflection_record(
             "high_headroom_efficiency_regression_count": high_headroom_efficiency_regressions,
             "mean_common_solve_efficiency_log2_delta": _mean_or_zero(
                 common_solve_efficiency_deltas
+            ),
+            "weighted_mean_common_solve_efficiency_delta": _mean_or_zero(
+                weighted_common_solve_efficiency_deltas
             ),
             "high_headroom_mean_common_solve_efficiency_log2_delta": _mean_or_zero(
                 high_headroom_efficiency_deltas

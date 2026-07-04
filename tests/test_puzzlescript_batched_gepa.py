@@ -1416,9 +1416,11 @@ def test_make_reflective_dataset_starts_with_aggregate_outcome_summary() -> None
     assert aggregate["Comparison"]["high_headroom_common_solve_count"] == 1
     assert aggregate["Comparison"]["high_headroom_efficiency_gain_count"] == 1
     assert aggregate["Comparison"]["high_headroom_efficiency_regression_count"] == 0
+    assert aggregate["Comparison"]["weighted_mean_common_solve_efficiency_delta"] == pytest.approx(1.0)
     assert "solved_efficiency_gains=1" in aggregate["Feedback"]
     assert "high_headroom_common_solves=1" in aggregate["Feedback"]
     assert "high_headroom_efficiency_gains=1" in aggregate["Feedback"]
+    assert "weighted_mean_common_solve_efficiency_delta=+1.000" in aggregate["Feedback"]
     assert "efficient-stable" in aggregate["Feedback"]
     assert "beam-gain" in aggregate["Feedback"]
     assert "stable-loss" in aggregate["Feedback"]
