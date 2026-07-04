@@ -593,6 +593,26 @@ def select_reflection_traces(
         if len(selected) >= max_records:
             return selected
 
+    # Efficiency optimization needs both sides of the tradeoff. If a candidate
+    # produces many fast common solves, class ordering alone can crowd out the
+    # repeated common-solve slowdowns that explain why mean efficiency stalls.
+    # Alternate solved regressions with solved gains before falling back to the
+    # global priority order.
+    efficiency_group_names = ("solved_regression", "solved_efficiency_gain")
+    while len(selected) < max_records:
+        added_in_round = False
+        for group_name in efficiency_group_names:
+            for trace in grouped.get(group_name, []):
+                if id(trace) in seen_ids:
+                    continue
+                add_trace(trace)
+                added_in_round = True
+                break
+            if len(selected) >= max_records:
+                return selected
+        if not added_in_round:
+            break
+
     for trace in sorted(traces, key=reflection_trace_priority):
         add_trace(trace)
         if len(selected) >= max_records:

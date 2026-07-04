@@ -2680,6 +2680,45 @@ def test_select_reflection_traces_prefers_strong_efficiency_examples() -> None:
     assert selected[0]["task"]["game"] == "strong-gain"
 
 
+def test_select_reflection_traces_balances_efficiency_gains_and_regressions() -> None:
+    """Keep repeated solved-slowdown causes visible when gains are plentiful."""
+
+    trajectories = []
+    for idx in range(8):
+        trajectories.append(
+            {
+                "task": {"game": f"gain-{idx}", "level": idx},
+                "result": {
+                    "score": 0.95,
+                    "solved": True,
+                    "baseline_solved": True,
+                    "expanded": 50 + idx,
+                    "baseline_expanded": 4_000 + idx,
+                },
+            }
+        )
+    for idx in range(4):
+        trajectories.append(
+            {
+                "task": {"game": f"regression-{idx}", "level": idx},
+                "result": {
+                    "score": 0.20,
+                    "baseline_score": 0.90,
+                    "solved": True,
+                    "baseline_solved": True,
+                    "expanded": 2_000 + idx,
+                    "baseline_expanded": 200 + idx,
+                },
+            }
+        )
+
+    selected = select_reflection_traces(trajectories, max_records=6)
+    selected_classes = [trace_classification(trace) for trace in selected]
+
+    assert selected_classes.count("solved_regression") >= 3
+    assert selected_classes.count("solved_efficiency_gain") >= 2
+
+
 def test_build_seed_candidate_attaches_initial_gepa_addendum() -> None:
     addendum = "Prefer relation pairs, but keep alias-aware fallback secondary."
 
