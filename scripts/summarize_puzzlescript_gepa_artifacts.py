@@ -15,11 +15,27 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from scripts.run_puzzlescript_batched_gepa import candidate_score  # noqa: E402
+from scripts.run_puzzlescript_batched_gepa import (  # noqa: E402
+    candidate_score,
+    heuristic_code_shape,
+)
 
 DEFAULT_REPORT_EFFICIENCY_WEIGHT = 2.0
 DEFAULT_REPORT_EFFICIENCY_CLIP = 1.0
 DEFAULT_HIGH_HEADROOM_EXPANSIONS = 500.0
+ACTIONABLE_SHAPE_FLAGS = (
+    "uses_transformed_object_terms",
+    "uses_gate_aware_reachability",
+    "uses_assignment_matching",
+    "uses_action_transition_terms",
+    "uses_player_interaction_distance",
+    "uses_reachability_search",
+    "uses_alias_specific_terms",
+    "uses_weighted_switch_terms",
+    "uses_pushable_object_terms",
+    "uses_target_terms",
+    "uses_deadlock_checks",
+)
 
 
 def _optional_float(row: Mapping[str, Any], key: str) -> Optional[float]:
@@ -53,6 +69,100 @@ def _is_candidate_error(row: Mapping[str, Any]) -> bool:
         return False
     text = str(error).lower()
     return "game compilation failed" not in text and "compiling game" not in text
+
+
+def _shape_loss_outcome(row: Mapping[str, Any]) -> str:
+    if bool(row.get("baseline_solved")) and not bool(row.get("solved")):
+        return "lost_baseline_solve"
+    if bool(row.get("solved")) and not bool(row.get("baseline_solved")):
+        return "new_solve"
+    delta = _common_solve_log2_delta(row)
+    if delta is not None and delta < 0.0:
+        return "common_solve_slower"
+    if delta is not None and delta > 0.0:
+        return "common_solve_faster"
+    if not bool(row.get("solved")) and not bool(row.get("baseline_solved")):
+        return "persistent_failure"
+    return "stable_or_equal"
+
+
+def summarize_code_shape_losses(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    max_code_chars: int = 16_000,
+) -> list[dict[str, Any]]:
+    """Return candidate-vs-base code-shape losses found in scored rows.
+
+    The aggregate metric already scores solve and expansion behavior. This audit
+    is interpretive: it identifies repairable implementation structures that
+    the base-generated heuristic used but the optimized-prompt heuristic omitted,
+    so completed artifacts can guide prompt-feedback changes without using
+    heldout data or adding code-side prompt routing.
+    """
+    counts: dict[str, dict[str, Any]] = {}
+    shape_cache: dict[str, Mapping[str, bool]] = {}
+
+    def shape_for(path_value: Any) -> Mapping[str, bool]:
+        path = str(path_value or "")
+        if not path:
+            return {}
+        cached = shape_cache.get(path)
+        if cached is not None:
+            return cached
+        try:
+            text = Path(path).read_text(encoding="utf-8")[:max_code_chars]
+        except OSError:
+            shape_cache[path] = {}
+            return {}
+        shape = heuristic_code_shape(text)
+        shape_cache[path] = shape
+        return shape
+
+    for row in rows:
+        baseline_shape = shape_for(row.get("baseline_heuristic_code_path"))
+        generated_shape = shape_for(row.get("heuristic_code_path"))
+        if not baseline_shape or not generated_shape:
+            continue
+        outcome = _shape_loss_outcome(row)
+        game = str(row.get("game", ""))
+        level = row.get("level")
+        for flag in ACTIONABLE_SHAPE_FLAGS:
+            if not bool(baseline_shape.get(flag)) or bool(generated_shape.get(flag)):
+                continue
+            entry = counts.setdefault(
+                flag,
+                {
+                    "flag": flag,
+                    "count": 0,
+                    "outcomes": {},
+                    "games": {},
+                    "examples": [],
+                },
+            )
+            entry["count"] += 1
+            outcomes = entry["outcomes"]
+            outcomes[outcome] = int(outcomes.get(outcome, 0)) + 1
+            games = entry["games"]
+            games[game] = int(games.get(game, 0)) + 1
+            if len(entry["examples"]) < 5:
+                entry["examples"].append(
+                    {
+                        "game": game,
+                        "level": level,
+                        "outcome": outcome,
+                        "expanded": row.get("expanded"),
+                        "baseline_expanded": row.get("baseline_expanded"),
+                    }
+                )
+
+    summaries = list(counts.values())
+    summaries.sort(
+        key=lambda item: (
+            -int(item["count"]),
+            str(item["flag"]),
+        )
+    )
+    return summaries
 
 
 def summarize_scored_results(
@@ -186,6 +296,7 @@ def summarize_eval_dir(
     *,
     common_solve_efficiency_weight: float = DEFAULT_REPORT_EFFICIENCY_WEIGHT,
     common_solve_efficiency_clip: float = DEFAULT_REPORT_EFFICIENCY_CLIP,
+    include_code_shape_losses: bool = False,
 ) -> dict[str, Any]:
     """Summarize one ``candidate_evals/eval-*`` directory."""
     scored_path = eval_dir / "scored_results.json"
@@ -197,6 +308,10 @@ def summarize_eval_dir(
         common_solve_efficiency_weight=common_solve_efficiency_weight,
         common_solve_efficiency_clip=common_solve_efficiency_clip,
     )
+    if include_code_shape_losses:
+        summary["code_shape_losses"] = summarize_code_shape_losses(
+            [row for row in rows if isinstance(row, Mapping)]
+        )
     summary.update(
         {
             "eval_dir": str(eval_dir),
@@ -212,6 +327,7 @@ def summarize_root(
     *,
     common_solve_efficiency_weight: float = DEFAULT_REPORT_EFFICIENCY_WEIGHT,
     common_solve_efficiency_clip: float = DEFAULT_REPORT_EFFICIENCY_CLIP,
+    include_code_shape_losses: bool = False,
 ) -> dict[str, Any]:
     """Summarize all scored candidate evaluations under one GEPA state root."""
     eval_summaries = [
@@ -223,6 +339,14 @@ def summarize_root(
         for path in sorted(root.glob("candidate_evals/*/scored_results.json"))
     ]
     eval_summaries.sort(key=lambda row: float(row["current_metric_score"]), reverse=True)
+    if include_code_shape_losses and eval_summaries:
+        best = eval_summaries[0]
+        scored_path = Path(str(best["scored_results_path"]))
+        rows = json.loads(scored_path.read_text(encoding="utf-8"))
+        if isinstance(rows, list):
+            best["code_shape_losses"] = summarize_code_shape_losses(
+                [row for row in rows if isinstance(row, Mapping)]
+            )
     git_state_path = root / "run_git_state.json"
     git_state: dict[str, Any] | None = None
     if git_state_path.exists():
@@ -352,6 +476,53 @@ def print_weak_game_tables(summaries: Sequence[Mapping[str, Any]], *, limit: int
             print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
 
 
+def print_shape_loss_tables(summaries: Sequence[Mapping[str, Any]], *, limit: int) -> None:
+    """Print code-shape losses for each root's best eval."""
+    if limit <= 0:
+        return
+    headers = ["shape_loss", "count", "outcomes", "top_games"]
+    for root_summary in summaries:
+        best = root_summary.get("best_eval")
+        if not isinstance(best, Mapping):
+            continue
+        losses = best.get("code_shape_losses")
+        if not isinstance(losses, Sequence):
+            continue
+        rows = [row for row in losses if isinstance(row, Mapping)][:limit]
+        if not rows:
+            continue
+        print(f"\nCode-shape losses for {root_summary.get('root_name')} / {best.get('eval_name')}:")
+        table: list[list[str]] = []
+        for row in rows:
+            outcomes = row.get("outcomes")
+            games = row.get("games")
+            outcome_text = "-"
+            if isinstance(outcomes, Mapping):
+                outcome_text = ", ".join(
+                    f"{key}:{outcomes[key]}" for key in sorted(outcomes, key=str)
+                )
+            game_text = "-"
+            if isinstance(games, Mapping):
+                game_items = sorted(
+                    games.items(),
+                    key=lambda item: (-int(item[1]), str(item[0])),
+                )[:4]
+                game_text = ", ".join(f"{game}:{count}" for game, count in game_items)
+            table.append(
+                [
+                    str(row.get("flag")),
+                    str(row.get("count")),
+                    outcome_text,
+                    game_text,
+                ]
+            )
+        widths = [max(len(headers[i]), *(len(row[i]) for row in table)) for i in range(len(headers))]
+        print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+        print("  ".join("-" * widths[i] for i in range(len(headers))))
+        for row in table:
+            print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Summarize batched PuzzleScript GEPA candidate_evals artifacts.",
@@ -377,6 +548,12 @@ def main() -> None:
         default=0,
         help="Show this many weakest per-game rows for each root's best eval.",
     )
+    parser.add_argument(
+        "--show-shape-losses",
+        type=int,
+        default=0,
+        help="Show this many candidate-vs-base code-shape losses for each root's best eval.",
+    )
     args = parser.parse_args()
 
     roots: list[Path] = []
@@ -388,6 +565,7 @@ def main() -> None:
             root.expanduser().resolve(),
             common_solve_efficiency_weight=args.common_solve_efficiency_weight,
             common_solve_efficiency_clip=args.common_solve_efficiency_clip,
+            include_code_shape_losses=args.show_shape_losses > 0 or args.output is not None,
         )
         for root in roots
     ]
@@ -406,6 +584,7 @@ def main() -> None:
     }
     print_root_table(summaries, limit=max(1, args.limit))
     print_weak_game_tables(summaries, limit=max(0, args.show_games))
+    print_shape_loss_tables(summaries, limit=max(0, args.show_shape_losses))
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

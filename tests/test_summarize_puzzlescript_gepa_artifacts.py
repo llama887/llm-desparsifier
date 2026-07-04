@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from scripts.summarize_puzzlescript_gepa_artifacts import (
+    summarize_code_shape_losses,
     summarize_eval_dir,
     summarize_scored_results,
     weakest_game_summaries,
@@ -105,6 +106,47 @@ def test_weakest_game_summaries_prioritize_losses_and_slowdowns() -> None:
     weakest = weakest_game_summaries(games, limit=2)
 
     assert [row["game"] for row in weakest] == ["lost", "slow"]
+
+
+def test_summarize_code_shape_losses_counts_dropped_assignment(tmp_path: Path) -> None:
+    baseline_code = tmp_path / "baseline.py"
+    baseline_code.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    remaining_crates = ctx.get('object_positions', {}).get('crate', [])\n"
+        "    remaining_targets = ctx.get('object_positions', {}).get('target', [])\n"
+        "    best_sum = 0\n"
+        "    for perm in permutations(remaining_crates):\n"
+        "        best_sum += len(remaining_targets)\n"
+        "    return float(best_sum)\n",
+        encoding="utf-8",
+    )
+    candidate_code = tmp_path / "candidate.py"
+    candidate_code.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    crates = ctx.get('object_positions', {}).get('crate', [])\n"
+        "    return float(len(crates))\n",
+        encoding="utf-8",
+    )
+
+    losses = summarize_code_shape_losses(
+        [
+            {
+                "game": "assignment-game",
+                "level": 2,
+                "solved": True,
+                "baseline_solved": True,
+                "expanded": 300,
+                "baseline_expanded": 100,
+                "heuristic_code_path": str(candidate_code),
+                "baseline_heuristic_code_path": str(baseline_code),
+            }
+        ]
+    )
+
+    by_flag = {row["flag"]: row for row in losses}
+    assert by_flag["uses_assignment_matching"]["count"] == 1
+    assert by_flag["uses_assignment_matching"]["outcomes"]["common_solve_slower"] == 1
+    assert by_flag["uses_assignment_matching"]["games"]["assignment-game"] == 1
 
 
 def test_summarize_eval_dir_reads_scored_results(tmp_path: Path) -> None:
