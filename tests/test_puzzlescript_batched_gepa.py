@@ -3649,6 +3649,58 @@ def test_select_reflection_traces_prefers_dropped_transformed_variant_regression
     assert selected[0]["task"]["game"] == "transformed-regression"
 
 
+def test_select_reflection_traces_prefers_dropped_assignment_regression(
+    tmp_path: Path,
+) -> None:
+    base_code = tmp_path / "base_assignment.py"
+    base_code.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    remaining_crates = ctx.get('object_positions', {}).get('crate', [])\n"
+        "    remaining_targets = ctx.get('object_positions', {}).get('target', [])\n"
+        "    best_sum = 0\n"
+        "    for perm in permutations(remaining_crates):\n"
+        "        best_sum += len(remaining_targets)\n"
+        "    return float(best_sum)\n",
+        encoding="utf-8",
+    )
+    generic_regression = {
+        "task": {"game": "generic-regression", "level": 0},
+        "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0\n",
+        "result": {
+            "score": 0.20,
+            "baseline_score": 0.90,
+            "solved": True,
+            "baseline_solved": True,
+            "expanded": 5_000,
+            "baseline_expanded": 500,
+        },
+    }
+    assignment_regression = {
+        "task": {"game": "assignment-regression", "level": 0},
+        "heuristic_code": (
+            "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+            "    crates = ctx.get('object_positions', {}).get('crate', [])\n"
+            "    return float(len(crates))\n"
+        ),
+        "result": {
+            "score": 0.70,
+            "baseline_score": 0.90,
+            "solved": True,
+            "baseline_solved": True,
+            "expanded": 320,
+            "baseline_expanded": 160,
+            "baseline_heuristic_code_path": str(base_code),
+        },
+    }
+
+    selected = select_reflection_traces(
+        [generic_regression, assignment_regression],
+        max_records=1,
+    )
+
+    assert selected[0]["task"]["game"] == "assignment-regression"
+
+
 def test_common_solve_diagnostic_reports_dropped_transformed_variants() -> None:
     line = _common_solve_code_shape_diagnostic_line(
         {

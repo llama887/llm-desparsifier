@@ -495,27 +495,16 @@ def _reflection_trace_signal(trace: Mapping[str, Any]) -> float:
     if classification == "solved_efficiency_gain" and efficiency_delta is not None:
         return -(efficiency_delta + high_headroom_bonus)
     if classification == "solved_regression" and efficiency_delta is not None:
-        transformed_variant_bonus = (
-            4.0 if _trace_drops_transformed_object_terms(trace) else 0.0
-        )
-        return efficiency_delta - high_headroom_bonus - transformed_variant_bonus
+        return efficiency_delta - high_headroom_bonus - _trace_actionable_shape_loss_bonus(trace)
     if classification == "new_solve":
         return -float(result.get("score", 0.0))
     return float(result.get("adjusted_score", result.get("score", 0.0)))
 
 
-def _trace_drops_transformed_object_terms(trace: Mapping[str, Any]) -> bool:
-    """Return whether a trace drops carried/transformed object handling.
-
-    Reflection selection has a tight record budget. A high-headroom generic
-    slowdown is useful, but a lower-magnitude slowdown that drops carried,
-    picked-up, dropped, or transformed object variants is more actionable for
-    prompt repair because the generated-code contrast points to a concrete
-    mechanics-preservation lesson.
-    """
-    classification = trace_classification(trace)
-    if classification not in {"lost_baseline_solve", "solved_regression"}:
-        return False
+def _trace_code_shape_pair(
+    trace: Mapping[str, Any],
+) -> tuple[Mapping[str, bool], Mapping[str, bool]] | None:
+    """Return baseline/generated code-shape flags for one trace when available."""
     result = cast(Mapping[str, Any], trace.get("result", {}))
     baseline_code = _read_optional_text(
         result.get("baseline_heuristic_code_path"),
@@ -523,11 +512,46 @@ def _trace_drops_transformed_object_terms(trace: Mapping[str, Any]) -> bool:
     )
     generated_code = str(trace.get("heuristic_code", ""))
     if not baseline_code or not generated_code:
-        return False
-    baseline_shape = heuristic_code_shape(baseline_code)
-    generated_shape = heuristic_code_shape(generated_code)
-    return bool(baseline_shape.get("uses_transformed_object_terms")) and not bool(
-        generated_shape.get("uses_transformed_object_terms")
+        return None
+    return heuristic_code_shape(baseline_code), heuristic_code_shape(generated_code)
+
+
+def _trace_actionable_shape_loss_bonus(trace: Mapping[str, Any]) -> float:
+    """Return a selection bonus for traces with repairable code-shape losses.
+
+    Reflection selection has a tight record budget. A high-headroom generic
+    slowdown is useful, but a lower-magnitude slowdown that drops known
+    mechanics-preservation structure is often more actionable because existing
+    feedback and fallback logic can turn that contrast into a concrete prompt
+    repair. The bonus only affects which traces GEPA sees, not scoring.
+    """
+    classification = trace_classification(trace)
+    if classification not in {"lost_baseline_solve", "solved_regression"}:
+        return 0.0
+    shapes = _trace_code_shape_pair(trace)
+    if shapes is None:
+        return 0.0
+    baseline_shape, generated_shape = shapes
+    weighted_flags = {
+        "uses_transformed_object_terms": 4.0,
+        "uses_gate_aware_reachability": 4.0,
+        "uses_assignment_matching": 4.0,
+        "uses_action_transition_terms": 4.0,
+        "uses_player_interaction_distance": 3.0,
+        "uses_reachability_search": 3.0,
+        "uses_alias_specific_terms": 3.0,
+        "uses_weighted_switch_terms": 3.0,
+        "uses_pushable_object_terms": 2.0,
+        "uses_target_terms": 2.0,
+        "uses_deadlock_checks": 2.0,
+    }
+    return max(
+        (
+            weight
+            for key, weight in weighted_flags.items()
+            if bool(baseline_shape.get(key)) and not bool(generated_shape.get(key))
+        ),
+        default=0.0,
     )
 
 
