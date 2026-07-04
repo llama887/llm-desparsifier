@@ -2540,6 +2540,8 @@ def _merge_current_addendum_with_fallback(
     if compact_fallback:
         compact = _clean_proposed_addendum(compact_fallback, max_chars=max_chars)
         if compact:
+            if compact in current:
+                return current
             compact_combined = f"{current} {compact}"
             compact_cleaned = _clean_proposed_addendum(
                 compact_combined,
@@ -3344,6 +3346,10 @@ class PuzzleScriptBatchedGEPAAdapter:
             tuple[str, tuple[tuple[str, int], ...]],
             list[dict[str, Any]],
         ] = {}
+        self.candidate_task_eval_cache: dict[
+            tuple[str, str, int],
+            dict[str, Any],
+        ] = {}
         self.eval_counter = _initial_eval_counter(self.state_root / "candidate_evals")
 
     def set_scoring_baseline_outputs(self, outputs: Sequence[Mapping[str, Any]]) -> None:
@@ -3432,10 +3438,13 @@ class PuzzleScriptBatchedGEPAAdapter:
         changing how distinct prompts or distinct train/validation batches are
         scored.
         """
-        candidate_hash = hashlib.sha256(
-            json.dumps(candidate, sort_keys=True).encode("utf-8")
-        ).hexdigest()
+        candidate_hash = self._candidate_hash(candidate)
         return candidate_hash, tuple((task.game, task.level) for task in batch)
+
+    @staticmethod
+    def _candidate_hash(candidate: Mapping[str, str]) -> str:
+        """Return the stable full prompt hash used for in-run candidate caches."""
+        return hashlib.sha256(json.dumps(candidate, sort_keys=True).encode("utf-8")).hexdigest()
 
     def _reuse_candidate_evaluation(
         self,
@@ -3838,44 +3847,102 @@ class PuzzleScriptBatchedGEPAAdapter:
                 trajectories=trajectories_or_none,
             )
 
-        task_rows = self._synthesize_batch(candidate=candidate, batch=batch, eval_dir=eval_dir)
-        results_by_id = {
-            int(row["task_id"]): row
-            for row in self._run_search(eval_dir=eval_dir, task_rows=task_rows)
-        }
-
-        outputs: list[dict[str, Any]] = []
-        scores: list[float] = []
-        trajectories: list[dict[str, Any]] = []
-        for task, task_row in zip(batch, task_rows, strict=True):
-            result = results_by_id.get(
-                task.task_id,
-                {
-                    "task_id": task.task_id,
-                    "game": task.game,
-                    "level": task.level,
-                    "score": 0.0,
-                    "solved": False,
-                    "feedback": "Missing search result shard output.",
-                    "error": "missing search result shard output",
-                },
+        candidate_hash = cache_key[0]
+        outputs_by_index: dict[int, dict[str, Any]] = {}
+        missing_indices: list[int] = []
+        missing_tasks: list[PuzzleScriptLevelTask] = []
+        for index, task in enumerate(batch):
+            cached_output = self.candidate_task_eval_cache.get(
+                (candidate_hash, task.game, int(task.level))
             )
-            result = dict(result)
-            result["synthesis_error"] = task_row.get("synthesis_error")
+            if cached_output is None:
+                missing_indices.append(index)
+                missing_tasks.append(task)
+                continue
+            result = copy.deepcopy(cached_output)
+            result.pop("adjusted_score", None)
+            result["task_id"] = task.task_id
+            result["game"] = task.game
+            result["level"] = task.level
             self._attach_baseline_metadata(result)
-            outputs.append(result)
-            if capture_traces:
+            outputs_by_index[index] = result
+
+        if outputs_by_index:
+            print(
+                "[adapter] reused per-task candidate outputs for exact prompt: "
+                f"{len(outputs_by_index)}/{len(batch)} level(s)",
+                flush=True,
+            )
+            (eval_dir / "candidate_reuse.json").write_text(
+                json.dumps(
+                    {
+                        "reused": True,
+                        "n_reused_outputs": len(outputs_by_index),
+                        "n_missing_outputs": len(missing_tasks),
+                        "reason": "per-task candidate prompt cache",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        if missing_tasks:
+            task_rows = self._synthesize_batch(
+                candidate=candidate,
+                batch=missing_tasks,
+                eval_dir=eval_dir,
+            )
+            results_by_id = {
+                int(row["task_id"]): row
+                for row in self._run_search(eval_dir=eval_dir, task_rows=task_rows)
+            }
+            for original_index, task, task_row in zip(
+                missing_indices,
+                missing_tasks,
+                task_rows,
+                strict=True,
+            ):
+                result = results_by_id.get(
+                    task.task_id,
+                    {
+                        "task_id": task.task_id,
+                        "game": task.game,
+                        "level": task.level,
+                        "score": 0.0,
+                        "solved": False,
+                        "feedback": "Missing search result shard output.",
+                        "error": "missing search result shard output",
+                    },
+                )
+                result = dict(result)
+                result["synthesis_error"] = task_row.get("synthesis_error")
+                if "heuristic_code_path" not in result:
+                    result["heuristic_code_path"] = task_row.get("heuristic_code_path")
+                self._attach_baseline_metadata(result)
+                outputs_by_index[original_index] = result
+        else:
+            (eval_dir / "synthesis_manifest.json").write_text("[]\n", encoding="utf-8")
+
+        outputs = [outputs_by_index[index] for index in range(len(batch))]
+        trajectories: list[dict[str, Any]] = []
+        if capture_traces:
+            for task, result in zip(batch, outputs, strict=True):
+                code_path = result.get("heuristic_code_path")
                 trajectories.append(
                     {
                         "task": asdict(task),
-                        "heuristic_code_path": task_row.get("heuristic_code_path"),
-                        "heuristic_code": Path(str(task_row["heuristic_code_path"])).read_text(
-                            encoding="utf-8"
-                        ),
-                        "synthesis_error": task_row.get("synthesis_error"),
+                        "heuristic_code_path": code_path,
+                        "heuristic_code": _read_optional_text(code_path, max_chars=16_000),
+                        "synthesis_error": result.get("synthesis_error"),
                         "result": result,
                     }
                 )
+        (eval_dir / "merged_results.json").write_text(
+            json.dumps(outputs, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
 
         scores = adjusted_candidate_scores(
             outputs,
@@ -3916,6 +3983,12 @@ class PuzzleScriptBatchedGEPAAdapter:
             flush=True,
         )
         self.candidate_eval_cache[cache_key] = copy.deepcopy(outputs)
+        for output in outputs:
+            cached_output = copy.deepcopy(output)
+            cached_output.pop("adjusted_score", None)
+            self.candidate_task_eval_cache[
+                (candidate_hash, str(output["game"]), int(output["level"]))
+            ] = cached_output
         return EvaluationBatch(
             outputs=outputs,
             scores=scores,

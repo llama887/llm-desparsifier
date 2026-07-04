@@ -1481,6 +1481,58 @@ def test_custom_proposer_preserves_near_budget_addendum_when_repairing_code_erro
     assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
 
 
+def test_custom_proposer_does_not_duplicate_existing_compact_code_repair() -> None:
+    compact_repair = (
+        "Preserve current mechanics guidance, but enforce code safety: no "
+        "imports/decorators/collections.deque or non-finite returns; use bounded "
+        "finite values and local lists/dicts/sets/loops."
+    )
+    current_addendum = (
+        "For common-solve efficiency, preserve smooth local ranking and "
+        "mechanics-grounded interaction distances. "
+        + "Keep the current rule-grounded efficiency preconditions. " * 12
+        + compact_repair
+    )
+    assert len(current_addendum) < DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+    assert len(current_addendum + " " + compact_repair) <= (
+        DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+    )
+    current_prompt = build_seed_candidate(current_addendum)["heuristic_prompt"]
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {
+                        "classification": "lost_baseline_solve",
+                        "candidate_error": True,
+                    },
+                    "Feedback": (
+                        "REGRESSION: base prompt solved but candidate failed. "
+                        "Heuristic validation failed before search: imports are not allowed."
+                    ),
+                    "Generated Outputs": {"synthesis_error": "imports are not allowed"},
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    revised_addendum = result["heuristic_prompt"].split(GEPA_ADDENDUM_HEADER, 1)[1].strip()
+    assert revised_addendum.count(compact_repair) == 1
+    assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+
+
 def test_custom_proposer_extracts_addendum_from_full_prompt_output() -> None:
     llm = _FakeLLM(
         PUZZLESCRIPT_HEURISTIC_CONTRACT
@@ -2645,6 +2697,98 @@ def test_nonbaseline_candidate_evaluation_reuses_exact_candidate_task_outputs(
     eval_dirs = sorted((tmp_path / "candidate_evals").glob("eval-*"))
     assert len(eval_dirs) == 2
     assert (eval_dirs[1] / "candidate_reuse.json").exists()
+
+
+def test_nonbaseline_candidate_evaluation_reuses_overlapping_task_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = build_seed_candidate("Use role guards before generic keyword helpers.")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=_FakeLLM(""),
+        state_root=tmp_path,
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    tasks = [
+        PuzzleScriptLevelTask(
+            task_id=index,
+            game=f"cache-game-{index}",
+            level=index,
+            budget=100,
+            env_description="Win conditions: all crates on targets",
+            game_text_path=str(tmp_path / f"game-{index}.txt"),
+        )
+        for index in range(3)
+    ]
+    code_paths = []
+    for task in tasks:
+        code_path = tmp_path / f"cached_heuristic_{task.task_id}.py"
+        code_path.write_text(
+            f"def heuristic_cost_to_go(ts, env_params, ctx):\n    return {task.task_id}.0\n",
+            encoding="utf-8",
+        )
+        code_paths.append(code_path)
+    synthesized_batches: list[list[int]] = []
+    searched_batches: list[list[int]] = []
+
+    def fake_synthesize_batch(**kwargs: object) -> list[dict[str, object]]:
+        batch = list(kwargs["batch"])  # type: ignore[index]
+        synthesized_batches.append([task.task_id for task in batch])
+        return [
+            {
+                "task_id": task.task_id,
+                "game": task.game,
+                "level": task.level,
+                "budget": task.budget,
+                "env_description": task.env_description,
+                "game_text_path": task.game_text_path,
+                "heuristic_code_path": str(code_paths[task.task_id]),
+                "synthesis_error": None,
+            }
+            for task in batch
+        ]
+
+    def fake_run_search(**kwargs: object) -> list[dict[str, object]]:
+        task_rows = list(kwargs["task_rows"])  # type: ignore[index]
+        searched_batches.append([int(row["task_id"]) for row in task_rows])
+        return [
+            {
+                "task_id": int(row["task_id"]),
+                "game": str(row["game"]),
+                "level": int(row["level"]),
+                "score": 0.75 + int(row["task_id"]) / 100.0,
+                "solved": True,
+                "expanded": 12 + int(row["task_id"]),
+                "generated": 18,
+                "solution_length": 4,
+                "partial_progress_score": 1.0,
+                "feedback": "candidate solved",
+                "error": None,
+                "heuristic_code_path": str(row["heuristic_code_path"]),
+            }
+            for row in task_rows
+        ]
+
+    monkeypatch.setattr(adapter, "_synthesize_batch", fake_synthesize_batch)
+    monkeypatch.setattr(adapter, "_run_search", fake_run_search)
+
+    first = adapter.evaluate(batch=tasks[:2], candidate=candidate, capture_traces=False)
+    second = adapter.evaluate(batch=tasks[1:], candidate=candidate, capture_traces=True)
+
+    assert synthesized_batches == [[0, 1], [2]]
+    assert searched_batches == [[0, 1], [2]]
+    assert [row["task_id"] for row in first.outputs] == [0, 1]
+    assert [row["task_id"] for row in second.outputs] == [1, 2]
+    assert [row["score"] for row in second.outputs] == pytest.approx([0.76, 0.77])
+    assert second.trajectories is not None
+    assert "return 1.0" in second.trajectories[0]["heuristic_code"]
+    eval_dirs = sorted((tmp_path / "candidate_evals").glob("eval-*"))
+    assert len(eval_dirs) == 2
+    reuse_metadata = (eval_dirs[1] / "candidate_reuse.json").read_text(encoding="utf-8")
+    assert "per-task candidate prompt cache" in reuse_metadata
 
 
 def test_build_reflection_feedback_includes_trace_diagnostics_for_solved_regression() -> None:
