@@ -846,6 +846,61 @@ def reassign_task_ids(tasks: Sequence[Any]) -> list[Any]:
     return [_with_task_id(task, index) for index, task in enumerate(tasks)]
 
 
+def _select_dev_games_by_task_count(
+    game_counts: Mapping[str, int],
+    *,
+    dev_fraction: float,
+    seed: int,
+) -> set[str]:
+    """Return a game-disjoint dev set whose level count is near the target.
+
+    GEPA validates on levels, but the split must remain game-disjoint to avoid
+    same-game mechanics leakage. A purely random game-count split can produce a
+    dev set with far too few or too many levels when games have uneven level
+    counts, which makes validation less representative of the optimized metric.
+    This bounded subset search keeps the random seed as a tie-breaker while
+    choosing the game subset closest to the requested level fraction.
+    """
+
+    if not 0.0 < dev_fraction < 1.0:
+        raise ValueError("dev_fraction must be between 0 and 1")
+    games = list(game_counts)
+    if len(games) <= 1:
+        return set()
+    total_tasks = sum(max(0, int(game_counts[game])) for game in games)
+    if total_tasks <= 0:
+        return set()
+    target_tasks = max(1, min(total_tasks - 1, int(round(total_tasks * dev_fraction))))
+    target_games = max(1, min(len(games) - 1, int(round(len(games) * dev_fraction))))
+    shuffled = games[:]
+    random.Random(seed).shuffle(shuffled)
+
+    states: dict[int, tuple[int, ...]] = {0: ()}
+    for index, game in enumerate(shuffled):
+        count = max(0, int(game_counts[game]))
+        for task_count, subset in list(states.items()):
+            next_count = task_count + count
+            if next_count > total_tasks:
+                continue
+            states.setdefault(next_count, (*subset, index))
+
+    candidates: list[tuple[tuple[int, int, int, tuple[int, ...]], tuple[int, ...]]] = []
+    for task_count, subset in states.items():
+        if not subset or len(subset) == len(games):
+            continue
+        key = (
+            abs(task_count - target_tasks),
+            abs(len(subset) - target_games),
+            len(subset),
+            subset,
+        )
+        candidates.append((key, subset))
+    if not candidates:
+        return {shuffled[0]}
+    _, best_subset = min(candidates, key=lambda item: item[0])
+    return {shuffled[index] for index in best_subset}
+
+
 def build_train_dev_tasks(
     tasks: Sequence[Any],
     *,
@@ -858,14 +913,16 @@ def build_train_dev_tasks(
     materialization. It is useful when some configured jobs fail to load; the
     held-out split then reflects only tasks that can actually be evaluated.
     """
-    games = list(dict.fromkeys(_task_game(task) for task in tasks))
-    train_jobs, dev_jobs = split_train_dev_jobs(
-        [{"name": game} for game in games],
+    rows = list(tasks)
+    game_counts: dict[str, int] = {}
+    for task in rows:
+        game_counts[_task_game(task)] = game_counts.get(_task_game(task), 0) + 1
+    dev_games = _select_dev_games_by_task_count(
+        game_counts,
         dev_fraction=dev_fraction,
         seed=seed,
     )
-    train_games = {str(job["name"]) for job in train_jobs}
-    dev_games = {str(job["name"]) for job in dev_jobs}
+    train_games = set(game_counts) - dev_games
     train_tasks = [task for task in tasks if _task_game(task) in train_games]
     dev_tasks = [task for task in tasks if _task_game(task) in dev_games]
     return reassign_task_ids(train_tasks), reassign_task_ids(dev_tasks)

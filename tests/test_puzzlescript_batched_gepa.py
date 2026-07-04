@@ -263,6 +263,34 @@ def test_build_train_dev_tasks_reassigns_task_ids_after_split() -> None:
     assert {task.game for task in train_tasks}.isdisjoint({task.game for task in dev_tasks})
 
 
+def test_build_train_dev_tasks_balances_dev_by_level_count() -> None:
+    tasks = [
+        *[
+            SimpleNamespace(task_id=idx, game="large-game", level=idx)
+            for idx in range(8)
+        ],
+        *[
+            SimpleNamespace(task_id=8 + idx, game=f"small-{idx}", level=0)
+            for idx in range(4)
+        ],
+    ]
+
+    train_tasks, dev_tasks = build_train_dev_tasks(tasks, dev_fraction=0.25, seed=1)
+
+    assert len(dev_tasks) == 3
+    assert {task.game for task in train_tasks}.isdisjoint({task.game for task in dev_tasks})
+    assert {task.game for task in dev_tasks} <= {"small-0", "small-1", "small-2", "small-3"}
+    assert [task.task_id for task in train_tasks] == list(range(len(train_tasks)))
+    assert [task.task_id for task in dev_tasks] == list(range(len(dev_tasks)))
+
+
+def test_build_train_dev_tasks_rejects_invalid_dev_fraction() -> None:
+    tasks = [SimpleNamespace(task_id=0, game="game", level=0)]
+
+    with pytest.raises(ValueError, match="dev_fraction"):
+        build_train_dev_tasks(tasks, dev_fraction=1.0, seed=0)
+
+
 def test_trace_classification_flags_moderate_solved_efficiency_regression() -> None:
     trace = {
         "result": {
