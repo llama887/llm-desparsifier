@@ -3251,6 +3251,42 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
     uses_count_terms = bool(re.search(r"\blen\s*\(", lowered)) or any(
         term in lowered for term in ("_count", "count_", "num_", "remaining")
     )
+    uses_pushable_object_terms = any(
+        term in lowered for term in ("crate", "block", "box", "boulder")
+    )
+    uses_target_terms = any(term in lowered for term in ("target", "flag", "goal"))
+    uses_assignment_matching = uses_pushable_object_terms and uses_target_terms and any(
+        term in lowered
+        for term in (
+            "assignment",
+            "matching",
+            "permutation",
+            "perm",
+            "remaining_crates",
+            "remaining_targets",
+            "used_crates",
+            "used_targets",
+            "best_sum",
+        )
+    )
+    uses_action_transition_terms = any(
+        term in lowered
+        for term in (
+            "push",
+            "pull",
+            "swap",
+            "slide",
+            "sliding",
+            "fill",
+            "filledwater",
+            "water",
+            "beam",
+            "laser",
+            "gravity",
+            "teleport",
+            "portal",
+        )
+    )
     return {
         "uses_generic_role_helpers": "role_positions" in lowered or "role_keywords" in lowered,
         "uses_score_fallback": "score_normalized" in lowered,
@@ -3270,6 +3306,8 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
         "uses_distance_terms": uses_distance_terms,
         "uses_interaction_object_terms": uses_interaction_object_terms,
         "uses_count_terms": uses_count_terms,
+        "uses_assignment_matching": uses_assignment_matching,
+        "uses_action_transition_terms": uses_action_transition_terms,
         "uses_player_interaction_distance": (
             uses_player_terms and uses_distance_terms and uses_interaction_object_terms
         ),
@@ -3290,10 +3328,8 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
                 "exit",
             )
         ),
-        "uses_pushable_object_terms": any(
-            term in lowered for term in ("crate", "block", "box", "boulder")
-        ),
-        "uses_target_terms": any(term in lowered for term in ("target", "flag", "goal")),
+        "uses_pushable_object_terms": uses_pushable_object_terms,
+        "uses_target_terms": uses_target_terms,
         "uses_deadlock_checks": any(
             term in lowered for term in ("deadlock", "dead-lock", "corner")
         ),
@@ -3322,6 +3358,113 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
             and any(term in lowered for term in ("weighted", "unweighted", "weighting"))
         ),
     }
+
+
+def _common_solve_code_shape_diagnostic_line(
+    result: Mapping[str, Any],
+    baseline_shape: Mapping[str, bool],
+    generated_shape: Mapping[str, bool],
+    classification: str,
+) -> str:
+    """Explain strategy-shape changes behind common-solve expansion deltas.
+
+    Scalar scoring says whether a candidate solved faster or slower, but GEPA
+    needs a short causal hypothesis to update one global prompt. This diagnostic
+    combines the paired expansion ratio with coarse code-shape differences; it
+    remains reflection-only evidence and does not route prompts or change scores.
+    """
+    if classification not in {"solved_regression", "solved_efficiency_gain"}:
+        return ""
+    delta = _common_solve_efficiency_log2_delta(result)
+    expanded = _optional_result_float(result, "expanded")
+    baseline_expanded = _optional_result_float(result, "baseline_expanded")
+    if delta is None or expanded is None or baseline_expanded is None or baseline_expanded <= 0:
+        return ""
+
+    expansion_ratio = expanded / baseline_expanded
+    parts = [
+        (
+            "common solve got slower"
+            if classification == "solved_regression"
+            else "common solve got faster"
+        )
+        + f" (candidate/base_expansion_ratio={expansion_ratio:.2f}, "
+        + f"log2_base_over_candidate={delta:+.3f})"
+    ]
+    if classification == "solved_regression":
+        if generated_shape.get("uses_reachability_search") and not baseline_shape.get(
+            "uses_reachability_search"
+        ):
+            parts.append(
+                "candidate added reachability/BFS where the base used cheaper ordering; "
+                "gate BFS behind observable blockers, terrain, one-way effects, or doors"
+            )
+        if baseline_shape.get("uses_action_transition_terms") and not generated_shape.get(
+            "uses_action_transition_terms"
+        ):
+            parts.append(
+                "base modeled action transitions such as push, pull, swap, slide, fill, "
+                "portal, or beam effects that the candidate omitted"
+            )
+        if baseline_shape.get("uses_assignment_matching") and not generated_shape.get(
+            "uses_assignment_matching"
+        ):
+            parts.append(
+                "base used explicit object-target assignment/matching that the candidate "
+                "weakened; preserve matching when multiple movable objects compete for goals"
+            )
+        if baseline_shape.get("uses_player_interaction_distance") and not generated_shape.get(
+            "uses_player_interaction_distance"
+        ):
+            parts.append(
+                "base retained player-to-interaction distance; avoid count-only or "
+                "score-only plateaus when the player must reach the next object"
+            )
+        if generated_shape.get("uses_score_fallback") and not baseline_shape.get("uses_score_fallback"):
+            parts.append(
+                "candidate leaned more on score_normalized; keep it as a small tie-breaker "
+                "rather than the main ranking when object-level structure exists"
+            )
+        if len(parts) == 1:
+            parts.append(
+                "look for plateau-causing scale changes or a term that orders the wrong "
+                "interaction target despite preserving the solve"
+            )
+    else:
+        if generated_shape.get("uses_action_transition_terms") and not baseline_shape.get(
+            "uses_action_transition_terms"
+        ):
+            parts.append(
+                "candidate added transition-aware terms; preserve them behind rule-derived "
+                "preconditions for games with staged object or terrain changes"
+            )
+        if generated_shape.get("uses_assignment_matching") and not baseline_shape.get(
+            "uses_assignment_matching"
+        ):
+            parts.append(
+                "candidate added object-target assignment/matching; preserve it for "
+                "multi-object goals without making a named-game exception"
+            )
+        if generated_shape.get("uses_player_interaction_distance") and not baseline_shape.get(
+            "uses_player_interaction_distance"
+        ):
+            parts.append(
+                "candidate added player-to-interaction distance; preserve it as a smooth "
+                "tie-breaker for choosing the next reachable interaction"
+            )
+        if generated_shape.get("uses_reachability_search") and not baseline_shape.get(
+            "uses_reachability_search"
+        ):
+            parts.append(
+                "candidate added reachability/BFS and won; keep this as an internal branch "
+                "only when legal paths differ from Manhattan distance"
+            )
+        if len(parts) == 1:
+            parts.append(
+                "identify the structural term that reduced A* plateaus and express it as "
+                "an observable prompt-level precondition"
+            )
+    return "Common-solve efficiency diagnosis: " + "; ".join(parts) + "."
 
 
 def _code_shape_diagnostic_line(
@@ -4240,6 +4383,14 @@ class PuzzleScriptBatchedGEPAAdapter:
                 generated_shape,
                 classification,
             )
+            efficiency_shape_feedback = _common_solve_code_shape_diagnostic_line(
+                result,
+                baseline_shape,
+                generated_shape,
+                classification,
+            )
+            if efficiency_shape_feedback:
+                targeted_feedback = f"{targeted_feedback}\n{efficiency_shape_feedback}"
             if shape_feedback:
                 targeted_feedback = f"{targeted_feedback}\n{shape_feedback}"
             records.append(

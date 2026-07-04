@@ -23,6 +23,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     PuzzleScriptLevelTask,
     SearchArrayConfig,
     SearchArrayStalledError,
+    _common_solve_code_shape_diagnostic_line,
     adjusted_candidate_scores,
     assigned_tasks,
     build_reflection_feedback,
@@ -843,6 +844,56 @@ def test_heuristic_code_shape_flags_player_interaction_distance() -> None:
     assert shape["uses_distance_terms"] is True
     assert shape["uses_interaction_object_terms"] is True
     assert shape["uses_player_interaction_distance"] is True
+
+
+def test_heuristic_code_shape_flags_assignment_and_transition_terms() -> None:
+    shape = heuristic_code_shape(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    remaining_crates = crate_positions[:]\n"
+        "    remaining_targets = target_positions[:]\n"
+        "    for perm in permutations(remaining_crates):\n"
+        "        best_sum = min(best_sum, sum(abs(cx - tx) + abs(cy - ty)))\n"
+        "    # Push crates into water, pull boxes, and swap through portals.\n"
+        "    return float(best_sum)\n"
+    )
+
+    assert shape["uses_assignment_matching"] is True
+    assert shape["uses_action_transition_terms"] is True
+
+
+def test_common_solve_efficiency_diagnostic_explains_reachability_regression() -> None:
+    baseline_shape = heuristic_code_shape(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    crates = ctx.get('object_positions', {}).get('crate', [])\n"
+        "    targets = ctx.get('object_positions', {}).get('target', [])\n"
+        "    player = ctx.get('object_positions', {}).get('player', [])\n"
+        "    return min(abs(cx - tx) + abs(cy - ty) for cx, cy in crates for tx, ty in targets)\n"
+    )
+    generated_shape = heuristic_code_shape(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    def bfs(start):\n"
+        "        visited = {start}\n"
+        "        while queue:\n"
+        "            pass\n"
+        "    return bfs(player) + (1.0 - ctx.get('score_normalized', 0.0))\n"
+    )
+
+    line = _common_solve_code_shape_diagnostic_line(
+        {
+            "solved": True,
+            "baseline_solved": True,
+            "expanded": 2186,
+            "baseline_expanded": 313,
+        },
+        baseline_shape,
+        generated_shape,
+        "solved_regression",
+    )
+
+    assert "common solve got slower" in line
+    assert "candidate/base_expansion_ratio=6.98" in line
+    assert "candidate added reachability/BFS" in line
+    assert "score_normalized" in line
 
 
 def test_candidate_prompt_issue_rejects_code_but_allows_contract_signature() -> None:
