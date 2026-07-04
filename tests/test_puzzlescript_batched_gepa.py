@@ -473,6 +473,71 @@ def test_candidate_scores_weight_common_solve_efficiency_by_headroom() -> None:
     assert scores[1] > scores[0] * 3.0
 
 
+def test_candidate_scores_penalize_severe_low_headroom_slowdowns() -> None:
+    outputs = [
+        {
+            "game": "low-headroom-collapse",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 629,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "baseline_expanded": 3,
+        }
+    ]
+
+    scores = adjusted_candidate_scores(
+        outputs,
+        score_delta_weight=0.0,
+        common_solve_efficiency_weight=1.0,
+        common_solve_efficiency_clip=1.0,
+    )
+
+    assert scores[0] <= -0.9
+
+
+def test_candidate_score_penalizes_negative_mean_common_solve_efficiency() -> None:
+    outputs = [
+        {
+            "game": "new",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 100,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+            "baseline_expanded": 10_000,
+        },
+        {
+            "game": "slow-a",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 300,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "baseline_expanded": 100,
+        },
+        {
+            "game": "slow-b",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 300,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "baseline_expanded": 100,
+        },
+    ]
+
+    score = candidate_score(
+        outputs,
+        score_delta_weight=0.0,
+        common_solve_efficiency_weight=2.0,
+        common_solve_efficiency_clip=1.0,
+        new_solve_bonus=4.0,
+    )
+
+    assert score < 0.0
+
+
 def test_candidate_score_does_not_reward_equal_new_lost_from_efficiency() -> None:
     outputs = [
         {

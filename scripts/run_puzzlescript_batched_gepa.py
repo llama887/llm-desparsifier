@@ -79,6 +79,8 @@ DEFAULT_COMMON_SOLVE_EFFICIENCY_CLIP = 1.0
 DEFAULT_SOLVED_REGRESSION_SCORE_MARGIN = 0.01
 DEFAULT_SOLVED_REGRESSION_EXPANSION_MARGIN = 100.0
 DEFAULT_SOLVED_REGRESSION_EXPANSION_RATIO = 1.2
+DEFAULT_SEVERE_SLOWDOWN_EXPANSION_MARGIN = 100.0
+DEFAULT_SEVERE_SLOWDOWN_EXPANSION_RATIO = 10.0
 DEFAULT_SOLVED_GAIN_SCORE_MARGIN = 0.01
 DEFAULT_SOLVED_GAIN_EXPANSION_MARGIN = 100.0
 DEFAULT_SOLVED_GAIN_EXPANSION_RATIO = 1.2
@@ -1013,7 +1015,18 @@ def _common_solve_efficiency_delta(row: Mapping[str, Any], *, clip: float) -> fl
     ratio_delta = _common_solve_efficiency_log2_delta(row)
     if ratio_delta is None:
         return 0.0
-    scaled_delta = ratio_delta * _common_solve_efficiency_headroom_scale(row)
+    scale = _common_solve_efficiency_headroom_scale(row)
+    expanded = _optional_result_float(row, "expanded")
+    baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    if (
+        ratio_delta < 0.0
+        and expanded is not None
+        and baseline_expanded is not None
+        and expanded - baseline_expanded >= DEFAULT_SEVERE_SLOWDOWN_EXPANSION_MARGIN
+        and expanded >= max(1.0, baseline_expanded) * DEFAULT_SEVERE_SLOWDOWN_EXPANSION_RATIO
+    ):
+        scale = max(scale, 1.0)
+    scaled_delta = ratio_delta * scale
     return _clamp(scaled_delta, max(0.0, clip))
 
 
@@ -1192,6 +1205,20 @@ def adjusted_candidate_scores(
         if gate_penalty <= 0.0
         else 0.0
     )
+    common_solve_efficiency_deltas = [
+        delta
+        for row in rows
+        if (delta := _common_solve_efficiency_log2_delta(row)) is not None
+    ]
+    mean_common_solve_efficiency_delta = (
+        sum(common_solve_efficiency_deltas) / len(common_solve_efficiency_deltas)
+        if common_solve_efficiency_deltas
+        else 0.0
+    )
+    mean_efficiency_regression_gate_penalty = (
+        max(0.0, -mean_common_solve_efficiency_delta)
+        * max(0.0, common_solve_efficiency_weight)
+    )
     scores: list[float] = []
     for row, weight in zip(rows, weights, strict=True):
         score = _base_relative_score(
@@ -1205,7 +1232,12 @@ def adjusted_candidate_scores(
             common_solve_efficiency_weight=common_solve_efficiency_weight,
             common_solve_efficiency_clip=common_solve_efficiency_clip,
         )
-        scores.append(score * weight - gate_penalty - net_solve_loss_gate_penalty)
+        scores.append(
+            score * weight
+            - gate_penalty
+            - net_solve_loss_gate_penalty
+            - mean_efficiency_regression_gate_penalty
+        )
     return scores
 
 
