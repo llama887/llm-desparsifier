@@ -2856,6 +2856,110 @@ def _merge_current_addendum_with_fallback(
     return fallback
 
 
+def _aggregate_code_shape_loss_counts(records: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """Return aggregate code-shape loss counts from reflection records."""
+    counts: dict[str, int] = {}
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) != "aggregate_summary":
+            continue
+        structured = comparison.get("code_shape_loss_counts")
+        if isinstance(structured, Mapping):
+            for key in ACTIONABLE_CODE_SHAPE_LOSS_WEIGHTS:
+                try:
+                    value = int(structured.get(key, 0))
+                except (TypeError, ValueError):
+                    value = 0
+                if value > 0:
+                    counts[key] = counts.get(key, 0) + value
+        feedback = str(record.get("Feedback", ""))
+        for key in ACTIONABLE_CODE_SHAPE_LOSS_WEIGHTS:
+            match = re.search(rf"\b{re.escape(key)}\s*=\s*(\d+)\b", feedback)
+            if match:
+                counts[key] = max(counts.get(key, 0), int(match.group(1)))
+    return counts
+
+
+def _dominant_aggregate_shape_loss(records: Sequence[Mapping[str, Any]]) -> str:
+    """Return the most common repairable aggregate code-shape loss flag."""
+    counts = _aggregate_code_shape_loss_counts(records)
+    if not counts:
+        return ""
+    return max(
+        counts,
+        key=lambda key: (
+            counts[key],
+            ACTIONABLE_CODE_SHAPE_LOSS_WEIGHTS.get(key, 0.0),
+            key,
+        ),
+    )
+
+
+def _aggregate_shape_loss_fallback(flag: str) -> str:
+    """Return a prompt-level fallback for a dominant aggregate shape loss."""
+    if flag == "uses_assignment_matching":
+        return (
+            "When aggregate feedback shows repeated dropped object-target assignment "
+            "or matching, preserve explicit matching for multiple movable objects and "
+            "goals. Use nearest-object or count terms only as cheap fallbacks when "
+            "WINCONDITIONS and current object counts show there is no meaningful "
+            "assignment choice."
+        )
+    if flag == "uses_action_transition_terms":
+        return (
+            "When aggregate feedback shows repeated dropped action-transition costs, "
+            "preserve finite move-scale terms for push, pull, swap, slide, water/fill, "
+            "portal, beam, gravity, or other state-changing RULES. Do not replace those "
+            "transitions with player-only distance, count-only progress, or "
+            "score_normalized fallback unless the observable transition precondition is "
+            "absent."
+        )
+    if flag == "uses_transformed_object_terms":
+        return (
+            "When aggregate feedback shows repeated dropped carried/transformed object "
+            "variants, preserve picked up, carried, dropped, or transformed objects as "
+            "aliases of their source object in the relevant prompt-internal branch. Do "
+            "not reduce those states to plain object roles or score fallback when RULES "
+            "or LEGEND show the variant can satisfy or move toward the win condition."
+        )
+    if flag == "uses_player_interaction_distance":
+        return (
+            "When aggregate feedback shows repeated dropped player-to-interaction "
+            "distance, preserve that bounded distance as a tie-breaker before count-only "
+            "or score_normalized fallback whenever RULES, aliases, or object counts show "
+            "the player must reach, clear, activate, enter, or move an interaction "
+            "object."
+        )
+    if flag in {"uses_reachability_search", "uses_gate_aware_reachability"}:
+        return (
+            "When aggregate feedback shows repeated dropped reachability or gate-aware "
+            "reachability, preserve the finite local passability model inside the "
+            "prompt-internal branch whose RULES, COLLISIONLAYERS, terrain, doors, "
+            "blockers, hazards, gates, or one-way effects make straight-line distance "
+            "misleading."
+        )
+    if flag in {"uses_alias_specific_terms", "uses_weighted_switch_terms"}:
+        return (
+            "When aggregate feedback shows repeated dropped exact aliases, transformed "
+            "variants, weighted switches, or door/switch gate state, preserve those "
+            "details as prompt-internal preconditions from RULES, COLLISIONLAYERS, "
+            "LEGEND aliases, and current object counts before falling back to generic "
+            "substring roles."
+        )
+    if flag in {
+        "uses_pushable_object_terms",
+        "uses_target_terms",
+        "uses_deadlock_checks",
+    }:
+        return (
+            "When aggregate feedback shows repeated dropped movable-object, target/goal, "
+            "or deadlock structure, do not collapse such games to pure player-goal "
+            "distance or generic counts. Preserve crate-target or block-goal matching, "
+            "player-to-interaction distance, and only finite rule-proven deadlock terms."
+        )
+    return ""
+
+
 def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> str:
     """Return a narrow safety addendum when the proposer no-ops.
 
@@ -2872,6 +2976,7 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
         str(cast(Mapping[str, Any], record.get("Comparison", {})).get("classification", ""))
         for record in records
     }
+    aggregate_shape_loss = _dominant_aggregate_shape_loss(records)
     if "candidate_error" in classifications and classifications <= {"candidate_error"}:
         return (
             "No import statements, decorators, imported helpers, file access, or cached "
@@ -2881,6 +2986,8 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "and clamp the final return nonnegative. Implement any needed assignment, "
             "queue, or memo logic with plain local lists, indexes, loops, dicts, and sets."
         )
+    if classifications <= {"aggregate_summary"} and aggregate_shape_loss:
+        return _aggregate_shape_loss_fallback(aggregate_shape_loss)
     if "lost_baseline_solve" in classifications:
         if _records_show_remote_motion_losses(records):
             if _records_show_lost_candidate_errors(records):
@@ -2994,6 +3101,9 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "COLLISIONLAYERS, aliases, and current object counts; fall back only when "
                 "the observable gate or alias is absent."
             )
+        aggregate_fallback = _aggregate_shape_loss_fallback(aggregate_shape_loss)
+        if aggregate_fallback:
+            return aggregate_fallback
         return (
             "For any added internal category, branch, role helper, deadlock test, or "
             "distance term, first state the observable precondition from WINCONDITIONS, "
@@ -3059,6 +3169,9 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "or count terms only as cheap fallbacks when WINCONDITIONS and current "
                 "object counts show there is no meaningful assignment choice."
             )
+        aggregate_fallback = _aggregate_shape_loss_fallback(aggregate_shape_loss)
+        if aggregate_fallback:
+            return aggregate_fallback
         if "new_solve" in classifications:
             return (
                 "Preserve rule-grounded new-solve signals, but preserve base-solved "

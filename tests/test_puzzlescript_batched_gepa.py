@@ -2687,6 +2687,45 @@ def test_custom_proposer_uses_assignment_fallback_for_solved_regression() -> Non
     assert "nearest-object" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_uses_aggregate_assignment_loss_fallback() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {
+                        "classification": "aggregate_summary",
+                        "code_shape_loss_counts": {
+                            "uses_assignment_matching": 7,
+                            "uses_action_transition_terms": 3,
+                        },
+                    },
+                    "Feedback": (
+                        "AGGREGATE CANDIDATE SUMMARY\n"
+                        "Code-shape losses: uses_assignment_matching=7; "
+                        "uses_action_transition_terms=3"
+                    ),
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "object-target assignment or matching" in result["heuristic_prompt"]
+    assert "multiple movable objects and goals" in result["heuristic_prompt"]
+    assert "nearest-object" in result["heuristic_prompt"]
+
+
 def test_custom_proposer_uses_transformed_variant_fallback_for_solved_regression() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
