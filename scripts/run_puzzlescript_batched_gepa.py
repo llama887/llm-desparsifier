@@ -2864,6 +2864,16 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "prompt-internal branch whose RULES and COLLISIONLAYERS expose that "
                 "state-changing mechanic; keep the term finite and move-scale."
             )
+        if _records_show_dropped_transformed_object_terms(records):
+            return (
+                "When a base-solved level modeled carried/transformed object variants "
+                "such as picked up, carried, dropped, or transformed objects, do not "
+                "replace that structure with generic substring roles or plain object "
+                "roles. Preserve each observable variant in the same prompt-internal "
+                "branch as its source object, using RULES, LEGEND aliases, "
+                "COLLISIONLAYERS, and current object counts to decide when the variant "
+                "can satisfy or move toward the win condition."
+            )
         if _records_show_dropped_assignment_matching(records):
             return (
                 "When a base-solved level used object-target assignment or matching for "
@@ -2938,6 +2948,15 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
                 "state-changing RULES. Do not replace those transitions with player-only "
                 "distance, count-only progress, or score_normalized fallback unless the "
                 "observable transition precondition is absent."
+            )
+        if _records_show_dropped_transformed_object_terms(records):
+            return (
+                "When both prompts solve but the candidate expands many more states after "
+                "omitting base carried/transformed object variants, preserve picked up, "
+                "carried, dropped, or transformed objects as aliases of their source "
+                "object in the relevant prompt-internal branch. Do not reduce those "
+                "states to plain object roles or score fallback when RULES or LEGEND "
+                "show the variant can satisfy or move toward the win condition."
             )
         if _records_show_dropped_assignment_matching(records):
             return (
@@ -3043,6 +3062,37 @@ def _records_show_dropped_action_transition_terms(
             return True
         feedback = str(record.get("Feedback", "")).lower()
         if "base modeled action transitions" in feedback and "candidate omitted" in feedback:
+            return True
+    return False
+
+
+def _records_show_dropped_transformed_object_terms(
+    records: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Return whether a candidate omitted carried/transformed object variants.
+
+    Generated heuristics often need to treat carried, picked-up, dropped, or
+    transformed objects as aliases of the source object for the current rules.
+    This detector turns that code-shape contrast into one prompt-level fallback
+    lesson when the reflection LLM no-ops.
+    """
+    for record in records:
+        comparison = cast(Mapping[str, Any], record.get("Comparison", {}))
+        if str(comparison.get("classification", "")) not in {
+            "lost_baseline_solve",
+            "solved_regression",
+        }:
+            continue
+        baseline_output = cast(Mapping[str, Any], record.get("Baseline Output", {}))
+        generated_output = cast(Mapping[str, Any], record.get("Generated Outputs", {}))
+        baseline_shape = cast(Mapping[str, Any], baseline_output.get("code_shape", {}))
+        generated_shape = cast(Mapping[str, Any], generated_output.get("code_shape", {}))
+        if bool(baseline_shape.get("uses_transformed_object_terms")) and not bool(
+            generated_shape.get("uses_transformed_object_terms")
+        ):
+            return True
+        feedback = str(record.get("Feedback", "")).lower()
+        if "carried/transformed object variants" in feedback and "plain object roles" in feedback:
             return True
     return False
 

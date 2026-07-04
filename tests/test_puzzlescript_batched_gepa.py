@@ -2620,6 +2620,51 @@ def test_custom_proposer_uses_assignment_fallback_for_solved_regression() -> Non
     assert "nearest-object" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_uses_transformed_variant_fallback_for_solved_regression() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "solved_regression"},
+                    "Feedback": (
+                        "Common-solve efficiency diagnosis: base modeled "
+                        "carried/transformed object variants that candidate reduced "
+                        "to plain object roles."
+                    ),
+                    "Baseline Output": {
+                        "code_shape": {
+                            "uses_transformed_object_terms": True,
+                            "uses_alias_specific_terms": True,
+                        }
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_transformed_object_terms": False,
+                            "uses_alias_specific_terms": False,
+                        }
+                    },
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "carried/transformed object variants" in result["heuristic_prompt"]
+    assert "picked up, carried, dropped, or transformed" in result["heuristic_prompt"]
+    assert "plain object roles" in result["heuristic_prompt"]
+
+
 def test_custom_proposer_preserves_new_solve_when_efficiency_feedback_is_mixed() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
