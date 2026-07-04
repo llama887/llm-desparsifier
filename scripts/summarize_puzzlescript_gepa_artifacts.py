@@ -238,6 +238,43 @@ def summarize_root(
     }
 
 
+def weakest_game_summaries(
+    game_summaries: Sequence[Mapping[str, Any]],
+    *,
+    limit: int = 5,
+) -> list[Mapping[str, Any]]:
+    """Return the games where a candidate most needs attention.
+
+    This is an interpretation helper for artifact triage, not an optimization
+    metric. It prioritizes lost solves and negative net solve changes first,
+    then common-solve slowdowns, so a short printed report surfaces the game
+    families most likely to explain why an otherwise good candidate is not a
+    clear improvement over the base prompt.
+    """
+    def key(row: Mapping[str, Any]) -> tuple[int, int, float, float, str]:
+        net_solve = int(row.get("net_solve") or 0)
+        lost_solves = int(row.get("lost_solves") or 0)
+        mean_delta = _optional_float(row, "mean_common_log2_base_over_candidate") or 0.0
+        high_headroom_delta = _optional_float(row, "high_headroom_mean_log2_base_over_candidate") or 0.0
+        return (
+            net_solve,
+            -lost_solves,
+            mean_delta,
+            high_headroom_delta,
+            str(row.get("game", "")),
+        )
+
+    concern_rows = [
+        dict(row)
+        for row in game_summaries
+        if int(row.get("net_solve") or 0) < 0
+        or int(row.get("lost_solves") or 0) > 0
+        or (_optional_float(row, "mean_common_log2_base_over_candidate") or 0.0) < 0.0
+        or (_optional_float(row, "high_headroom_mean_log2_base_over_candidate") or 0.0) < 0.0
+    ]
+    return sorted(concern_rows, key=key)[:max(0, limit)]
+
+
 def _format_float(value: Any, digits: int = 3) -> str:
     try:
         numeric = float(value)
@@ -277,6 +314,44 @@ def print_root_table(summaries: Sequence[Mapping[str, Any]], *, limit: int) -> N
         print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
 
 
+def print_weak_game_tables(summaries: Sequence[Mapping[str, Any]], *, limit: int) -> None:
+    """Print weakest per-game summaries for each root's best eval."""
+    if limit <= 0:
+        return
+    headers = ["game", "metric", "sol/base", "new/lost", "mean", "high", "f/same/sl"]
+    for root_summary in summaries:
+        best = root_summary.get("best_eval")
+        if not isinstance(best, Mapping):
+            continue
+        game_summaries = best.get("game_summaries")
+        if not isinstance(game_summaries, Sequence):
+            continue
+        rows = weakest_game_summaries(
+            [row for row in game_summaries if isinstance(row, Mapping)],
+            limit=limit,
+        )
+        if not rows:
+            continue
+        print(f"\nWeak games for {root_summary.get('root_name')} / {best.get('eval_name')}:")
+        table = [
+            [
+                str(row.get("game")),
+                _format_float(row.get("current_metric_score")),
+                f"{row.get('solved')}/{row.get('baseline_solved')}",
+                f"{row.get('new_solves')}/{row.get('lost_solves')}",
+                _format_float(row.get("mean_common_log2_base_over_candidate")),
+                _format_float(row.get("high_headroom_mean_log2_base_over_candidate")),
+                f"{row.get('common_faster')}/{row.get('common_same')}/{row.get('common_slower')}",
+            ]
+            for row in rows
+        ]
+        widths = [max(len(headers[i]), *(len(row[i]) for row in table)) for i in range(len(headers))]
+        print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+        print("  ".join("-" * widths[i] for i in range(len(headers))))
+        for row in table:
+            print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Summarize batched PuzzleScript GEPA candidate_evals artifacts.",
@@ -295,6 +370,12 @@ def main() -> None:
         type=float,
         default=DEFAULT_REPORT_EFFICIENCY_CLIP,
         help="Metric clip used for current_metric_score reporting.",
+    )
+    parser.add_argument(
+        "--show-games",
+        type=int,
+        default=0,
+        help="Show this many weakest per-game rows for each root's best eval.",
     )
     args = parser.parse_args()
 
@@ -324,6 +405,7 @@ def main() -> None:
         "roots": summaries,
     }
     print_root_table(summaries, limit=max(1, args.limit))
+    print_weak_game_tables(summaries, limit=max(0, args.show_games))
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

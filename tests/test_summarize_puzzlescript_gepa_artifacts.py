@@ -10,6 +10,7 @@ import pytest
 from scripts.summarize_puzzlescript_gepa_artifacts import (
     summarize_eval_dir,
     summarize_scored_results,
+    weakest_game_summaries,
 )
 
 
@@ -77,6 +78,33 @@ def test_summarize_scored_results_reports_solve_and_efficiency_gap() -> None:
     assert by_game["slow"]["common_slower"] == 1
     assert by_game["slow"]["mean_common_log2_base_over_candidate"] < 0.0
     assert by_game["lost"]["lost_solves"] == 1
+
+
+def test_weakest_game_summaries_prioritize_losses_and_slowdowns() -> None:
+    games = [
+        {
+            "game": "fast",
+            "net_solve": 0,
+            "lost_solves": 0,
+            "mean_common_log2_base_over_candidate": 1.0,
+        },
+        {
+            "game": "slow",
+            "net_solve": 0,
+            "lost_solves": 0,
+            "mean_common_log2_base_over_candidate": -1.5,
+        },
+        {
+            "game": "lost",
+            "net_solve": -1,
+            "lost_solves": 1,
+            "mean_common_log2_base_over_candidate": 0.2,
+        },
+    ]
+
+    weakest = weakest_game_summaries(games, limit=2)
+
+    assert [row["game"] for row in weakest] == ["lost", "slow"]
 
 
 def test_summarize_eval_dir_reads_scored_results(tmp_path: Path) -> None:
