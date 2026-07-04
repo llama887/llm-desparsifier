@@ -1266,18 +1266,35 @@ def adjusted_candidate_scores(
         if gate_penalty <= 0.0
         else 0.0
     )
-    common_solve_efficiency_deltas = [
+    raw_common_solve_efficiency_deltas = [
         delta
         for row in rows
         if (delta := _common_solve_efficiency_log2_delta(row)) is not None
     ]
-    mean_common_solve_efficiency_delta = (
-        sum(common_solve_efficiency_deltas) / len(common_solve_efficiency_deltas)
-        if common_solve_efficiency_deltas
+    weighted_common_solve_efficiency_deltas = [
+        _common_solve_efficiency_delta(
+            row,
+            clip=common_solve_efficiency_clip,
+        )
+        for row in rows
+        if _common_solve_efficiency_log2_delta(row) is not None
+    ]
+    mean_raw_common_solve_efficiency_delta = (
+        sum(raw_common_solve_efficiency_deltas) / len(raw_common_solve_efficiency_deltas)
+        if raw_common_solve_efficiency_deltas
+        else 0.0
+    )
+    mean_weighted_common_solve_efficiency_delta = (
+        sum(weighted_common_solve_efficiency_deltas) / len(weighted_common_solve_efficiency_deltas)
+        if weighted_common_solve_efficiency_deltas
         else 0.0
     )
     mean_efficiency_regression_gate_penalty = (
-        max(0.0, -mean_common_solve_efficiency_delta)
+        max(
+            0.0,
+            -mean_raw_common_solve_efficiency_delta,
+            -mean_weighted_common_solve_efficiency_delta,
+        )
         * max(0.0, common_solve_efficiency_weight)
     )
     scores: list[float] = []

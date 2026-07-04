@@ -622,6 +622,51 @@ def test_candidate_score_penalizes_negative_mean_common_solve_efficiency() -> No
     assert score < 0.0
 
 
+def test_candidate_score_uses_headroom_weighted_mean_efficiency_gate() -> None:
+    outputs = [
+        {
+            "game": "new",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 100,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+            "baseline_expanded": 10_000,
+        },
+        *[
+            {
+                "game": f"cheap-fast-{idx}",
+                "score": 0.9,
+                "solved": True,
+                "expanded": 4,
+                "baseline_score": 0.9,
+                "baseline_solved": True,
+                "baseline_expanded": 10,
+            }
+            for idx in range(5)
+        ],
+        {
+            "game": "expensive-slow",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 10_000,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "baseline_expanded": 5_000,
+        },
+    ]
+
+    score = candidate_score(
+        outputs,
+        score_delta_weight=0.0,
+        common_solve_efficiency_weight=1.0,
+        common_solve_efficiency_clip=2.0,
+        new_solve_bonus=4.0,
+    )
+
+    assert score < 0.0
+
+
 def test_candidate_score_does_not_reward_equal_new_lost_from_efficiency() -> None:
     outputs = [
         {
