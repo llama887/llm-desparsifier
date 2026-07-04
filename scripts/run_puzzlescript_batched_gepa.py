@@ -85,6 +85,7 @@ DEFAULT_SOLVED_GAIN_SCORE_MARGIN = 0.01
 DEFAULT_SOLVED_GAIN_EXPANSION_MARGIN = 100.0
 DEFAULT_SOLVED_GAIN_EXPANSION_RATIO = 1.2
 DEFAULT_EFFICIENCY_HEADROOM_EXPANSIONS = 500.0
+DEFAULT_EFFICIENCY_HEADROOM_SCALE_CAP = 3.0
 DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4200
 DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 1200
 DEFAULT_REFLECTION_DATASET_CHARS = 24000
@@ -334,13 +335,16 @@ def _common_solve_efficiency_headroom_scale(
     row: Mapping[str, Any],
     *,
     threshold: float = DEFAULT_EFFICIENCY_HEADROOM_EXPANSIONS,
+    scale_cap: float = DEFAULT_EFFICIENCY_HEADROOM_SCALE_CAP,
 ) -> float:
     """Return the scalar weight for paired expansion deltas.
 
     Expansion ratios from tiny base searches are noisy and have low absolute
     payoff. Scale the common-solve efficiency term by the amount of base-search
     headroom so GEPA prefers prompt edits that reduce expensive solved searches
-    while still leaving a small signal for cheap levels.
+    while still leaving a small signal for cheap levels. The cap keeps this term
+    below solve/loss events while distinguishing barely-expensive common solves
+    from cases where the base prompt spent thousands of expansions.
     """
     if _common_solve_efficiency_log2_delta(row) is None:
         return 0.0
@@ -348,7 +352,7 @@ def _common_solve_efficiency_headroom_scale(
     if baseline_expanded is None or baseline_expanded <= 0:
         return 0.0
     positive_threshold = max(1.0, threshold)
-    return _clamp(baseline_expanded / positive_threshold, 1.0)
+    return min(max(0.0, scale_cap), max(0.0, baseline_expanded / positive_threshold))
 
 
 def _efficiency_headroom_feedback_line(result: Mapping[str, Any]) -> str:

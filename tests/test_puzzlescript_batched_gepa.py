@@ -502,6 +502,39 @@ def test_candidate_scores_weight_common_solve_efficiency_by_headroom() -> None:
     assert scores[1] > scores[0] * 3.0
 
 
+def test_candidate_scores_upweight_very_high_headroom_common_solves() -> None:
+    outputs = [
+        {
+            "game": "barely-high-headroom",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 250,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "baseline_expanded": 500,
+        },
+        {
+            "game": "very-high-headroom",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 2_500,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "baseline_expanded": 5_000,
+        },
+    ]
+
+    scores = adjusted_candidate_scores(
+        outputs,
+        score_delta_weight=0.0,
+        common_solve_efficiency_weight=1.0,
+        common_solve_efficiency_clip=5.0,
+    )
+
+    assert scores[1] > scores[0] * 2.5
+    assert scores[1] <= 3.0
+
+
 def test_candidate_scores_penalize_severe_low_headroom_slowdowns() -> None:
     outputs = [
         {
