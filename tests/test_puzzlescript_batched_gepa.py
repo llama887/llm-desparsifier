@@ -1918,6 +1918,61 @@ def test_custom_proposer_does_not_treat_none_synthesis_error_as_code_error() -> 
     assert "observable precondition" in result["heuristic_prompt"]
 
 
+def test_custom_proposer_repairs_clean_lost_solve_without_returning_code_safe_seed() -> None:
+    current_addendum = Path(
+        "configs/gepa_seed_addenda/smooth_reach_code_safety_probe.txt"
+    ).read_text(encoding="utf-8")
+    current_prompt = build_seed_candidate(current_addendum)["heuristic_prompt"]
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {
+                        "classification": "lost_baseline_solve",
+                        "candidate_error": False,
+                    },
+                    "Feedback": (
+                        "REGRESSION: base solved but candidate exhausted the budget "
+                        "after adding approximate push reachability."
+                    ),
+                    "Baseline Output": {
+                        "code_shape": {
+                            "uses_reachability_search": False,
+                            "uses_pushable_object_terms": True,
+                            "uses_target_terms": True,
+                        }
+                    },
+                    "Generated Outputs": {
+                        "synthesis_error": None,
+                        "code_shape": {
+                            "uses_reachability_search": True,
+                            "uses_pushable_object_terms": True,
+                            "uses_target_terms": True,
+                        },
+                    },
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    revised_addendum = result["heuristic_prompt"].split(GEPA_ADDENDUM_HEADER, 1)[1].strip()
+    assert revised_addendum != current_addendum
+    assert "simple base-style distance" in revised_addendum
+    assert "No import statements" not in revised_addendum
+
+
 def test_custom_proposer_combines_remote_motion_loss_and_code_contract_fallback() -> None:
     current_addendum = Path(
         "configs/gepa_seed_addenda/persistent_mechanics_probe.txt"
