@@ -2509,6 +2509,74 @@ def _compact_code_contract_fallback(fallback_addendum: str) -> str:
     )
 
 
+def _compact_noncode_fallback(fallback_addendum: str) -> str:
+    """Return a short mechanics repair that can fit beside a long seed addendum.
+
+    The full fallback paragraphs are intentionally explicit when no useful
+    addendum exists. When a seed addendum is already near the character budget,
+    using that full paragraph would erase the seed. These compact repairs keep
+    the no-op fallback as a refinement of the current prompt instead.
+    """
+
+    lowered = fallback_addendum.lower()
+    if "preserve base reachability" in lowered or (
+        "reachability" in lowered and "plain manhattan" in lowered
+    ):
+        return (
+            "When solved regressions show dropped passability, preserve base "
+            "reachability/BFS inside the RULES/COLLISIONLAYERS branch; keep it "
+            "finite/local and adjust only weights or tie-breakers."
+        )
+    if "player-to-interaction distance" in lowered:
+        return (
+            "When counts or score collapse ordering, preserve bounded "
+            "player-to-interaction distance under observable WINCONDITIONS/RULES "
+            "preconditions."
+        )
+    if "new-solve" in lowered or "new solve" in lowered:
+        return (
+            "Preserve new-solve signals only behind observable WINCONDITIONS/RULES "
+            "preconditions, and fall back to the base mechanics-reading behavior "
+            "when absent."
+        )
+    if "missing goal objects" in lowered or "missing-object" in lowered:
+        return (
+            "Keep missing-object penalties small unless WINCONDITIONS and RULES "
+            "prove the object cannot reappear through aliases, transforms, or "
+            "creation rules."
+        )
+    return ""
+
+
+def _trim_addendum_to_sentence_budget(text: str, *, max_chars: int) -> str:
+    """Trim addendum text at sentence boundaries while preserving a valid prompt.
+
+    GEPA addenda are multi-sentence rules. When we need space for a compact
+    repair, retaining whole leading sentences preserves the seed hypothesis much
+    better than a raw character cut, while still keeping the result acceptable to
+    the addendum-shape validator.
+    """
+
+    stripped = text.strip()
+    if len(stripped) <= max_chars:
+        return stripped
+    if max_chars <= 0:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", stripped)
+    kept: list[str] = []
+    for sentence in sentences:
+        candidate = " ".join([*kept, sentence]).strip()
+        if len(candidate) > max_chars:
+            break
+        kept.append(sentence)
+    if kept:
+        return " ".join(kept).strip()
+    trimmed = stripped[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:")
+    if trimmed and trimmed[-1] not in ".!?":
+        trimmed += "."
+    return trimmed
+
+
 def _merge_current_addendum_with_fallback(
     current_addendum: str,
     fallback_addendum: str,
@@ -2552,6 +2620,31 @@ def _merge_current_addendum_with_fallback(
             available_current_chars = max_chars - len(compact) - 1
             if available_current_chars > 0:
                 trimmed_current = current[:available_current_chars].rstrip()
+                trimmed_combined = _clean_proposed_addendum(
+                    f"{trimmed_current} {compact}",
+                    max_chars=max_chars,
+                )
+                if trimmed_combined:
+                    return trimmed_combined
+    compact_noncode_fallback = _compact_noncode_fallback(fallback)
+    if compact_noncode_fallback:
+        compact = _clean_proposed_addendum(compact_noncode_fallback, max_chars=max_chars)
+        if compact:
+            if compact in current:
+                return current
+            compact_combined = f"{current} {compact}"
+            compact_cleaned = _clean_proposed_addendum(
+                compact_combined,
+                max_chars=max_chars,
+            )
+            if compact_cleaned:
+                return compact_cleaned
+            available_current_chars = max_chars - len(compact) - 1
+            trimmed_current = _trim_addendum_to_sentence_budget(
+                current,
+                max_chars=available_current_chars,
+            )
+            if trimmed_current:
                 trimmed_combined = _clean_proposed_addendum(
                     f"{trimmed_current} {compact}",
                     max_chars=max_chars,

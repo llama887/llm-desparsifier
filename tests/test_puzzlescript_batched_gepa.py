@@ -1533,6 +1533,71 @@ def test_custom_proposer_does_not_duplicate_existing_compact_code_repair() -> No
     assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
 
 
+def test_custom_proposer_preserves_long_seed_when_merging_noncode_fallback() -> None:
+    current_addendum = (
+        "For efficiency improvements, preserve local ordering signals that the base "
+        "prompt often gets right before adding broader mechanics: when the win/rules "
+        "imply the player must reach, clear, activate, enter, pick up, pull, swap, "
+        "or move marked/goal/wall/switch/exit/crate/block objects, combine "
+        "remaining-object counts with a bounded player-to-interaction distance "
+        "instead of count-only or score-only progress. If RULES or LEGEND create "
+        "transformed, carried, direction-specific, or collision-specific variants "
+        "such as picked-up objects, player-state aliases, special walls, "
+        "drop/marked objects, doors, switches, or terrain states, include those "
+        "observable variants in the same branch before falling back to generic "
+        "substring roles. Keep secondary existence/precondition terms finite and "
+        "smooth: do not delete them when they protect solvability, but avoid "
+        "1e4/1e6 penalties unless the rules prove an irreversible dead state. "
+        "Use reachability/BFS only when collision layers, blockers, gates, terrain, "
+        "or one-way effects make Manhattan distance misleading; otherwise prefer "
+        "cheap matching plus interaction distance and a small score_normalized "
+        "tie-breaker."
+    )
+    current_prompt = build_seed_candidate(current_addendum)["heuristic_prompt"]
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": current_prompt},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "solved_regression"},
+                    "Baseline Output": {
+                        "code_shape": {"uses_reachability_search": True}
+                    },
+                    "Generated Outputs": {
+                        "code_shape": {
+                            "uses_reachability_search": False,
+                            "uses_count_terms": True,
+                            "uses_distance_terms": True,
+                        }
+                    },
+                    "Feedback": (
+                        "EFFICIENCY REGRESSION: both prompts solved, but the "
+                        "candidate expanded far more states after replacing base "
+                        "reachability/BFS-style search with plain Manhattan/count terms."
+                    ),
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    revised_addendum = result["heuristic_prompt"].split(GEPA_ADDENDUM_HEADER, 1)[1].strip()
+    assert "player-to-interaction distance" in revised_addendum
+    assert "observable variants" in revised_addendum
+    assert "preserve base reachability" in revised_addendum
+    assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+
+
 def test_custom_proposer_extracts_addendum_from_full_prompt_output() -> None:
     llm = _FakeLLM(
         PUZZLESCRIPT_HEURISTIC_CONTRACT
