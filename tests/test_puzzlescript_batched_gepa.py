@@ -2388,6 +2388,20 @@ def test_smooth_reach_code_safety_seed_file_builds_valid_prompt() -> None:
     assert "Additional GEPA guidance" in prompt
 
 
+def test_interaction_alias_code_safety_seed_file_builds_valid_prompt() -> None:
+    addendum = Path(
+        "configs/gepa_seed_addenda/interaction_alias_code_safety_probe.txt"
+    ).read_text(encoding="utf-8")
+
+    prompt = build_seed_candidate(addendum)["heuristic_prompt"]
+
+    assert "player-to-interaction distance" in prompt
+    assert "observable variants" in prompt
+    assert "no imports" in prompt
+    assert "non-finite returns" in prompt
+    assert "Additional GEPA guidance" in prompt
+
+
 def test_initial_addendum_rejects_inline_and_file(tmp_path: Path) -> None:
     addendum_path = tmp_path / "seed_addendum.txt"
     addendum_path.write_text("Use score_normalized only as a tie-breaker.", encoding="utf-8")
