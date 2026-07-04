@@ -69,6 +69,24 @@ def summarize_scored_results(
     also exposing raw counts and paired-expansion diagnostics for interpretation.
     """
     materialized = [dict(row) for row in rows]
+    return _summarize_materialized_rows(
+        materialized,
+        common_solve_efficiency_weight=common_solve_efficiency_weight,
+        common_solve_efficiency_clip=common_solve_efficiency_clip,
+        high_headroom_expansions=high_headroom_expansions,
+        include_game_summaries=True,
+    )
+
+
+def _summarize_materialized_rows(
+    materialized: Sequence[Mapping[str, Any]],
+    *,
+    common_solve_efficiency_weight: float,
+    common_solve_efficiency_clip: float,
+    high_headroom_expansions: float,
+    include_game_summaries: bool,
+) -> dict[str, Any]:
+    """Return aggregate metrics for already-materialized result rows."""
     common_rows = [
         row for row in materialized
         if _common_solve_log2_delta(row) is not None
@@ -108,7 +126,7 @@ def summarize_scored_results(
         for row in common_rows
     )
     common_same = len(common_rows) - common_faster - common_slower
-    return {
+    summary: dict[str, Any] = {
         "n": len(materialized),
         "solved": solved,
         "baseline_solved": baseline_solved,
@@ -137,6 +155,30 @@ def summarize_scored_results(
             common_solve_efficiency_clip=common_solve_efficiency_clip,
         ),
     }
+    if include_game_summaries:
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for row in materialized:
+            grouped.setdefault(str(row.get("game", "")), []).append(row)
+        game_summaries = []
+        for game, game_rows in grouped.items():
+            game_summary = _summarize_materialized_rows(
+                game_rows,
+                common_solve_efficiency_weight=common_solve_efficiency_weight,
+                common_solve_efficiency_clip=common_solve_efficiency_clip,
+                high_headroom_expansions=high_headroom_expansions,
+                include_game_summaries=False,
+            )
+            game_summary["game"] = game
+            game_summaries.append(game_summary)
+        game_summaries.sort(
+            key=lambda row: (
+                int(row["net_solve"]),
+                float(row["mean_common_log2_base_over_candidate"]),
+                str(row["game"]),
+            )
+        )
+        summary["game_summaries"] = game_summaries
+    return summary
 
 
 def summarize_eval_dir(

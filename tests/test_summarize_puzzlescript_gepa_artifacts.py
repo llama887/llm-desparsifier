@@ -71,6 +71,12 @@ def test_summarize_scored_results_reports_solve_and_efficiency_gap() -> None:
     assert summary["high_headroom_common_solves"] == 2
     assert summary["mean_common_log2_base_over_candidate"] == pytest.approx(0.5, abs=0.02)
     assert summary["current_metric_score"] < 0.0
+    by_game = {row["game"]: row for row in summary["game_summaries"]}
+    assert by_game["fast"]["common_faster"] == 1
+    assert by_game["fast"]["mean_common_log2_base_over_candidate"] > 0.0
+    assert by_game["slow"]["common_slower"] == 1
+    assert by_game["slow"]["mean_common_log2_base_over_candidate"] < 0.0
+    assert by_game["lost"]["lost_solves"] == 1
 
 
 def test_summarize_eval_dir_reads_scored_results(tmp_path: Path) -> None:
