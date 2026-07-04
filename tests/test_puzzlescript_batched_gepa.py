@@ -929,6 +929,20 @@ def test_heuristic_code_shape_flags_generic_fallback_and_mechanics_terms() -> No
     assert shape["uses_gate_aware_reachability"] is True
 
 
+def test_heuristic_code_shape_flags_carried_transformed_object_terms() -> None:
+    shape = heuristic_code_shape(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    obj_pos = ctx.get('object_positions', {})\n"
+        "    crates = obj_pos.get('crate', [])\n"
+        "    carried = obj_pos.get('carry', []) + obj_pos.get('pickedup', [])\n"
+        "    all_crates = list(crates) + list(carried)\n"
+        "    return float(len(all_crates))\n"
+    )
+
+    assert shape["uses_transformed_object_terms"] is True
+    assert shape["uses_alias_specific_terms"] is True
+
+
 def test_heuristic_code_shape_flags_player_interaction_distance() -> None:
     shape = heuristic_code_shape(
         "def heuristic_cost_to_go(ts, env_params, ctx):\n"
@@ -3539,6 +3553,29 @@ def test_select_reflection_traces_balances_efficiency_gains_and_regressions() ->
 
     assert selected_classes.count("solved_regression") >= 3
     assert selected_classes.count("solved_efficiency_gain") >= 2
+
+
+def test_common_solve_diagnostic_reports_dropped_transformed_variants() -> None:
+    line = _common_solve_code_shape_diagnostic_line(
+        {
+            "solved": True,
+            "baseline_solved": True,
+            "expanded": 700,
+            "baseline_expanded": 35,
+        },
+        baseline_shape={
+            "uses_transformed_object_terms": True,
+            "uses_alias_specific_terms": True,
+        },
+        generated_shape={
+            "uses_transformed_object_terms": False,
+            "uses_alias_specific_terms": False,
+        },
+        classification="solved_regression",
+    )
+
+    assert "carried/transformed" in line
+    assert "plain object roles" in line
 
 
 def test_build_seed_candidate_attaches_initial_gepa_addendum() -> None:

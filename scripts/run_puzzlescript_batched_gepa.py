@@ -3415,6 +3415,44 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
             "portal",
         )
     )
+    uses_transformed_object_terms = any(
+        term in lowered
+        for term in (
+            "carry",
+            "carried",
+            "carrying",
+            "pickedup",
+            "picked_up",
+            "pickup",
+            "picked",
+            "held",
+            "holding",
+            "transformed",
+            "variant",
+            "dropped",
+            "dropwall",
+        )
+    )
+    uses_named_alias_terms = any(
+        term in lowered
+        for term in (
+            "controlplayer",
+            "dummy",
+            "ncrate",
+            "mixcrate",
+            "jcrate",
+            "lightcrate",
+            "matchcrate",
+            "rmatchcrate",
+            "bmatchcrate",
+            "ymatchcrate",
+            "pmatchcrate",
+            "gmatchcrate",
+            "sfighter",
+            "swizard",
+            "sthief",
+        )
+    )
     return {
         "uses_generic_role_helpers": "role_positions" in lowered or "role_keywords" in lowered,
         "uses_score_fallback": "score_normalized" in lowered,
@@ -3461,26 +3499,8 @@ def heuristic_code_shape(code: str) -> dict[str, bool]:
         "uses_deadlock_checks": any(
             term in lowered for term in ("deadlock", "dead-lock", "corner")
         ),
-        "uses_alias_specific_terms": any(
-            term in lowered
-            for term in (
-                "controlplayer",
-                "dummy",
-                "ncrate",
-                "mixcrate",
-                "jcrate",
-                "lightcrate",
-                "matchcrate",
-                "rmatchcrate",
-                "bmatchcrate",
-                "ymatchcrate",
-                "pmatchcrate",
-                "gmatchcrate",
-                "sfighter",
-                "swizard",
-                "sthief",
-            )
-        ),
+        "uses_transformed_object_terms": uses_transformed_object_terms,
+        "uses_alias_specific_terms": uses_named_alias_terms or uses_transformed_object_terms,
         "uses_weighted_switch_terms": (
             "switch" in lowered
             and any(term in lowered for term in ("weighted", "unweighted", "weighting"))
@@ -3534,6 +3554,15 @@ def _common_solve_code_shape_diagnostic_line(
                 "base modeled action transitions such as push, pull, swap, slide, fill, "
                 "portal, or beam effects that the candidate omitted"
             )
+        if baseline_shape.get("uses_transformed_object_terms") and not generated_shape.get(
+            "uses_transformed_object_terms"
+        ):
+            parts.append(
+                "base modeled carried/transformed object variants such as carried, "
+                "picked-up, dropped, or transformed objects that the candidate reduced "
+                "to plain object roles; preserve these variants in the same branch as "
+                "their source object"
+            )
         if baseline_shape.get("uses_assignment_matching") and not generated_shape.get(
             "uses_assignment_matching"
         ):
@@ -3565,6 +3594,14 @@ def _common_solve_code_shape_diagnostic_line(
             parts.append(
                 "candidate added transition-aware terms; preserve them behind rule-derived "
                 "preconditions for games with staged object or terrain changes"
+            )
+        if generated_shape.get("uses_transformed_object_terms") and not baseline_shape.get(
+            "uses_transformed_object_terms"
+        ):
+            parts.append(
+                "candidate included carried/transformed object variants; preserve them "
+                "when RULES or LEGEND show objects can be picked up, carried, dropped, "
+                "or transformed before satisfying the win condition"
             )
         if generated_shape.get("uses_assignment_matching") and not baseline_shape.get(
             "uses_assignment_matching"
