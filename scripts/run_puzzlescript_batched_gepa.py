@@ -495,10 +495,40 @@ def _reflection_trace_signal(trace: Mapping[str, Any]) -> float:
     if classification == "solved_efficiency_gain" and efficiency_delta is not None:
         return -(efficiency_delta + high_headroom_bonus)
     if classification == "solved_regression" and efficiency_delta is not None:
-        return efficiency_delta - high_headroom_bonus
+        transformed_variant_bonus = (
+            4.0 if _trace_drops_transformed_object_terms(trace) else 0.0
+        )
+        return efficiency_delta - high_headroom_bonus - transformed_variant_bonus
     if classification == "new_solve":
         return -float(result.get("score", 0.0))
     return float(result.get("adjusted_score", result.get("score", 0.0)))
+
+
+def _trace_drops_transformed_object_terms(trace: Mapping[str, Any]) -> bool:
+    """Return whether a trace drops carried/transformed object handling.
+
+    Reflection selection has a tight record budget. A high-headroom generic
+    slowdown is useful, but a lower-magnitude slowdown that drops carried,
+    picked-up, dropped, or transformed object variants is more actionable for
+    prompt repair because the generated-code contrast points to a concrete
+    mechanics-preservation lesson.
+    """
+    classification = trace_classification(trace)
+    if classification not in {"lost_baseline_solve", "solved_regression"}:
+        return False
+    result = cast(Mapping[str, Any], trace.get("result", {}))
+    baseline_code = _read_optional_text(
+        result.get("baseline_heuristic_code_path"),
+        max_chars=DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
+    )
+    generated_code = str(trace.get("heuristic_code", ""))
+    if not baseline_code or not generated_code:
+        return False
+    baseline_shape = heuristic_code_shape(baseline_code)
+    generated_shape = heuristic_code_shape(generated_code)
+    return bool(baseline_shape.get("uses_transformed_object_terms")) and not bool(
+        generated_shape.get("uses_transformed_object_terms")
+    )
 
 
 def trace_mechanics_signature(trace: Mapping[str, Any]) -> str:

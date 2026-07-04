@@ -3600,6 +3600,55 @@ def test_select_reflection_traces_balances_efficiency_gains_and_regressions() ->
     assert selected_classes.count("solved_efficiency_gain") >= 2
 
 
+def test_select_reflection_traces_prefers_dropped_transformed_variant_regression(
+    tmp_path: Path,
+) -> None:
+    base_code = tmp_path / "base_variant.py"
+    base_code.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    obj_pos = ctx.get('object_positions', {})\n"
+        "    crates = obj_pos.get('crate', []) + obj_pos.get('pickedup', [])\n"
+        "    return float(len(crates))\n",
+        encoding="utf-8",
+    )
+    generic_regression = {
+        "task": {"game": "generic-regression", "level": 0},
+        "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 1.0\n",
+        "result": {
+            "score": 0.20,
+            "baseline_score": 0.90,
+            "solved": True,
+            "baseline_solved": True,
+            "expanded": 5_000,
+            "baseline_expanded": 500,
+        },
+    }
+    transformed_regression = {
+        "task": {"game": "transformed-regression", "level": 0},
+        "heuristic_code": (
+            "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+            "    crates = ctx.get('object_positions', {}).get('crate', [])\n"
+            "    return float(len(crates))\n"
+        ),
+        "result": {
+            "score": 0.70,
+            "baseline_score": 0.90,
+            "solved": True,
+            "baseline_solved": True,
+            "expanded": 320,
+            "baseline_expanded": 160,
+            "baseline_heuristic_code_path": str(base_code),
+        },
+    }
+
+    selected = select_reflection_traces(
+        [generic_regression, transformed_regression],
+        max_records=1,
+    )
+
+    assert selected[0]["task"]["game"] == "transformed-regression"
+
+
 def test_common_solve_diagnostic_reports_dropped_transformed_variants() -> None:
     line = _common_solve_code_shape_diagnostic_line(
         {
