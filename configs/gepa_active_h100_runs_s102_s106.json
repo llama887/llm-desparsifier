@@ -1,0 +1,37 @@
+[
+  {
+    "job_id": "12445608",
+    "label": "s102_smoothreach_code_safe_fixed",
+    "state_root": "/scratch/fyy2003/repos/llm-desparsifier/artifacts/gepa_sweep_effmetric_smoothreachcodesafe_fixed_seed47_s102_h100_20260703_224223",
+    "seed": 47,
+    "seed_addendum_file": "configs/gepa_seed_addenda/smooth_reach_code_safety_probe.txt"
+  },
+  {
+    "job_id": "12445609",
+    "label": "s103_sharp_interaction_reach_fixed",
+    "state_root": "/scratch/fyy2003/repos/llm-desparsifier/artifacts/gepa_sweep_effmetric_sharpinteractionreach_fixed_seed48_s103_h100_20260703_224225",
+    "seed": 48,
+    "seed_addendum_file": "configs/gepa_seed_addenda/sharp_interaction_reach_code_safety_probe.txt"
+  },
+  {
+    "job_id": "12446943",
+    "label": "s104_common_solve_efficiency_shape",
+    "state_root": "/scratch/fyy2003/repos/llm-desparsifier/artifacts/gepa_sweep_effmetric_effshape_seed49_s104_h100_20260703_230726",
+    "seed": 49,
+    "seed_addendum_file": "configs/gepa_seed_addenda/common_solve_efficiency_shape_probe.txt"
+  },
+  {
+    "job_id": "12447279",
+    "label": "s105_multi_object_assignment_efficiency",
+    "state_root": "/scratch/fyy2003/repos/llm-desparsifier/artifacts/gepa_sweep_effmetric_assignment_seed50_s105_h100_20260703_231440",
+    "seed": 50,
+    "seed_addendum_file": "configs/gepa_seed_addenda/multi_object_assignment_efficiency_probe.txt"
+  },
+  {
+    "job_id": "12447280",
+    "label": "s106_transition_aware_efficiency",
+    "state_root": "/scratch/fyy2003/repos/llm-desparsifier/artifacts/gepa_sweep_effmetric_transition_seed51_s106_h100_20260703_231440",
+    "seed": 51,
+    "seed_addendum_file": "configs/gepa_seed_addenda/transition_aware_efficiency_probe.txt"
+  }
+]
