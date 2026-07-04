@@ -4657,9 +4657,58 @@ def parse_extra_sbatch_args(values: Optional[str]) -> tuple[str, ...]:
     return tuple(part for part in values.split() if part)
 
 
+def collect_git_state(
+    repo_root: Path,
+    *,
+    git_runner: Optional[Callable[[list[str]], str]] = None,
+) -> dict[str, Any]:
+    """Return git metadata for experiment artifact provenance.
+
+    Batched SLURM jobs execute from the live checkout, so queued jobs may start
+    after later commits. Recording the actual commit and dirty status at run
+    start makes prompt and metric comparisons auditable without affecting the
+    optimizer's behavior.
+    """
+
+    def run_git(args: list[str]) -> str:
+        if git_runner is not None:
+            return git_runner(args)
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                cwd=repo_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return completed.stdout.strip() if completed.returncode == 0 else ""
+
+    status_short = run_git(["status", "--short"])
+    return {
+        "repo_root": str(repo_root),
+        "commit": run_git(["rev-parse", "HEAD"]) or None,
+        "branch": run_git(["branch", "--show-current"]) or None,
+        "status_short": status_short.splitlines(),
+        "dirty": bool(status_short.strip()),
+    }
+
+
 def run_standalone_gepa(args: argparse.Namespace) -> None:
     state_root = args.state_root.expanduser().resolve()
     state_root.mkdir(parents=True, exist_ok=True)
+    git_state = collect_git_state(_PROJECT_ROOT)
+    (state_root / "run_git_state.json").write_text(
+        json.dumps(git_state, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        "[run] git_commit="
+        f"{git_state.get('commit') or '<unknown>'} dirty={bool(git_state.get('dirty'))}",
+        flush=True,
+    )
     gepa_run_dir = state_root / "gepa_run"
     gepa_run_dir.mkdir(parents=True, exist_ok=True)
     # GEPA 0.0.7 checks for this directory when deciding whether to resume.

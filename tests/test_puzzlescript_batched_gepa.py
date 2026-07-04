@@ -33,6 +33,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     build_train_dev_tasks,
     candidate_prompt_issue,
     candidate_score,
+    collect_git_state,
     context_retry_max_tokens,
     evaluate_manifest_shards_locally,
     evaluate_search_task_with_wall_timeout,
@@ -162,6 +163,27 @@ def test_build_sbatch_array_command_exports_manifest_and_count() -> None:
     )
     assert "--time=01:00:00" in command
     assert command[-1] == "sbatch/evaluate_puzzlescript_search_array.s"
+
+
+def test_collect_git_state_reports_commit_branch_and_dirty_status() -> None:
+    responses = {
+        ("rev-parse", "HEAD"): "abc123",
+        ("branch", "--show-current"): "feature",
+        ("status", "--short"): " M changed.py\n?? new.py",
+    }
+
+    state = collect_git_state(
+        Path("/repo"),
+        git_runner=lambda args: responses.get(tuple(args), ""),
+    )
+
+    assert state == {
+        "repo_root": "/repo",
+        "commit": "abc123",
+        "branch": "feature",
+        "status_short": [" M changed.py", "?? new.py"],
+        "dirty": True,
+    }
 
 
 def test_wait_for_shards_raises_with_missing_indices_on_stall(tmp_path: Path) -> None:
