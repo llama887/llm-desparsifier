@@ -1,0 +1,11 @@
+[
+  {
+    "game": "No_Right_Turn_Sokoban",
+    "level": 3,
+    "base_expanded": 22045,
+    "base_solved": true,
+    "optimized_expanded": 41632,
+    "optimized_solved": true,
+    "score_delta": -0.39173216535669286
+  }
+]

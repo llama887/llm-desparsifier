@@ -27,12 +27,13 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from queue import Empty
-from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, cast
+from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Sequence, cast
 
 import yaml
 
@@ -61,9 +62,9 @@ DEFAULT_ASTAR_TIMEOUT_S = 30.0
 DEFAULT_CONTEXT_RETRY_MARGIN_TOKENS = 512
 DEFAULT_CONTEXT_RETRY_ATTEMPTS = 8
 DEFAULT_MIN_RETRY_OUTPUT_TOKENS = 256
-DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS = 1200
-DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS = 1800
-DEFAULT_REFLECTION_FEEDBACK_CHARS = 1600
+DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS = 6000
+DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS = 5000
+DEFAULT_REFLECTION_FEEDBACK_CHARS = 3000
 DEFAULT_REFLECTION_MAX_RECORDS = 24
 DEFAULT_SEARCH_TASK_WALL_TIMEOUT_S = 120.0
 DEFAULT_DEV_FRACTION = 0.25
@@ -86,9 +87,15 @@ DEFAULT_SOLVED_GAIN_EXPANSION_MARGIN = 100.0
 DEFAULT_SOLVED_GAIN_EXPANSION_RATIO = 1.2
 DEFAULT_EFFICIENCY_HEADROOM_EXPANSIONS = 500.0
 DEFAULT_EFFICIENCY_HEADROOM_SCALE_CAP = 3.0
-DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4200
+DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4000
 DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 1200
-DEFAULT_REFLECTION_DATASET_CHARS = 24000
+CASE_SPECIFIC_OVERFIT_ADDENDUM_MAX_CHARS = 4000
+FULL_PROMPT_PROPOSAL_FOCI = (
+    "Remove unsupported instructions and simplify the downstream agent's decision process.",
+    "Improve rule and win-condition parsing across non-Sokoban mechanics.",
+    "Preserve solve probability while making heuristic ordering less brittle across samples.",
+)
+DEFAULT_REFLECTION_DATASET_CHARS = 64000
 DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 300.0
 DEFAULT_LLM_TEMPERATURE = 0.0
 ACTIONABLE_CODE_SHAPE_LOSS_WEIGHTS: dict[str, float] = {
@@ -175,6 +182,7 @@ class PuzzleScriptLevelTask:
     budget: int
     env_description: str
     game_text_path: str
+    replicate: int = 0
 
 
 @dataclass(frozen=True)
@@ -186,6 +194,7 @@ class SearchArrayConfig:
     poll_interval_s: float
     stall_timeout_s: float = DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S
     extra_sbatch_args: tuple[str, ...] = ()
+    pool_dir: Optional[Path] = None
 
 
 class TextCompletionClient(Protocol):
@@ -252,6 +261,107 @@ class OpenAITextClient:
         raise RuntimeError("unreachable context retry loop exit")
 
 
+@dataclass
+class CodexCLITextClient:
+    """Use a logged-in Codex CLI as a structured completion or read-only agent."""
+
+    model: str
+    timeout_s: float
+    executable: str = "codex"
+    reasoning_effort: str = ""
+    working_directory: Optional[Path] = None
+    allow_read_tools: bool = False
+    agentic_workspace: bool = False
+
+    def complete(self, prompt: str) -> str:
+        schema = {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        }
+        if self.agentic_workspace:
+            backend_prompt = (
+                "Act as a coding agent in the isolated current workspace. Use shell tools "
+                "to draft the requested Python function in candidate.py and test it with "
+                "Python before answering. Do not inspect paths outside the current "
+                "workspace, use the network, or launch jobs. Put the final function code "
+                "in the `text` field.\n\n"
+                + prompt
+            )
+        elif self.allow_read_tools:
+            backend_prompt = (
+                "Act as a read-only analysis agent. You may use read-only shell tools to "
+                "inspect only artifact paths named in the task. Do not modify files, run "
+                "network commands, or launch jobs. Put the complete answer in the `text` "
+                "field.\n\n"
+                + prompt
+            )
+        else:
+            backend_prompt = (
+                "Act only as a stateless text-completion backend. Do not inspect files, "
+                "run commands, browse, or use tools. Solve the supplied task from its text "
+                "alone and put the complete answer in the `text` field.\n\n"
+                + prompt
+            )
+        with tempfile.TemporaryDirectory(prefix="gepa-codex-") as temp_dir:
+            temp_root = Path(temp_dir)
+            schema_path = temp_root / "schema.json"
+            output_path = temp_root / "output.json"
+            schema_path.write_text(json.dumps(schema), encoding="utf-8")
+            command = [
+                self.executable,
+                "exec",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--sandbox",
+                "workspace-write" if self.agentic_workspace else "read-only",
+                "--skip-git-repo-check",
+                "--config",
+                'web_search="disabled"',
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "--color",
+                "never",
+            ]
+            if not self.allow_read_tools and not self.agentic_workspace:
+                command[command.index("--config"):command.index("--config")] = [
+                    "--disable",
+                    "shell_tool",
+                ]
+            if self.model:
+                command.extend(["--model", self.model])
+            if self.reasoning_effort:
+                command.extend(
+                    ["--config", f'model_reasoning_effort="{self.reasoning_effort}"']
+                )
+            command.append("-")
+            completed = subprocess.run(
+                command,
+                cwd=temp_root if self.agentic_workspace else (self.working_directory or temp_root),
+                input=backend_prompt,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = truncate_text(completed.stderr.strip(), 4000)
+                raise RuntimeError(
+                    f"Codex CLI completion failed with exit code {completed.returncode}: {detail}"
+                )
+            try:
+                payload = json.loads(output_path.read_text(encoding="utf-8"))
+                text = payload["text"]
+            except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise RuntimeError("Codex CLI returned an invalid structured response") from exc
+            if not isinstance(text, str) or not text.strip():
+                raise RuntimeError("Codex CLI returned an empty text completion")
+            return text.strip()
+
+
 
 def context_retry_max_tokens(
     error_message: str,
@@ -288,6 +398,19 @@ def truncate_text(text: str, limit: int) -> str:
     return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
 
 
+def reflection_env_summary(text: str) -> str:
+    """Keep rules/win summary and initial state instead of a blind prefix."""
+    summary = text.split("\nRaw PuzzleScript source for reference:", 1)[0]
+    initial_match = re.search(
+        r"Initial state for this level:\s*(.*?)(?:\nInitial root ctx summary:|\Z)",
+        text,
+        flags=re.DOTALL,
+    )
+    if initial_match:
+        summary += "\nInitial state for this level:\n" + initial_match.group(1).strip()
+    return truncate_text(summary, DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS)
+
+
 def _trace_level(trace: Mapping[str, Any]) -> int:
     task = trace.get("task", {})
     try:
@@ -308,6 +431,13 @@ def _optional_result_float(result: Mapping[str, Any], key: str) -> Optional[floa
     return numeric if math.isfinite(numeric) else None
 
 
+def _row_solve_rate(row: Mapping[str, Any], *, prefix: str = "") -> float:
+    value = _optional_result_float(row, f"{prefix}solve_rate")
+    if value is not None:
+        return max(0.0, min(1.0, value))
+    return float(bool(row.get(f"{prefix}solved", False)))
+
+
 def _common_solve_efficiency_log2_delta(row: Mapping[str, Any]) -> Optional[float]:
     """Return paired common-solve expansion savings as a log2 ratio.
 
@@ -315,10 +445,14 @@ def _common_solve_efficiency_log2_delta(row: Mapping[str, Any]) -> Optional[floa
     prompt; negative values mean it expanded more. The value is unavailable for
     non-common solves or rows without finite expansion metadata.
     """
-    if not bool(row.get("solved", False)) or not bool(row.get("baseline_solved", False)):
+    if _row_solve_rate(row) <= 0.0 or _row_solve_rate(row, prefix="baseline_") <= 0.0:
         return None
-    expanded = _optional_result_float(row, "expanded")
-    baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    expanded = _optional_result_float(row, "solved_expanded_mean")
+    if expanded is None:
+        expanded = _optional_result_float(row, "expanded")
+    baseline_expanded = _optional_result_float(row, "baseline_solved_expanded_mean")
+    if baseline_expanded is None:
+        baseline_expanded = _optional_result_float(row, "baseline_expanded")
     if expanded is None or baseline_expanded is None:
         return None
     if expanded < 0 or baseline_expanded < 0:
@@ -340,7 +474,9 @@ def _is_high_headroom_common_solve(
     """
     if _common_solve_efficiency_log2_delta(row) is None:
         return False
-    baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    baseline_expanded = _optional_result_float(row, "baseline_solved_expanded_mean")
+    if baseline_expanded is None:
+        baseline_expanded = _optional_result_float(row, "baseline_expanded")
     return baseline_expanded is not None and baseline_expanded >= max(0.0, threshold)
 
 
@@ -361,7 +497,9 @@ def _common_solve_efficiency_headroom_scale(
     """
     if _common_solve_efficiency_log2_delta(row) is None:
         return 0.0
-    baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    baseline_expanded = _optional_result_float(row, "baseline_solved_expanded_mean")
+    if baseline_expanded is None:
+        baseline_expanded = _optional_result_float(row, "baseline_expanded")
     if baseline_expanded is None or baseline_expanded <= 0:
         return 0.0
     positive_threshold = max(1.0, threshold)
@@ -371,7 +509,9 @@ def _common_solve_efficiency_headroom_scale(
 def _efficiency_headroom_feedback_line(result: Mapping[str, Any]) -> str:
     """Return a compact explanation of common-solve efficiency headroom."""
     delta = _common_solve_efficiency_log2_delta(result)
-    baseline_expanded = _optional_result_float(result, "baseline_expanded")
+    baseline_expanded = _optional_result_float(result, "baseline_solved_expanded_mean")
+    if baseline_expanded is None:
+        baseline_expanded = _optional_result_float(result, "baseline_expanded")
     if delta is None or baseline_expanded is None:
         return ""
     if _is_high_headroom_common_solve(result):
@@ -450,13 +590,15 @@ def _is_solved_efficiency_gain(result: Mapping[str, Any]) -> bool:
 def trace_classification(trace: Mapping[str, Any]) -> str:
     """Classify a trace by how it changes behavior relative to the base prompt."""
     result = trace.get("result", {})
-    solved = bool(result.get("solved", False))
-    baseline_solved = bool(result.get("baseline_solved", False))
+    solve_rate = _row_solve_rate(result)
+    baseline_solve_rate = _row_solve_rate(result, prefix="baseline_")
+    solved = solve_rate > 0.0
+    baseline_solved = baseline_solve_rate > 0.0
     if is_candidate_error(result):
         return "candidate_error"
-    if baseline_solved and not solved:
+    if baseline_solve_rate > solve_rate:
         return "lost_baseline_solve"
-    if not baseline_solved and solved:
+    if solve_rate > baseline_solve_rate:
         return "new_solve"
     if baseline_solved and solved and _is_solved_efficiency_regression(result):
         return "solved_regression"
@@ -606,7 +748,7 @@ def select_reflection_traces(
     reflection prompt for proposal generation.
     """
     traces = list(trajectories)
-    if max_records <= 0 or len(traces) <= max_records:
+    if max_records <= 0:
         return traces
     grouped: dict[str, list[Mapping[str, Any]]] = {}
     for trace in traces:
@@ -825,6 +967,93 @@ def parse_guard_level_selection(selection: str) -> dict[str, list[int]]:
             )
         levels_by_game[game] = sorted(dict.fromkeys(parsed_levels))
     return levels_by_game
+
+
+def select_jobs_for_training_levels(
+    train_jobs: Sequence[Mapping[str, Any]],
+    eval_jobs: Sequence[Mapping[str, Any]],
+    levels_by_game: Mapping[str, Sequence[int]],
+) -> list[dict[str, Any]]:
+    """Return the configured jobs needed for an exact diagnostic train set.
+
+    Ordinary GEPA runs optimize only the configured training games. A targeted
+    overfitting diagnostic may intentionally train on one previously held-out
+    game-level pair, so this helper resolves requested games across both config
+    sections without changing the default train/eval boundary. Unknown game
+    names fail early instead of producing an empty or partially selected run.
+    """
+
+    if not levels_by_game:
+        return [dict(job) for job in train_jobs]
+
+    jobs_by_name: dict[str, dict[str, Any]] = {}
+    for job in [*train_jobs, *eval_jobs]:
+        jobs_by_name.setdefault(str(job["name"]), dict(job))
+
+    missing_games = sorted(set(levels_by_game) - set(jobs_by_name))
+    if missing_games:
+        raise ValueError(
+            "Training level selection contains unknown games: "
+            + ", ".join(missing_games)
+        )
+    return [jobs_by_name[game] for game in levels_by_game]
+
+
+def load_training_targets(path: Path) -> list[dict[str, Any]]:
+    """Load and validate exact game-level targets for independent GEPA runs.
+
+    A sweep manifest may be either a JSON list or an object containing a
+    ``targets`` list plus provenance metadata. Each target retains optional
+    diagnostic fields such as its prior score delta, while ``game`` and
+    ``level`` are normalized and validated here so a malformed sweep cannot
+    silently reuse a state directory or optimize the wrong environment.
+    """
+
+    resolved_path = path.expanduser().resolve()
+    payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    raw_targets = payload.get("targets") if isinstance(payload, Mapping) else payload
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise ValueError(f"Training target manifest has no targets: {resolved_path}")
+
+    targets: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for index, raw_target in enumerate(raw_targets):
+        if not isinstance(raw_target, Mapping):
+            raise ValueError(f"Training target {index} must be a JSON object")
+        game = str(raw_target.get("game", "")).strip()
+        try:
+            level = int(raw_target.get("level"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Training target {index} has an invalid level") from exc
+        if not game or level < 0:
+            raise ValueError(f"Training target {index} must have a game and non-negative level")
+        key = (game, level)
+        if key in seen:
+            raise ValueError(f"Training target manifest contains duplicate {game}:{level}")
+        seen.add(key)
+        target = dict(raw_target)
+        target["game"] = game
+        target["level"] = level
+        targets.append(target)
+    return targets
+
+
+def training_target_state_root(
+    group_state_root: Path,
+    *,
+    index: int,
+    game: str,
+    level: int,
+) -> Path:
+    """Return an isolated, stable state root for one sweep target.
+
+    The numeric prefix preserves manifest order, while a conservative lowercase
+    slug keeps artifact paths readable without allowing game-title punctuation
+    to create nested directories.
+    """
+
+    slug = re.sub(r"[^a-z0-9]+", "-", game.lower()).strip("-") or "game"
+    return group_state_root / "targets" / f"{index:02d}-{slug}-level-{level:02d}"
 
 
 def _task_game(task: Any) -> str:
@@ -1070,6 +1299,79 @@ def is_candidate_error(output: Mapping[str, Any]) -> bool:
     return error is not None and not _is_game_compile_error(error)
 
 
+def aggregate_replicate_results(
+    task: PuzzleScriptLevelTask,
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate fresh heuristic samples into one stable GEPA task result."""
+    if not rows:
+        raise ValueError("Cannot aggregate an empty replicate set.")
+    solved_rows = [row for row in rows if bool(row.get("solved", False))]
+    result = dict((solved_rows or list(rows))[0])
+    count = len(rows)
+
+    def mean(key: str, selected: Sequence[Mapping[str, Any]] = rows) -> float:
+        return sum(float(row.get(key, 0.0) or 0.0) for row in selected) / len(selected)
+
+    solve_rate = len(solved_rows) / count
+    result.update(
+        task_id=task.task_id,
+        game=task.game,
+        level=task.level,
+        replicate_count=count,
+        solve_rate=solve_rate,
+        solved=solve_rate >= 0.5,
+        score=mean("score"),
+        partial_progress_score=mean("partial_progress_score"),
+        expanded=mean("expanded"),
+        generated=mean("generated"),
+        solved_expanded_mean=mean("expanded", solved_rows) if solved_rows else None,
+        solution_length=mean("solution_length", solved_rows) if solved_rows else 0.0,
+        candidate_error_rate=sum(is_candidate_error(row) for row in rows) / count,
+        replicate_expansions=[row.get("expanded") for row in rows],
+        replicate_termination_reasons=[
+            row.get("trace_summary", {}).get("terminated_reason")
+            for row in rows
+            if isinstance(row.get("trace_summary"), Mapping)
+        ],
+        replicate_results=[dict(row) for row in rows],
+    )
+    synthesis_errors = [str(row["synthesis_error"]) for row in rows if row.get("synthesis_error")]
+    result["synthesis_error"] = "; ".join(synthesis_errors) if synthesis_errors else None
+    result["feedback"] = (
+        f"Fresh heuristic replicates solved {len(solved_rows)}/{count}; "
+        f"mean score={result['score']:.4f}, mean expansions={result['expanded']:.1f}, "
+        f"candidate error rate={result['candidate_error_rate']:.3f}."
+    )
+    return result
+
+
+def filter_unlearnable_tasks(
+    tasks: Sequence[PuzzleScriptLevelTask],
+    baseline_outputs: Sequence[Mapping[str, Any]],
+) -> tuple[list[PuzzleScriptLevelTask], list[PuzzleScriptLevelTask]]:
+    """Drop levels whose complete reachable state space was exhausted in every replicate."""
+    baseline_by_key = {
+        (str(row["game"]), int(row["level"])): row for row in baseline_outputs
+    }
+    kept: list[PuzzleScriptLevelTask] = []
+    dropped: list[PuzzleScriptLevelTask] = []
+    for task in tasks:
+        row = baseline_by_key.get((task.game, task.level), {})
+        replicates = row.get("replicate_results")
+        if not isinstance(replicates, list) or not replicates:
+            replicates = [row]
+        reasons = [
+            replicate.get("trace_summary", {}).get("terminated_reason")
+            for replicate in replicates
+            if isinstance(replicate, Mapping)
+            and isinstance(replicate.get("trace_summary"), Mapping)
+        ]
+        (dropped if reasons and len(reasons) == len(replicates) and
+         all(reason == "open_set_exhausted" for reason in reasons) else kept).append(task)
+    return kept, dropped
+
+
 def _clamp(value: float, limit: float) -> float:
     bound = max(0.0, limit)
     return max(-bound, min(bound, value))
@@ -1085,6 +1387,34 @@ def _score_normalized_from_snapshot(snapshot: Mapping[str, Any]) -> Optional[flo
         return None
 
 
+def _progress_from_snapshot(snapshot: Mapping[str, Any]) -> Optional[float]:
+    """Return candidate-independent progress recorded by the search tracer."""
+
+    value = snapshot.get("progress_score")
+    if value is not None:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return None
+    return _score_normalized_from_snapshot(snapshot)
+
+
+def _trace_snapshots(trace_summary: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
+    """Yield every bounded root, early, progress, and late trace snapshot."""
+
+    for key in ("root_snapshot", "best_progress_snapshot"):
+        snapshot = trace_summary.get(key)
+        if isinstance(snapshot, Mapping):
+            yield snapshot
+    for key in ("sampled_states", "progress_samples", "late_states"):
+        for state in trace_summary.get(key, []) or []:
+            if not isinstance(state, Mapping):
+                continue
+            snapshot = state.get("snapshot")
+            if isinstance(snapshot, Mapping):
+                yield snapshot
+
+
 def trace_partial_progress_score(trace_summary: Mapping[str, Any]) -> float:
     """Return the best normalized engine progress visible in an A* trace.
 
@@ -1093,18 +1423,8 @@ def trace_partial_progress_score(trace_summary: Mapping[str, Any]) -> float:
     without letting partial progress outweigh solve preservation.
     """
     values: list[float] = []
-    root_snapshot = trace_summary.get("root_snapshot")
-    if isinstance(root_snapshot, Mapping):
-        value = _score_normalized_from_snapshot(root_snapshot)
-        if value is not None:
-            values.append(value)
-    for state in trace_summary.get("sampled_states", []) or []:
-        if not isinstance(state, Mapping):
-            continue
-        snapshot = state.get("snapshot")
-        if not isinstance(snapshot, Mapping):
-            continue
-        value = _score_normalized_from_snapshot(snapshot)
+    for snapshot in _trace_snapshots(trace_summary):
+        value = _progress_from_snapshot(snapshot)
         if value is not None:
             values.append(value)
     return max(values) if values else 0.0
@@ -1138,8 +1458,12 @@ def _common_solve_efficiency_delta(row: Mapping[str, Any], *, clip: float) -> fl
     if ratio_delta is None:
         return 0.0
     scale = _common_solve_efficiency_headroom_scale(row)
-    expanded = _optional_result_float(row, "expanded")
-    baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    expanded = _optional_result_float(row, "solved_expanded_mean")
+    if expanded is None:
+        expanded = _optional_result_float(row, "expanded")
+    baseline_expanded = _optional_result_float(row, "baseline_solved_expanded_mean")
+    if baseline_expanded is None:
+        baseline_expanded = _optional_result_float(row, "baseline_expanded")
     if (
         ratio_delta < 0.0
         and expanded is not None
@@ -1189,13 +1513,15 @@ def _base_relative_score(
     efficiency matter only as a capped tie-breaker.
     """
     raw_score = float(row.get("score", 0.0))
-    solved = bool(row.get("solved", False))
+    solve_rate = _row_solve_rate(row)
+    solved = solve_rate > 0.0
     partial_weight = max(0.0, partial_progress_weight)
     if not _has_baseline(row):
         score = raw_score if solved else partial_weight * _row_partial_progress_score(row)
     else:
         baseline_score = float(row.get("baseline_score", 0.0))
-        baseline_solved = bool(row.get("baseline_solved", False))
+        baseline_solve_rate = _row_solve_rate(row, prefix="baseline_")
+        baseline_solved = baseline_solve_rate > 0.0
         raw_quality = raw_score if solved else partial_weight * _row_partial_progress_score(row)
         baseline_quality = (
             baseline_score
@@ -1204,17 +1530,22 @@ def _base_relative_score(
         )
         delta = _clamp(raw_quality - baseline_quality, score_delta_clip)
         score = max(0.0, score_delta_weight) * delta
-        if baseline_solved and not solved:
-            score -= max(0.0, lost_solve_penalty)
-        elif not baseline_solved and solved:
-            score += max(0.0, new_solve_bonus)
-        elif baseline_solved and solved:
-            score += max(0.0, common_solve_efficiency_weight) * _common_solve_efficiency_delta(
+        solve_delta = solve_rate - baseline_solve_rate
+        score += max(0.0, new_solve_bonus) * max(0.0, solve_delta)
+        score -= max(0.0, lost_solve_penalty) * max(0.0, -solve_delta)
+        if baseline_solved and solved:
+            score += (
+                min(solve_rate, baseline_solve_rate)
+                * max(0.0, common_solve_efficiency_weight)
+                * _common_solve_efficiency_delta(
                 row,
                 clip=common_solve_efficiency_clip,
             )
-    if is_candidate_error(row):
-        score -= max(0.0, error_penalty)
+            )
+    error_rate = _optional_result_float(row, "candidate_error_rate")
+    score -= max(0.0, error_penalty) * (
+        max(0.0, min(1.0, error_rate)) if error_rate is not None else float(is_candidate_error(row))
+    )
     return score
 
 
@@ -1295,27 +1626,26 @@ def adjusted_candidate_scores(
     rows = list(outputs)
     weights = _macro_game_weights(rows)
     gate_value = 0.0 if global_lost_solve_gate_penalty is None else global_lost_solve_gate_penalty
+    net_gate_value = (
+        lost_solve_penalty
+        if global_net_solve_loss_gate_penalty is None
+        else global_net_solve_loss_gate_penalty
+    )
+    global_gates_enabled = gate_value > 0.0 or net_gate_value > 0.0
     lost_solves = sum(
         _has_baseline(row)
-        and bool(row.get("baseline_solved", False))
-        and not bool(row.get("solved", False))
+        and _row_solve_rate(row, prefix="baseline_") > _row_solve_rate(row)
         for row in rows
     )
     new_solves = sum(
         _has_baseline(row)
-        and not bool(row.get("baseline_solved", False))
-        and bool(row.get("solved", False))
+        and _row_solve_rate(row) > _row_solve_rate(row, prefix="baseline_")
         for row in rows
     )
     gate_penalty = (
         max(0.0, gate_value)
         if lost_solves > 0
         else 0.0
-    )
-    net_gate_value = (
-        lost_solve_penalty
-        if global_net_solve_loss_gate_penalty is None
-        else global_net_solve_loss_gate_penalty
     )
     nonpositive_net_loss_units = (
         max(0, lost_solves - new_solves)
@@ -1357,6 +1687,8 @@ def adjusted_candidate_scores(
             -mean_weighted_common_solve_efficiency_delta,
         )
         * max(0.0, common_solve_efficiency_weight)
+        if global_gates_enabled and new_solves == lost_solves
+        else 0.0
     )
     scores: list[float] = []
     for row, weight in zip(rows, weights, strict=True):
@@ -1377,7 +1709,78 @@ def adjusted_candidate_scores(
             - net_solve_loss_gate_penalty
             - mean_efficiency_regression_gate_penalty
         )
+    net_solves = new_solves - lost_solves
+    if global_gates_enabled and scores and net_solves:
+        aggregate = sum(scores) / len(scores)
+        solve_margin = net_solves / len(scores)
+        if (net_solves > 0 and aggregate < solve_margin) or (
+            net_solves < 0 and aggregate > solve_margin
+        ):
+            correction = solve_margin - aggregate
+            scores = [score + correction for score in scores]
     return scores
+
+
+def select_generalizing_candidate(
+    candidates: Sequence[Sequence[Mapping[str, Any]]],
+) -> tuple[int, list[dict[str, Any]]]:
+    """Select broad validation gains, rejecting single-game efficiency outliers."""
+    diagnostics: list[dict[str, Any]] = []
+    ranks: list[tuple[float, float, float]] = []
+    eligible: list[bool] = []
+    for index, outputs in enumerate(candidates):
+        by_game: dict[str, list[float]] = {}
+        solve_deltas: dict[str, list[float]] = {}
+        for row in outputs:
+            game = str(row.get("game", ""))
+            solve_delta = _row_solve_rate(row) - _row_solve_rate(row, prefix="baseline_")
+            efficiency = (
+                _common_solve_efficiency_delta(row, clip=0.25)
+                if _row_solve_rate(row) > 0.0
+                and _row_solve_rate(row, prefix="baseline_") > 0.0
+                else 0.0
+            )
+            by_game.setdefault(game, []).append(20.0 * solve_delta + efficiency)
+            solve_deltas.setdefault(game, []).append(solve_delta)
+        game_scores = [sum(values) / len(values) for values in by_game.values()]
+        game_solve_deltas = [sum(values) / len(values) for values in solve_deltas.values()]
+        mean_score = sum(game_scores) / len(game_scores) if game_scores else 0.0
+        mean_solve_delta = (
+            sum(game_solve_deltas) / len(game_solve_deltas) if game_solve_deltas else 0.0
+        )
+        ordered = sorted(game_scores)
+        median_score = (
+            ordered[len(ordered) // 2]
+            if len(ordered) % 2
+            else sum(ordered[len(ordered) // 2 - 1 : len(ordered) // 2 + 1]) / 2
+        ) if ordered else 0.0
+        positive_games = sum(score > 1e-9 for score in game_scores)
+        negative_games = sum(score < -1e-9 for score in game_scores)
+        is_eligible = index == 0 or mean_solve_delta > 1e-9 or (
+            abs(mean_solve_delta) <= 1e-9
+            and positive_games >= 2
+            and positive_games > negative_games
+            and mean_score > 0.0
+        )
+        diagnostics.append(
+            {
+                "candidate_idx": index,
+                "mean_solve_rate_delta": mean_solve_delta,
+                "mean_game_score": mean_score,
+                "median_game_score": median_score,
+                "positive_games": positive_games,
+                "negative_games": negative_games,
+                "eligible": is_eligible,
+            }
+        )
+        ranks.append((mean_solve_delta, median_score, mean_score))
+        eligible.append(is_eligible)
+    selected = max(
+        (index for index in range(len(candidates)) if eligible[index]),
+        key=lambda index: ranks[index],
+        default=0,
+    )
+    return selected, diagnostics
 
 
 def find_game_text_path(name: str, script_doctor: Path) -> Optional[Path]:
@@ -1895,6 +2298,16 @@ def build_sbatch_array_command(
     ]
 
 
+def publish_search_pool_manifest(pool_dir: Path, manifest_path: Path) -> Path:
+    """Atomically point persistent array workers at the next search manifest."""
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    pointer = pool_dir / "current_manifest"
+    temporary = pool_dir / f"current_manifest.{os.getpid()}.tmp"
+    temporary.write_text(str(manifest_path.resolve()) + "\n", encoding="utf-8")
+    temporary.replace(pointer)
+    return pointer
+
+
 class SearchArrayStalledError(RuntimeError):
     """Raised when no new search shards arrive before the stall timeout."""
 
@@ -1989,10 +2402,13 @@ def _read_optional_text(path_value: object, *, max_chars: int) -> str:
 
 def _result_summary(prefix: str, result: Mapping[str, Any], *, baseline: bool = False) -> str:
     key_prefix = "baseline_" if baseline else ""
+    solve_rate = _row_solve_rate(result, prefix=key_prefix)
     return (
         f"{prefix}: solved={bool(result.get(f'{key_prefix}solved', False))} "
+        f"solve_rate={solve_rate:.3f} "
+        f"replicates={result.get(f'{key_prefix}replicate_count', 1)} "
         f"score={float(result.get(f'{key_prefix}score', 0.0)):.4f} "
-        f"expanded={result.get(f'{key_prefix}expanded', 'unknown')} "
+        f"expanded={result.get(f'{key_prefix}solved_expanded_mean', result.get(f'{key_prefix}expanded', 'unknown'))} "
         f"generated={result.get(f'{key_prefix}generated', 'unknown')} "
         f"solution_length={result.get(f'{key_prefix}solution_length', 'unknown')}"
     )
@@ -2004,18 +2420,8 @@ def _compact_trace_diagnostics(result: Mapping[str, Any]) -> str:
     if not isinstance(trace_summary, Mapping):
         return ""
     values: list[float] = []
-    root_snapshot = trace_summary.get("root_snapshot")
-    if isinstance(root_snapshot, Mapping):
-        value = _score_normalized_from_snapshot(root_snapshot)
-        if value is not None:
-            values.append(value)
-    for state in trace_summary.get("sampled_states", []) or []:
-        if not isinstance(state, Mapping):
-            continue
-        snapshot = state.get("snapshot")
-        if not isinstance(snapshot, Mapping):
-            continue
-        value = _score_normalized_from_snapshot(snapshot)
+    for snapshot in _trace_snapshots(trace_summary):
+        value = _progress_from_snapshot(snapshot)
         if value is not None:
             values.append(value)
     parts = ["Candidate trace diagnostics:"]
@@ -2025,6 +2431,24 @@ def _compact_trace_diagnostics(result: Mapping[str, Any]) -> str:
         if key in trace_summary:
             parts.append(f"{key}={trace_summary[key]}")
     return " ".join(parts) if len(parts) > 1 else ""
+
+
+def _paired_trace_diagnostics(result: Mapping[str, Any]) -> str:
+    candidate = result.get("trace_summary")
+    baseline = result.get("baseline_trace_summary")
+    if not isinstance(candidate, Mapping) and not isinstance(baseline, Mapping):
+        return ""
+    candidate = candidate if isinstance(candidate, Mapping) else {}
+    baseline = baseline if isinstance(baseline, Mapping) else {}
+    return (
+        "Paired evidence: "
+        f"baseline_termination={baseline.get('terminated_reason', 'unknown')} "
+        f"candidate_termination={candidate.get('terminated_reason', 'unknown')} "
+        f"baseline_progress={_row_partial_progress_score(result, prefix='baseline_'):.3f} "
+        f"candidate_progress={_row_partial_progress_score(result):.3f} "
+        f"baseline_expansions={result.get('baseline_replicate_expansions', [])} "
+        f"candidate_expansions={result.get('replicate_expansions', [])}"
+    )
 
 
 def _mechanics_diagnostic_line(mechanics_signature: str) -> str:
@@ -2142,6 +2566,9 @@ def build_reflection_feedback(
     diagnostics = _compact_trace_diagnostics(result)
     if diagnostics and classification != "stable_or_improved":
         lines.append(diagnostics)
+    paired_diagnostics = _paired_trace_diagnostics(result)
+    if paired_diagnostics and classification != "stable_or_improved":
+        lines.append(paired_diagnostics)
     return "\n".join(lines)
 
 
@@ -2173,6 +2600,12 @@ def build_comparison_payload(
         "mechanics_signature": mechanics_signature or "generic",
         "candidate_solved": bool(result.get("solved", False)),
         "baseline_solved": bool(result.get("baseline_solved", False)),
+        "candidate_solve_rate": _row_solve_rate(result),
+        "baseline_solve_rate": _row_solve_rate(result, prefix="baseline_"),
+        "candidate_replicate_count": result.get("replicate_count", 1),
+        "baseline_replicate_count": result.get("baseline_replicate_count", 1),
+        "candidate_replicate_expansions": result.get("replicate_expansions", []),
+        "baseline_replicate_expansions": result.get("baseline_replicate_expansions", []),
         "candidate_score": raw_score,
         "baseline_score": baseline_score,
         "score_delta": raw_score - baseline_score,
@@ -2262,9 +2695,17 @@ def _mean_or_zero(values: Sequence[float]) -> float:
 def _aggregate_actionable_shape_losses(
     trajectories: Sequence[Mapping[str, Any]],
 ) -> dict[str, int]:
-    """Return counts of repairable base-vs-candidate code-shape losses."""
+    """Return counts of harmful repairable base-vs-candidate shape losses.
+
+    A candidate can drop a base-generated code structure and improve anyway.
+    Aggregate prompt repair should preserve dropped structure only when the drop
+    coincides with a lost base solve or a solved efficiency regression; helpful
+    drops remain visible through per-trace gains rather than this loss counter.
+    """
     counts: dict[str, int] = {}
     for trace in trajectories:
+        if trace_classification(trace) not in {"lost_baseline_solve", "solved_regression"}:
+            continue
         shapes = _trace_code_shape_pair(trace)
         if shapes is None:
             continue
@@ -2556,13 +2997,15 @@ def build_seed_candidate(initial_addendum: str = "") -> dict[str, str]:
 
 
 def read_initial_gepa_addendum(inline_addendum: str, addendum_file: Path | None) -> str:
-    """Resolve the optional seed addendum from either CLI text or a file.
+    """Resolve the optional seed addendum from CLI text, an addendum, or a prompt.
 
     SLURM's ``--export`` option splits environment payloads on commas, which is
     exactly the punctuation used by useful prompt-routing addenda. Reading the
     seed text from a file keeps the optimization contract unchanged while making
     launch-time transport robust to commas, conditionals, and multi-sentence
-    guidance.
+    guidance. Completed ``best_prompt.txt`` artifacts are also accepted: when
+    the GEPA addendum marker is present, only its addendum is reused so the
+    canonical base contract is not duplicated.
     """
     inline = inline_addendum.strip()
     if addendum_file is None:
@@ -2574,6 +3017,8 @@ def read_initial_gepa_addendum(inline_addendum: str, addendum_file: Path | None)
             "Specify either inline --initial-gepa-addendum or "
             "--initial-gepa-addendum-file, not both."
         )
+    if GEPA_ADDENDUM_HEADER in file_text:
+        return _current_gepa_addendum(file_text)
     return file_text or inline
 
 
@@ -2586,18 +3031,6 @@ def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
         flags=re.IGNORECASE,
     ).strip()
     if candidate_prompt_issue(cleaned) is not None:
-        return ""
-    required_markers = (
-        "WINCONDITIONS",
-        "RULES",
-        "COLLISIONLAYERS",
-        "LEGEND",
-        "initial level state",
-        "score_normalized",
-        "Return 0.0",
-        "Do not output",
-    )
-    if any(marker not in cleaned for marker in required_markers):
         return ""
     if _has_dangling_prompt_tail(cleaned):
         return ""
@@ -3209,6 +3642,35 @@ def _fallback_addendum_from_feedback(records: Sequence[Mapping[str, Any]]) -> st
             "Use the signal only when its observable precondition is present, keep it "
             "finite/nonnegative, and otherwise preserve the base prompt behavior."
         )
+    return ""
+
+
+def _case_specific_baseline_addendum(records: Sequence[Mapping[str, Any]]) -> str:
+    """Return a deliberate oracle prompt containing the known-good baseline algorithm."""
+
+    for record in records:
+        inputs = cast(Mapping[str, Any], record.get("Inputs", {}))
+        baseline = cast(Mapping[str, Any], record.get("Baseline Output", {}))
+        code = str(baseline.get("heuristic_code", "")).strip()
+        game = str(inputs.get("game", "")).strip()
+        level = inputs.get("level")
+        if code and game and level is not None:
+            score_ablation = (
+                "\nControlled refinement for this next candidate: preserve every "
+                "object-level term and weight, but omit the score_normalized penalty "
+                "from the normal path. Use it only when the core object roles cannot "
+                "be resolved."
+                if "score_normalized" in code
+                else ""
+            )
+            return (
+                f"For the deliberate overfit case {game} level {int(level)}, reproduce the "
+                "following known-successful baseline heuristic algorithm exactly before "
+                "trying any refinement. Preserve its object-name tests, exclusions, formula, "
+                "weights, and fallback; only change them when the measured expansion count "
+                "improves on this same level. Reference implementation:\n"
+                f"{code}{score_ablation}"
+            )
     return ""
 
 
@@ -4042,11 +4504,17 @@ def _initial_eval_counter(candidate_eval_root: Path) -> int:
     return max_counter
 
 
+def _canonical_candidate(candidate: Mapping[str, str]) -> dict[str, str]:
+    """Normalize prompt whitespace before hashing, caching, and model calls."""
+    return {component: text.strip() for component, text in candidate.items()}
+
+
 class PuzzleScriptBatchedGEPAAdapter:
     def __init__(
         self,
         *,
         llm: TextCompletionClient,
+        proposal_llm: Optional[TextCompletionClient] = None,
         state_root: Path,
         script_doctor: Path,
         search_config: SearchArrayConfig,
@@ -4062,8 +4530,12 @@ class PuzzleScriptBatchedGEPAAdapter:
         common_solve_efficiency_clip: float = DEFAULT_COMMON_SOLVE_EFFICIENCY_CLIP,
         global_lost_solve_gate_penalty: float | None = None,
         global_net_solve_loss_gate_penalty: float | None = None,
+        allow_case_specific_overfit: bool = False,
+        optimize_full_prompt: bool = False,
+        synthesis_replicates: int = 1,
     ) -> None:
         self.llm = llm
+        self.proposal_llm = proposal_llm or llm
         self.state_root = state_root
         self.script_doctor = script_doctor
         self.search_config = search_config
@@ -4087,6 +4559,9 @@ class PuzzleScriptBatchedGEPAAdapter:
             if global_net_solve_loss_gate_penalty is None
             else max(0.0, global_net_solve_loss_gate_penalty)
         )
+        self.allow_case_specific_overfit = allow_case_specific_overfit
+        self.optimize_full_prompt = optimize_full_prompt
+        self.synthesis_replicates = max(1, synthesis_replicates)
         self.baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
         self.reuse_baseline_by_key: dict[tuple[str, int], dict[str, Any]] = {}
         self.baseline_prompt_text: Optional[str] = None
@@ -4098,6 +4573,8 @@ class PuzzleScriptBatchedGEPAAdapter:
             tuple[str, str, int],
             dict[str, Any],
         ] = {}
+        self.proposal_history: set[tuple[str, str]] = set()
+        self.candidate_outcome_history: list[str] = []
         self.eval_counter = _initial_eval_counter(self.state_root / "candidate_evals")
 
     def set_scoring_baseline_outputs(self, outputs: Sequence[Mapping[str, Any]]) -> None:
@@ -4151,19 +4628,30 @@ class PuzzleScriptBatchedGEPAAdapter:
             return
         result["baseline_score"] = float(baseline.get("score", 0.0))
         result["baseline_solved"] = bool(baseline.get("solved", False))
+        result["baseline_solve_rate"] = float(
+            baseline.get("solve_rate", float(bool(baseline.get("solved", False))))
+        )
         result["baseline_error"] = baseline.get("error")
         result["baseline_expanded"] = baseline.get("expanded")
+        result["baseline_solved_expanded_mean"] = baseline.get("solved_expanded_mean")
         result["baseline_generated"] = baseline.get("generated")
         result["baseline_solution_length"] = baseline.get("solution_length")
         result["baseline_partial_progress_score"] = baseline.get("partial_progress_score", 0.0)
         result["baseline_feedback"] = baseline.get("feedback")
         result["baseline_heuristic_code_path"] = baseline.get("heuristic_code_path")
+        result["baseline_candidate_error_rate"] = baseline.get("candidate_error_rate", 0.0)
+        result["baseline_replicate_count"] = baseline.get("replicate_count", 1)
+        result["baseline_replicate_results_path"] = baseline.get("replicate_results_path")
+        result["baseline_trace_summary"] = baseline.get("trace_summary")
+        result["baseline_trace_artifact_path"] = baseline.get("trace_artifact_path")
+        result["baseline_replicate_expansions"] = baseline.get("replicate_expansions", [])
+        result["baseline_replicate_termination_reasons"] = baseline.get(
+            "replicate_termination_reasons", []
+        )
 
     def _next_eval_dir(self, candidate: Mapping[str, str], batch: Sequence[PuzzleScriptLevelTask]) -> Path:
         self.eval_counter += 1
-        candidate_hash = hashlib.sha256(
-            json.dumps(candidate, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:10]
+        candidate_hash = self._candidate_hash(candidate)[:10]
         task_hash = hashlib.sha256(
             ",".join(f"{task.game}:{task.level}" for task in batch).encode("utf-8")
         ).hexdigest()[:8]
@@ -4192,7 +4680,9 @@ class PuzzleScriptBatchedGEPAAdapter:
     @staticmethod
     def _candidate_hash(candidate: Mapping[str, str]) -> str:
         """Return the stable full prompt hash used for in-run candidate caches."""
-        return hashlib.sha256(json.dumps(candidate, sort_keys=True).encode("utf-8")).hexdigest()
+        return hashlib.sha256(
+            json.dumps(_canonical_candidate(candidate), sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
     def _reuse_candidate_evaluation(
         self,
@@ -4282,7 +4772,10 @@ class PuzzleScriptBatchedGEPAAdapter:
 
         def _one(index: int, task: PuzzleScriptLevelTask) -> tuple[int, dict[str, Any]]:
             code, error = synthesize_heuristic_code(llm=self.llm, prompt_text=prompt_text, task=task)
-            code_path = heuristics_dir / f"{task.task_id:04d}-{safe_name(task.game)}-level-{task.level:02d}.py"
+            code_path = heuristics_dir / (
+                f"{task.task_id:04d}-{safe_name(task.game)}-level-{task.level:02d}"
+                f"-rep-{task.replicate:02d}.py"
+            )
             code_path.write_text(code + "\n", encoding="utf-8")
             row = asdict(task)
             row["heuristic_code_path"] = str(code_path)
@@ -4303,7 +4796,10 @@ class PuzzleScriptBatchedGEPAAdapter:
         return materialized
 
     def _run_search(self, *, eval_dir: Path, task_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        array_count = min(max(1, self.search_config.array_count), max(1, len(task_rows)))
+        if self.search_config.pool_dir is not None:
+            array_count = max(1, self.search_config.array_count)
+        else:
+            array_count = min(max(1, self.search_config.array_count), max(1, len(task_rows)))
         shard_dir = eval_dir / "search_shards"
         manifest_path = eval_dir / "search_manifest.json"
         manifest = {
@@ -4324,7 +4820,13 @@ class PuzzleScriptBatchedGEPAAdapter:
         )
 
         submitted_job_id: Optional[str] = None
-        if self.search_config.submit:
+        if self.search_config.pool_dir is not None:
+            pointer = publish_search_pool_manifest(
+                self.search_config.pool_dir,
+                manifest_path,
+            )
+            print(f"[search-pool] published manifest via {pointer}", flush=True)
+        elif self.search_config.submit:
             command = build_sbatch_array_command(
                 manifest_path=manifest_path,
                 array_script=self.search_config.array_script,
@@ -4355,7 +4857,9 @@ class PuzzleScriptBatchedGEPAAdapter:
                 array_count=array_count,
                 poll_interval_s=self.search_config.poll_interval_s,
                 stall_timeout_s=(
-                    self.search_config.stall_timeout_s if self.search_config.submit else 0.0
+                    self.search_config.stall_timeout_s
+                    if self.search_config.submit or self.search_config.pool_dir is not None
+                    else 0.0
                 ),
             )
         except SearchArrayStalledError as exc:
@@ -4481,6 +4985,7 @@ class PuzzleScriptBatchedGEPAAdapter:
     ):
         from gepa import EvaluationBatch
 
+        candidate = _canonical_candidate(candidate)
         eval_dir = self._next_eval_dir(candidate, batch)
         (eval_dir / "candidate.json").write_text(
             json.dumps(candidate, indent=2, sort_keys=True) + "\n",
@@ -4637,43 +5142,64 @@ class PuzzleScriptBatchedGEPAAdapter:
             )
 
         if missing_tasks:
+            physical_tasks: list[PuzzleScriptLevelTask] = []
+            physical_owners: dict[int, tuple[int, PuzzleScriptLevelTask]] = {}
+            for original_index, task in zip(missing_indices, missing_tasks, strict=True):
+                for replicate in range(self.synthesis_replicates):
+                    physical_id = (
+                        task.task_id
+                        if self.synthesis_replicates == 1
+                        else len(physical_tasks)
+                    )
+                    physical_task = replace(task, task_id=physical_id, replicate=replicate)
+                    physical_tasks.append(physical_task)
+                    physical_owners[physical_id] = (original_index, task)
             task_rows = self._synthesize_batch(
                 candidate=candidate,
-                batch=missing_tasks,
+                batch=physical_tasks,
                 eval_dir=eval_dir,
             )
             results_by_id = {
                 int(row["task_id"]): row
                 for row in self._run_search(eval_dir=eval_dir, task_rows=task_rows)
             }
-            for original_index, task, task_row in zip(
-                missing_indices,
-                missing_tasks,
-                task_rows,
-                strict=True,
-            ):
-                result = results_by_id.get(
-                    task.task_id,
+            grouped: dict[int, list[dict[str, Any]]] = {}
+            for physical_task, task_row in zip(physical_tasks, task_rows, strict=True):
+                result = dict(results_by_id.get(
+                    physical_task.task_id,
                     {
-                        "task_id": task.task_id,
-                        "game": task.game,
-                        "level": task.level,
+                        "task_id": physical_task.task_id,
+                        "game": physical_task.game,
+                        "level": physical_task.level,
                         "score": 0.0,
                         "solved": False,
                         "feedback": "Missing search result shard output.",
                         "error": "missing search result shard output",
                     },
-                )
-                result = dict(result)
+                ))
                 result["synthesis_error"] = task_row.get("synthesis_error")
+                result["replicate"] = physical_task.replicate
                 if "heuristic_code_path" not in result:
                     result["heuristic_code_path"] = task_row.get("heuristic_code_path")
+                original_index, _ = physical_owners[physical_task.task_id]
+                grouped.setdefault(original_index, []).append(result)
+            replicate_path = eval_dir / "replicate_results.json"
+            replicate_path.write_text(
+                json.dumps(grouped, indent=2, sort_keys=True, default=str) + "\n",
+                encoding="utf-8",
+            )
+            for original_index, task in zip(missing_indices, missing_tasks, strict=True):
+                result = aggregate_replicate_results(task, grouped[original_index])
+                result["replicate_results_path"] = str(replicate_path)
                 self._attach_baseline_metadata(result)
                 outputs_by_index[original_index] = result
         else:
             (eval_dir / "synthesis_manifest.json").write_text("[]\n", encoding="utf-8")
 
         outputs = [outputs_by_index[index] for index in range(len(batch))]
+        trace_artifact_path = str(eval_dir / "scored_results.json")
+        for output in outputs:
+            output["trace_artifact_path"] = trace_artifact_path
         trajectories: list[dict[str, Any]] = []
         if capture_traces:
             for task, result in zip(batch, outputs, strict=True):
@@ -4717,16 +5243,32 @@ class PuzzleScriptBatchedGEPAAdapter:
             if outputs
             else 0.0
         )
-        solved = sum(1 for output in outputs if output.get("solved"))
-        lost_solves = sum(
-            1
+        solved = sum(_row_solve_rate(output) for output in outputs)
+        lost_rows = [
+            output
             for output in outputs
-            if bool(output.get("baseline_solved", False)) and not bool(output.get("solved", False))
+            if _row_solve_rate(output, prefix="baseline_") > _row_solve_rate(output)
+        ]
+        lost_solves = len(lost_rows)
+        candidate_errors = sum(
+            float(output.get("candidate_error_rate", float(is_candidate_error(output))))
+            for output in outputs
         )
-        candidate_errors = sum(1 for output in outputs if is_candidate_error(output))
+        new_rows = [
+            output
+            for output in outputs
+            if _row_solve_rate(output) > _row_solve_rate(output, prefix="baseline_")
+        ]
+        if any(_has_baseline(output) for output in outputs):
+            self.candidate_outcome_history.append(
+                f"candidate={candidate_hash[:10]} eval={eval_dir.name} tasks={len(outputs)} "
+                f"score={aggregate:+.4f} new={[(row['game'], row['level']) for row in new_rows]} "
+                f"lost={[(row['game'], row['level']) for row in lost_rows]} errors={candidate_errors}"
+            )
+            self.candidate_outcome_history = self.candidate_outcome_history[-12:]
         print(
             f"[adapter] merged adjusted_score={aggregate:.4f} raw_score={raw_aggregate:.4f}, "
-            f"solved={solved}/{len(outputs)} lost_solves={lost_solves} "
+            f"mean_solved={solved:.2f}/{len(outputs)} lost_solves={lost_solves} "
             f"candidate_errors={candidate_errors}",
             flush=True,
         )
@@ -4760,6 +5302,7 @@ class PuzzleScriptBatchedGEPAAdapter:
         del candidate
         trajectories = list(eval_batch.trajectories or [])
         selected_traces = select_reflection_traces(trajectories)
+        artifact_tools = bool(getattr(self.proposal_llm, "allow_read_tools", False))
         if len(selected_traces) < len(trajectories):
             print(
                 "[adapter] reflection traces selected="
@@ -4787,9 +5330,14 @@ class PuzzleScriptBatchedGEPAAdapter:
             result = trace["result"]
             classification = trace_classification(trace)
             mechanics_signature = trace_mechanics_signature(trace)
+            code_chars = (
+                CASE_SPECIFIC_OVERFIT_ADDENDUM_MAX_CHARS
+                if self.allow_case_specific_overfit
+                else DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS
+            )
             baseline_code = _read_optional_text(
                 result.get("baseline_heuristic_code_path"),
-                max_chars=DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
+                max_chars=code_chars,
             )
             generated_code = trace.get("heuristic_code", "")
             baseline_shape = heuristic_code_shape(baseline_code)
@@ -4814,38 +5362,44 @@ class PuzzleScriptBatchedGEPAAdapter:
                 targeted_feedback = f"{targeted_feedback}\n{efficiency_shape_feedback}"
             if shape_feedback:
                 targeted_feedback = f"{targeted_feedback}\n{shape_feedback}"
+            baseline_output: dict[str, Any] = {
+                "code_shape": baseline_shape,
+                "feedback": truncate_text(
+                    str(result.get("baseline_feedback", "")),
+                    DEFAULT_REFLECTION_FEEDBACK_CHARS,
+                ),
+            }
+            generated_output: dict[str, Any] = {
+                "code_shape": generated_shape,
+                "synthesis_error": trace.get("synthesis_error"),
+            }
+            if artifact_tools:
+                baseline_output["heuristic_code_path"] = result.get(
+                    "baseline_heuristic_code_path"
+                )
+                generated_output["heuristic_code_path"] = trace.get("heuristic_code_path")
+            else:
+                baseline_output["heuristic_code"] = baseline_code
+                generated_output["heuristic_code"] = truncate_text(generated_code, code_chars)
             records.append(
                 {
                     "Inputs": {
                         "game": task["game"],
                         "level": task["level"],
                         "budget": task["budget"],
-                        "env_description": truncate_text(
-                            task["env_description"],
-                            DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS,
-                        ),
+                        "env_description": reflection_env_summary(task["env_description"]),
                     },
                     "Comparison": build_comparison_payload(
                         result,
                         classification,
                         mechanics_signature=mechanics_signature,
                     ),
-                    "Baseline Output": {
-                        "heuristic_code": baseline_code,
-                        "code_shape": baseline_shape,
-                        "feedback": truncate_text(
-                            str(result.get("baseline_feedback", "")),
-                            DEFAULT_REFLECTION_FEEDBACK_CHARS,
-                        ),
-                    },
-                    "Generated Outputs": {
-                        "heuristic_code": truncate_text(
-                            generated_code,
-                            DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
-                        ),
-                        "code_shape": generated_shape,
-                        "synthesis_error": trace.get("synthesis_error"),
-                    },
+                    "Baseline Output": baseline_output,
+                    "Generated Outputs": generated_output,
+                    "Trace Artifact": result.get("trace_artifact_path"),
+                    "Replicate Artifact": result.get("replicate_results_path"),
+                    "Baseline Trace Artifact": result.get("baseline_trace_artifact_path"),
+                    "Baseline Replicate Artifact": result.get("baseline_replicate_results_path"),
                     "Feedback": truncate_text(
                         targeted_feedback,
                         DEFAULT_REFLECTION_FEEDBACK_CHARS,
@@ -4882,11 +5436,112 @@ class PuzzleScriptBatchedGEPAAdapter:
                 json.dumps(records, indent=2, sort_keys=True, default=str),
                 DEFAULT_REFLECTION_DATASET_CHARS,
             )
-            max_chars = DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+            recent_outcomes = "\n".join(self.candidate_outcome_history[-8:]) or "<none>"
+            if self.optimize_full_prompt:
+                artifact_access = ""
+                if bool(getattr(self.proposal_llm, "allow_read_tools", False)):
+                    artifact_access = f"""
+You may use read-only shell tools to inspect {self.state_root / 'candidate_evals'}.
+Inspect candidate.json, scored_results.json, replicate_results.json, trace summaries,
+and heuristic files from accepted and rejected candidates. Do not modify artifacts
+or run searches. Do not inspect any holdout data or paths outside this run root.
+"""
+                reflection_prompt = f"""Rewrite the entire prompt used by a separate coding agent to generate one PuzzleScript A* heuristic.
+
+You may change, delete, reorder, or add any instruction. The next evaluation will
+enforce the code contract, so preserve only constraints you judge useful. Produce
+one reusable prompt for unseen games; do not memorize game titles or levels.
+Optimize validation solve probability first and solved-search efficiency second.
+Use the causal comparisons, replicate rates, rejected-child evidence, and artifact
+traces below. Output only the complete replacement prompt, without markdown or commentary.
+Keep it under {DEFAULT_PROPOSED_PROMPT_MAX_CHARS} characters.
+
+Current full prompt:
+{current_prompt}
+
+Comparison-focused feedback:
+{feedback_payload}
+
+Recent evaluated outcomes:
+{recent_outcomes}
+{artifact_access}
+"""
+                revised_prompt = ""
+                proposal_key = (component, "")
+                focus_offset = len(self.proposal_history)
+                for attempt in range(3):
+                    focus = FULL_PROMPT_PROPOSAL_FOCI[
+                        (focus_offset + attempt) % len(FULL_PROMPT_PROPOSAL_FOCI)
+                    ]
+                    revised_prompt = _clean_proposed_prompt(
+                        self.proposal_llm.complete(
+                            reflection_prompt
+                            + f"\nThis proposal's required focus: {focus}\n"
+                            + "Return a materially different complete prompt."
+                        ),
+                        max_chars=DEFAULT_PROPOSED_PROMPT_MAX_CHARS,
+                    )
+                    proposal_key = (component, revised_prompt.strip())
+                    if (
+                        revised_prompt
+                        and revised_prompt.strip() != current_prompt.strip()
+                        and proposal_key not in self.proposal_history
+                    ):
+                        break
+                else:
+                    revised_prompt = current_prompt
+                    proposal_key = (component, revised_prompt.strip())
+                new_texts[component] = revised_prompt
+                self.proposal_history.add(proposal_key)
+                continue
+            max_chars = (
+                CASE_SPECIFIC_OVERFIT_ADDENDUM_MAX_CHARS
+                if self.allow_case_specific_overfit
+                else DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
+            )
+            if self.allow_case_specific_overfit:
+                research_goal = (
+                    "This is an explicit single-case overfitting diagnostic. Optimize only "
+                    "the named game and level in the feedback. Case-specific instructions, "
+                    "constants, aliases, and mechanics are allowed; generalization is out of scope."
+                )
+                proposal_scope = """
+- Use the successful Baseline Output as the positive specification. Name the exact
+  game and level when useful, and tell the downstream model which concrete baseline
+  code structure or mechanics to preserve or strengthen.
+- The replacement must differ materially from the current addendum and maximize the
+  measured case's solve status first, then beat the baseline expansion count.
+- Memorization is allowed in this diagnostic. Do not weaken a useful case-specific
+  instruction merely to make it generalize.
+"""
+            else:
+                research_goal = (
+                    "The research goal is one general prompt, selected by GEPA-visible "
+                    "train/validation performance, not a prompt tuned on heldout data.\n"
+                    "The desired artifact should behave like one human heuristic designer's "
+                    "reusable decision procedure for unseen games."
+                )
+                proposal_scope = """
+- Prompt-internal if-statements, decision trees, or named categories are allowed
+  prompt shapes when the feedback supports them; define them from observable
+  rules and state properties rather than from game titles.
+- Avoid memorized title/level exceptions unless the feedback clearly shows they
+  generalize through observable mechanics. The goal is validation generalization,
+  not fitting a few named cases.
+"""
+            artifact_access = ""
+            if bool(getattr(self.proposal_llm, "allow_read_tools", False)):
+                artifact_access = f"""
+Read-only artifact access:
+- You may inspect {self.state_root / 'candidate_evals'} with shell tools.
+- Compare candidate.json, scored_results.json, and heuristic files across recent
+  evaluations, including rejected candidates. Use the bounded early, best-progress,
+  and late states in trace_summary; do not infer progress from candidate h values.
+- Do not modify artifacts or run searches. Return only the requested addendum.
+"""
             reflection_prompt = f"""You are revising one global prompt used to generate PuzzleScript A* heuristics.
 
-The research goal is one general prompt, selected by GEPA-visible train/validation performance, not a prompt tuned on heldout data.
-The desired artifact should behave like one human heuristic designer's reusable decision procedure for unseen games.
+{research_goal}
 The existing base prompt is already strong. Propose only a short replacement addendum that will be attached after it.
 
 Hard requirements:
@@ -4900,12 +5555,7 @@ Hard requirements:
   self-discover categories, conditionals, or routing inside the prompt, but the
   runner will not implement buckets in code and the addendum should not force a
   category scheme without evidence.
-- Prompt-internal if-statements, decision trees, or named categories are allowed
-  prompt shapes when the feedback supports them; define them from observable
-  rules and state properties rather than from game titles.
-- Avoid memorized title/level exceptions unless the feedback clearly shows they
-  generalize through observable mechanics. The goal is validation generalization,
-  not fitting a few named cases.
+{proposal_scope}
 - Phrase the addendum as preconditioned reasoning: before using target counts,
   distances, deadlocks, missing-object penalties, or score fallback, state what
   the heuristic writer must verify from WINCONDITIONS, RULES, LEGEND,
@@ -4948,15 +5598,52 @@ Current addendum being revised:
 
 Comparison-focused feedback:
 {feedback_payload}
+
+Recent evaluated candidate outcomes (including rejected candidates):
+{recent_outcomes}
+{artifact_access}
 """
-            proposed = self.llm.complete(reflection_prompt)
+            proposed = self.proposal_llm.complete(reflection_prompt)
             cleaned = _clean_proposed_addendum(proposed, max_chars=max_chars)
             revised_prompt = (
                 _compose_prompt_with_addendum(base_prompt, cleaned) if cleaned else current_prompt
             )
-            if revised_prompt.strip() == current_prompt.strip():
-                fallback = _fallback_addendum_from_feedback(records)
-                if fallback:
+            proposal_key = (component, revised_prompt.strip())
+            duplicate_proposal = proposal_key in self.proposal_history
+            no_op_proposal = revised_prompt.strip() == current_prompt.strip()
+            if no_op_proposal or duplicate_proposal:
+                classifications = {
+                    str(cast(Mapping[str, Any], record.get("Comparison", {})).get(
+                        "classification", ""
+                    ))
+                    for record in records
+                }
+                if (
+                    self.allow_case_specific_overfit
+                    and no_op_proposal
+                    and not duplicate_proposal
+                    and current_addendum
+                    and classifications & {"lost_baseline_solve", "solved_regression"}
+                ):
+                    print(
+                        "[proposer] dropping regressed seed addendum after no-op proposal",
+                        flush=True,
+                    )
+                    revised_prompt = base_prompt
+                else:
+                    if duplicate_proposal:
+                        print(
+                            "[proposer] replacing previously attempted proposal",
+                            flush=True,
+                        )
+                    fallback = (
+                        _case_specific_baseline_addendum(records)
+                        if self.allow_case_specific_overfit
+                        else ""
+                    ) or _fallback_addendum_from_feedback(records)
+                    if not fallback:
+                        new_texts[component] = revised_prompt
+                        continue
                     merged_fallback = _merge_current_addendum_with_fallback(
                         current_addendum,
                         fallback,
@@ -4968,7 +5655,28 @@ Comparison-focused feedback:
                             flush=True,
                         )
                         revised_prompt = _compose_prompt_with_addendum(base_prompt, merged_fallback)
+            final_key = (component, revised_prompt.strip())
+            if final_key in self.proposal_history:
+                retry_prompt = (
+                    reflection_prompt
+                    + "\nThe previous proposal and conservative fallback were already evaluated. "
+                    "Return one materially different addendum hypothesis."
+                )
+                retry = _clean_proposed_addendum(
+                    self.proposal_llm.complete(retry_prompt),
+                    max_chars=max_chars,
+                )
+                retry_prompt_text = (
+                    _compose_prompt_with_addendum(base_prompt, retry) if retry else current_prompt
+                )
+                retry_key = (component, retry_prompt_text.strip())
+                revised_prompt = (
+                    retry_prompt_text
+                    if retry_key not in self.proposal_history
+                    else current_prompt
+                )
             new_texts[component] = revised_prompt
+            self.proposal_history.add((component, revised_prompt.strip()))
         return new_texts
 
 
@@ -5017,6 +5725,15 @@ def collect_git_state(
     }
 
 
+def _gepa_iteration_limit_reached(state: Any, max_iterations: int) -> bool:
+    """Return whether GEPA has completed the requested number of iterations.
+
+    GEPA initializes ``state.i`` to -1 and increments it before each proposal,
+    so iteration 40 is complete when the persisted index reaches 39.
+    """
+    return int(state.i) + 1 >= max_iterations
+
+
 def run_standalone_gepa(args: argparse.Namespace) -> None:
     state_root = args.state_root.expanduser().resolve()
     state_root.mkdir(parents=True, exist_ok=True)
@@ -5036,14 +5753,36 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     (gepa_run_dir / "prog_candidates").mkdir(exist_ok=True)
 
     evaluator = PuzzleScriptEvaluator(args.script_doctor)
-    train_jobs, _eval_jobs = load_env_grid(args.env_grid)
+    train_jobs, eval_jobs = load_env_grid(args.env_grid)
+    training_level_selection = parse_guard_level_selection(args.training_levels)
+    selected_jobs = select_jobs_for_training_levels(
+        train_jobs,
+        eval_jobs,
+        training_level_selection,
+    )
     all_train_tasks = build_level_tasks(
         evaluator=evaluator,
-        jobs=train_jobs,
+        jobs=selected_jobs,
         script_doctor=args.script_doctor,
         levels_per_game=args.levels_per_game,
         budget=max(1, args.max_gepa_expansions_per_level),
+        selected_levels_by_game=training_level_selection or None,
     )
+    if training_level_selection:
+        requested_training_keys = {
+            (str(game), int(level))
+            for game, levels in training_level_selection.items()
+            for level in levels
+        }
+        loaded_training_keys = {task_key(task) for task in all_train_tasks}
+        missing_training_keys = sorted(requested_training_keys - loaded_training_keys)
+        if missing_training_keys:
+            raise RuntimeError(
+                "Exact training levels could not be loaded: "
+                + ", ".join(
+                    f"{game}:{level}" for game, level in missing_training_keys
+                )
+            )
     if args.val_split == "dev":
         split_train_tasks, split_val_tasks = build_train_dev_tasks(
             all_train_tasks,
@@ -5088,6 +5827,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         "val_split": args.val_split,
         "dev_fraction": args.dev_fraction if args.val_split == "dev" else None,
         "seed": args.seed,
+        "training_levels": training_level_selection,
         "all_train_games": sorted({task.game for task in all_train_tasks}),
         "train_games": sorted({task.game for task in train_tasks}),
         "val_games": sorted({task.game for task in val_tasks}),
@@ -5110,17 +5850,45 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         encoding="utf-8",
     )
 
-    llm = OpenAITextClient(
-        model=args.model,
-        base_url=args.openai_base_url,
-        api_key=args.openai_api_key,
-        max_tokens=args.max_model_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        timeout_s=args.llm_timeout_s,
+    llm: TextCompletionClient
+    if args.synthesis_backend == "codex-cli":
+        llm = CodexCLITextClient(
+            model=args.synthesis_codex_model,
+            timeout_s=args.llm_timeout_s,
+            executable=args.codex_executable,
+            reasoning_effort=args.codex_reasoning_effort,
+            agentic_workspace=getattr(args, "synthesis_agentic", True),
+        )
+    else:
+        llm = OpenAITextClient(
+            model=args.model,
+            base_url=args.openai_base_url,
+            api_key=args.openai_api_key,
+            max_tokens=args.max_model_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            timeout_s=args.llm_timeout_s,
+        )
+    proposal_llm: TextCompletionClient = llm
+    if args.reflection_backend == "codex-cli":
+        proposal_llm = CodexCLITextClient(
+            model=args.codex_model,
+            timeout_s=args.llm_timeout_s,
+            executable=args.codex_executable,
+            reasoning_effort=args.codex_reasoning_effort,
+            working_directory=state_root,
+            allow_read_tools=args.reflection_artifact_tools,
+        )
+    print(
+        f"[llm] synthesis_backend={args.synthesis_backend} "
+        f"synthesis_model={args.synthesis_codex_model if args.synthesis_backend == 'codex-cli' else args.model} "
+        f"reflection_backend={args.reflection_backend} "
+        f"reflection_model={args.codex_model if args.reflection_backend == 'codex-cli' else args.model}",
+        flush=True,
     )
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=llm,
+        proposal_llm=proposal_llm,
         state_root=state_root,
         script_doctor=args.script_doctor,
         search_config=SearchArrayConfig(
@@ -5131,6 +5899,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
             poll_interval_s=args.search_poll_interval_s,
             stall_timeout_s=args.search_array_stall_timeout_s,
             extra_sbatch_args=parse_extra_sbatch_args(args.extra_sbatch_args),
+            pool_dir=args.search_pool_dir,
         ),
         llm_concurrency=args.llm_concurrency,
         astar_timeout_s=max(1.0, args.astar_timeout_s),
@@ -5144,18 +5913,13 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         common_solve_efficiency_clip=args.common_solve_efficiency_clip,
         global_lost_solve_gate_penalty=args.global_lost_solve_gate_penalty,
         global_net_solve_loss_gate_penalty=args.global_net_solve_loss_gate_penalty,
+        allow_case_specific_overfit=getattr(args, "allow_case_specific_overfit", False),
+        optimize_full_prompt=args.optimize_full_prompt,
+        synthesis_replicates=args.synthesis_replicates,
     )
 
     import gepa
 
-    reflection_minibatch_size = (
-        len(train_tasks) if args.reflection_minibatch_size <= 0 else args.reflection_minibatch_size
-    )
-    max_metric_calls = (
-        args.max_metric_calls
-        if args.max_metric_calls > 0
-        else len(val_tasks) + args.max_gepa_iterations * len(train_tasks) * 2
-    )
     initial_gepa_addendum = read_initial_gepa_addendum(
         args.initial_gepa_addendum,
         args.initial_gepa_addendum_file,
@@ -5268,6 +6032,30 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         json.dumps(baseline_summary, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
+    train_tasks, dropped_train_tasks = filter_unlearnable_tasks(train_tasks, baseline_outputs)
+    val_tasks, dropped_val_tasks = filter_unlearnable_tasks(val_tasks, baseline_outputs)
+    if not train_tasks or not val_tasks:
+        raise RuntimeError("Baseline filtering left an empty GEPA train or validation set.")
+    optimization_split = {
+        "train_task_count": len(train_tasks),
+        "val_task_count": len(val_tasks),
+        "dropped_unlearnable_train": [asdict(task) for task in dropped_train_tasks],
+        "dropped_unlearnable_val": [asdict(task) for task in dropped_val_tasks],
+    }
+    (state_root / "optimization_split.json").write_text(
+        json.dumps(optimization_split, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    reflection_minibatch_size = (
+        min(len(train_tasks), DEFAULT_REFLECTION_MAX_RECORDS)
+        if args.reflection_minibatch_size <= 0
+        else min(len(train_tasks), args.reflection_minibatch_size)
+    )
+    max_metric_calls = (
+        args.max_metric_calls
+        if args.max_metric_calls > 0
+        else len(val_tasks) + args.max_gepa_iterations * reflection_minibatch_size * 2
+    )
     print(
         "[gepa] starting standalone optimization: "
         f"train_tasks={len(train_tasks)} val_tasks={len(val_tasks)} "
@@ -5282,27 +6070,163 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         trainset=train_tasks,
         valset=val_tasks,
         adapter=adapter,
-        reflection_lm=llm.complete,
+        reflection_lm=proposal_llm.complete,
         reflection_minibatch_size=reflection_minibatch_size,
         max_metric_calls=max_metric_calls,
+        stop_callbacks=lambda state: _gepa_iteration_limit_reached(
+            state,
+            args.max_gepa_iterations,
+        ),
         run_dir=str(gepa_run_dir),
         display_progress_bar=False,
         raise_on_exception=False,
         seed=args.seed,
     )
+    validation_outputs = []
+    for candidate in result.candidates:
+        batch = adapter.evaluate(batch=val_tasks, candidate=candidate, capture_traces=False)
+        rows = [dict(row) for row in batch.outputs]
+        for row in rows:
+            adapter._attach_baseline_metadata(row)  # noqa: SLF001 - selection uses adapter baseline.
+        validation_outputs.append(rows)
+    selected_idx, selection_diagnostics = select_generalizing_candidate(validation_outputs)
+    result_payload = result.to_dict()
+    result_payload["selected_best_idx"] = selected_idx
+    result_payload["selection_diagnostics"] = selection_diagnostics
     result_path = state_root / "gepa_result.json"
     result_path.write_text(
-        json.dumps(result.to_dict(), indent=2, sort_keys=True, default=str) + "\n",
+        json.dumps(result_payload, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
     best_prompt_path = state_root / "best_prompt.txt"
     best_prompt_path.write_text(
-        result.best_candidate.get(HEURISTIC_COMPONENT, "") + "\n",
+        result.candidates[selected_idx].get(HEURISTIC_COMPONENT, "") + "\n",
         encoding="utf-8",
     )
     print(f"[gepa] result: {result_path}")
     print(f"[gepa] best prompt: {best_prompt_path}")
-    print(f"[gepa] best_idx={result.best_idx} best_score={result.val_aggregate_scores[result.best_idx]:.4f}")
+    print(
+        f"[gepa] gepa_best_idx={result.best_idx} selected_best_idx={selected_idx} "
+        f"gepa_best_score={result.val_aggregate_scores[result.best_idx]:.4f}"
+    )
+
+
+def _completed_training_target_summary(state_root: Path) -> dict[str, Any]:
+    """Return the compact result fields needed by the sweep progress artifact."""
+
+    result_path = state_root / "gepa_result.json"
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"GEPA result must be a JSON object: {result_path}")
+    best_idx = int(payload.get("selected_best_idx", payload["best_idx"]))
+    scores = payload.get("val_aggregate_scores")
+    if not isinstance(scores, list) or not 0 <= best_idx < len(scores):
+        raise ValueError(f"GEPA result has an invalid best candidate index: {result_path}")
+    return {
+        "best_idx": best_idx,
+        "best_score": float(scores[best_idx]),
+        "candidate_count": len(payload.get("candidates", [])),
+        "result_path": str(result_path),
+        "best_prompt_path": str(state_root / "best_prompt.txt"),
+    }
+
+
+def run_training_target_sweep(
+    args: argparse.Namespace,
+    *,
+    run_target: Callable[[argparse.Namespace], None] = run_standalone_gepa,
+) -> None:
+    """Run isolated single-environment GEPA experiments under one GPU server.
+
+    The Slurm wrapper owns one local vLLM process. This coordinator reuses that
+    server while giving every manifest target a distinct GEPA state directory,
+    train/validation set, and candidate cache. A target failure is recorded and
+    the sweep continues, then the overall process fails at the end so Slurm does
+    not report a partially completed sweep as successful.
+    """
+
+    manifest_path = args.training_targets_file.expanduser().resolve()
+    targets = load_training_targets(manifest_path)
+    group_state_root = args.state_root.expanduser().resolve()
+    group_state_root.mkdir(parents=True, exist_ok=True)
+    summary_path = group_state_root / "sweep_summary.json"
+    summaries: list[dict[str, Any]] = []
+
+    for index, target in enumerate(targets):
+        game = str(target["game"])
+        level = int(target["level"])
+        target_state_root = training_target_state_root(
+            group_state_root,
+            index=index,
+            game=game,
+            level=level,
+        )
+        target_args = copy.copy(args)
+        target_args.state_root = target_state_root
+        target_args.training_levels = f"{game}:{level}"
+        target_args.training_targets_file = None
+        # A one-target sweep changes only the dataset; it must exercise the same
+        # general proposer and feedback contract used by multi-game training.
+        target_args.allow_case_specific_overfit = False
+        started_at = time.time()
+        summary = {
+            "index": index,
+            "game": game,
+            "level": level,
+            "state_root": str(target_state_root),
+            "status": "running",
+            "source": target,
+        }
+        summaries.append(summary)
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "manifest": str(manifest_path),
+                    "target_count": len(targets),
+                    "targets": summaries,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"[sweep] target {index + 1}/{len(targets)}: {game}:{level} "
+            f"state_root={target_state_root}",
+            flush=True,
+        )
+        try:
+            run_target(target_args)
+            summary.update(_completed_training_target_summary(target_state_root))
+            summary["status"] = "completed"
+        except Exception as exc:  # Keep independent targets running after one failure.
+            summary["status"] = "failed"
+            summary["error"] = f"{type(exc).__name__}: {exc}"
+            print(f"[sweep] target failed: {game}:{level}: {exc}", flush=True)
+        summary["elapsed_seconds"] = time.time() - started_at
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "manifest": str(manifest_path),
+                    "target_count": len(targets),
+                    "targets": summaries,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    failed = [summary for summary in summaries if summary["status"] != "completed"]
+    print(
+        f"[sweep] completed={len(summaries) - len(failed)}/{len(summaries)} "
+        f"summary={summary_path}",
+        flush=True,
+    )
+    if failed:
+        raise RuntimeError(f"{len(failed)} training target(s) failed; see {summary_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -5313,6 +6237,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     parser.add_argument("--script-doctor", type=Path, default=DEFAULT_SCRIPT_DOCTOR)
     parser.add_argument("--levels-per-game", type=int, default=0)
+    parser.add_argument(
+        "--training-levels",
+        type=str,
+        default="",
+        help=(
+            "Optional semicolon-separated game:level,level exact GEPA train set. "
+            "Requested games may come from jobs or eval_jobs for explicit "
+            "single-environment overfitting diagnostics."
+        ),
+    )
+    parser.add_argument(
+        "--training-targets-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON manifest of independent exact game-level GEPA runs. "
+            "Each target receives an isolated state root beneath --state-root."
+        ),
+    )
     parser.add_argument("--max-expansions", type=int, default=DEFAULT_MAX_EXPANSIONS)
     parser.add_argument(
         "--max-gepa-expansions-per-level",
@@ -5332,6 +6275,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--llm-timeout-s", type=float, default=600.0)
     parser.add_argument("--llm-concurrency", type=int, default=16)
+    parser.add_argument(
+        "--synthesis-replicates",
+        type=int,
+        default=1,
+        help="Fresh heuristic generations and searches averaged per logical level.",
+    )
+    parser.add_argument(
+        "--synthesis-backend",
+        choices=("openai", "codex-cli"),
+        default=os.getenv("SYNTHESIS_BACKEND", "openai"),
+    )
+    parser.add_argument(
+        "--synthesis-codex-model",
+        type=str,
+        default=os.getenv("SYNTHESIS_CODEX_MODEL", ""),
+    )
+    parser.add_argument(
+        "--synthesis-agentic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Let Codex synthesis draft and test candidate.py in an isolated workspace.",
+    )
+    parser.add_argument(
+        "--reflection-backend",
+        choices=("same", "codex-cli"),
+        default=os.getenv("REFLECTION_BACKEND", "same"),
+    )
+    parser.add_argument(
+        "--codex-executable",
+        type=str,
+        default=os.getenv("CODEX_EXECUTABLE", "codex"),
+    )
+    parser.add_argument("--codex-model", type=str, default=os.getenv("CODEX_MODEL", ""))
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        type=str,
+        default=os.getenv("CODEX_REASONING_EFFORT", "high"),
+    )
+    parser.add_argument(
+        "--reflection-artifact-tools",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow reflection Codex to browse repository artifacts.",
+    )
+    parser.add_argument(
+        "--optimize-full-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Let GEPA replace the complete synthesis prompt instead of only its addendum.",
+    )
     parser.add_argument("--submit-search-array", action="store_true")
     parser.add_argument(
         "--search-array-script",
@@ -5340,6 +6333,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--search-array-count", type=int, default=101)
     parser.add_argument("--search-array-concurrency", type=int, default=16)
+    parser.add_argument(
+        "--search-pool-dir",
+        type=Path,
+        default=None,
+        help="Shared directory watched by a persistent Slurm search array.",
+    )
     parser.add_argument("--search-poll-interval-s", type=float, default=15.0)
     parser.add_argument(
         "--search-array-stall-timeout-s",
@@ -5424,7 +6423,10 @@ def parse_args() -> argparse.Namespace:
         "--reflection-minibatch-size",
         type=int,
         default=0,
-        help="Use <=0 to evaluate all active levels per GEPA reflection round.",
+        help=(
+            "Levels sampled per GEPA reflection round. Use <=0 for a rotating "
+            f"{DEFAULT_REFLECTION_MAX_RECORDS}-level sample."
+        ),
     )
     parser.add_argument(
         "--initial-gepa-addendum",
@@ -5459,7 +6461,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    run_standalone_gepa(parse_args())
+    args = parse_args()
+    if args.training_targets_file is not None:
+        run_training_target_sweep(args)
+    else:
+        run_standalone_gepa(args)
 
 
 if __name__ == "__main__":

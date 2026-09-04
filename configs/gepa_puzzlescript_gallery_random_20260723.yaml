@@ -1,0 +1,50 @@
+# Fixed-seed sample from script-doctor/data/scraped_games.
+# Seed 20260723; 44 compileable games with >=3 levels; explicit Sokoban names capped at 4.
+# The runner samples 3 levels/game and makes a game-disjoint 75/25 train/dev split.
+jobs:
+- {name: gdd301_test, levels: 3}
+- {name: Magnet_Jack, levels: 6}
+- {name: Metal_and_Grass, levels: 8}
+- {name: coincounter, levels: 11}
+- {name: Festive_Lights, levels: 11}
+- {name: Wrap, levels: 14}
+- {name: FACED, levels: 54}
+- {name: Collapse, levels: 7}
+- {name: Stairways, levels: 6}
+- {name: City_Founder, levels: 9}
+- {name: mijn_puzzelspel, levels: 6}
+- {name: Winter, levels: 54}
+- {name: Microbe_Destroyers, levels: 16}
+- {name: Memories_Of_Castlemouse, levels: 24}
+- {name: Minimalist, levels: 21}
+- {name: Shared_Bridges_Game, levels: 9}
+- {name: The_Irrigation_Game, levels: 23}
+- {name: blockfaker, levels: 10}
+- {name: "ESCAPE!", levels: 12}
+- {name: KidsCoding, levels: 16}
+- {name: Quantum_Childminding, levels: 12}
+- {name: Dash_Boulder, levels: 9}
+- {name: One_Way_Street, levels: 5}
+- {name: silver_lungs, levels: 7}
+- {name: icecrates, levels: 13}
+- {name: Running_out_of_space_and_into_your_spaceship, levels: 6}
+- {name: Emerita, levels: 16}
+- {name: dreizack, levels: 9}
+- {name: Roze, levels: 3}
+- {name: Pivotal, levels: 23}
+- {name: Veggie_Jam, levels: 6}
+- {name: Graded_Sir, levels: 6}
+
+eval_jobs:
+- {name: Crafting_Table, levels: 4}
+- {name: Bat_Loves_Lava_Shark, levels: 7}
+- {name: Fractured_Identity, levels: 32}
+- {name: Skull_Contraption, levels: 15}
+- {name: Good_Example, levels: 3}
+- {name: Cratopia, levels: 27}
+- {name: Random_Color_Maze, levels: 28}
+- {name: Impasse, levels: 24}
+- {name: "_____", levels: 41}
+- {name: Pulling_Box_Sokoban, levels: 21}
+- {name: Filler, levels: 145}
+- {name: Zombie_Invasion, levels: 8}

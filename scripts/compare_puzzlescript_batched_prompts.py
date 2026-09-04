@@ -28,6 +28,7 @@ from scripts.run_puzzlescript_batched_gepa import (  # noqa: E402
     DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S,
     HEURISTIC_COMPONENT,
     PUZZLESCRIPT_HEURISTIC_CONTRACT,
+    CodexCLITextClient,
     OpenAITextClient,
     PuzzleScriptBatchedGEPAAdapter,
     PuzzleScriptEvaluator,
@@ -36,6 +37,27 @@ from scripts.run_puzzlescript_batched_gepa import (  # noqa: E402
     load_env_grid,
     parse_extra_sbatch_args,
 )
+
+
+def build_synthesis_client(args: argparse.Namespace) -> Any:
+    """Build the same heuristic-synthesis backend used during GEPA training."""
+    if args.synthesis_backend == "codex-cli":
+        return CodexCLITextClient(
+            model=args.synthesis_codex_model,
+            timeout_s=args.llm_timeout_s,
+            executable=args.codex_executable,
+            reasoning_effort=args.codex_reasoning_effort,
+            agentic_workspace=getattr(args, "synthesis_agentic", True),
+        )
+    return OpenAITextClient(
+        model=args.model,
+        base_url=args.openai_base_url,
+        api_key=args.openai_api_key,
+        max_tokens=args.max_model_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        timeout_s=args.llm_timeout_s,
+    )
 
 
 def output_summary(label: str, outputs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -339,15 +361,7 @@ def run_holdout_comparison(args: argparse.Namespace) -> None:
         encoding="utf-8",
     )
 
-    llm = OpenAITextClient(
-        model=args.model,
-        base_url=args.openai_base_url,
-        api_key=args.openai_api_key,
-        max_tokens=args.max_model_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        timeout_s=args.llm_timeout_s,
-    )
+    llm = build_synthesis_client(args)
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=llm,
         state_root=state_root,
@@ -360,9 +374,11 @@ def run_holdout_comparison(args: argparse.Namespace) -> None:
             poll_interval_s=args.search_poll_interval_s,
             stall_timeout_s=args.search_array_stall_timeout_s,
             extra_sbatch_args=parse_extra_sbatch_args(args.extra_sbatch_args),
+            pool_dir=args.search_pool_dir,
         ),
         llm_concurrency=args.llm_concurrency,
         astar_timeout_s=max(1.0, args.astar_timeout_s),
+        synthesis_replicates=max(1, args.synthesis_replicates),
     )
 
     print(f"[holdout] tasks={len(tasks)} state_root={state_root}", flush=True)
@@ -448,6 +464,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--llm-timeout-s", type=float, default=600.0)
     parser.add_argument("--llm-concurrency", type=int, default=16)
+    parser.add_argument("--synthesis-replicates", type=int, default=1)
+    parser.add_argument(
+        "--synthesis-backend",
+        choices=("openai", "codex-cli"),
+        default=os.getenv("SYNTHESIS_BACKEND", "openai"),
+    )
+    parser.add_argument(
+        "--synthesis-codex-model",
+        type=str,
+        default=os.getenv("SYNTHESIS_CODEX_MODEL", ""),
+    )
+    parser.add_argument(
+        "--synthesis-agentic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--codex-executable",
+        type=str,
+        default=os.getenv("CODEX_EXECUTABLE", "codex"),
+    )
+    parser.add_argument(
+        "--codex-reasoning-effort",
+        type=str,
+        default=os.getenv("CODEX_REASONING_EFFORT", "high"),
+    )
     parser.add_argument("--submit-search-array", action="store_true")
     parser.add_argument(
         "--search-array-script",
@@ -456,6 +498,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--search-array-count", type=int, default=101)
     parser.add_argument("--search-array-concurrency", type=int, default=16)
+    parser.add_argument("--search-pool-dir", type=Path, default=None)
     parser.add_argument("--search-poll-interval-s", type=float, default=15.0)
     parser.add_argument(
         "--search-array-stall-timeout-s",

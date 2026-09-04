@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -9,7 +10,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts.compare_puzzlescript_batched_prompts import compare_prompt_outputs
+from llm_desparsifier.search.puzzlescript_adapter import win_condition_progress
+from scripts.compare_puzzlescript_batched_prompts import (
+    build_synthesis_client,
+    compare_prompt_outputs,
+)
+from scripts.plot_puzzlescript_paper_results import write_paper_plots
 from scripts.run_puzzlescript_batched_gepa import (
     DEFAULT_LLM_TEMPERATURE,
     DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS,
@@ -19,12 +25,15 @@ from scripts.run_puzzlescript_batched_gepa import (
     DEFAULT_REFLECTION_MAX_RECORDS,
     GEPA_ADDENDUM_HEADER,
     PUZZLESCRIPT_HEURISTIC_CONTRACT,
+    CodexCLITextClient,
     PuzzleScriptBatchedGEPAAdapter,
     PuzzleScriptLevelTask,
     SearchArrayConfig,
     SearchArrayStalledError,
     _common_solve_code_shape_diagnostic_line,
+    _gepa_iteration_limit_reached,
     adjusted_candidate_scores,
+    aggregate_replicate_results,
     assigned_tasks,
     build_reflection_feedback,
     build_repair_prompt,
@@ -37,17 +46,25 @@ from scripts.run_puzzlescript_batched_gepa import (
     context_retry_max_tokens,
     evaluate_manifest_shards_locally,
     evaluate_search_task_with_wall_timeout,
+    filter_unlearnable_tasks,
     heuristic_code_shape,
     load_scoring_baseline_outputs,
+    load_training_targets,
     local_search_fallback_workers,
     merge_validation_guard_tasks,
     parse_guard_level_selection,
+    publish_search_pool_manifest,
     read_initial_gepa_addendum,
+    run_training_target_sweep,
+    select_generalizing_candidate,
+    select_jobs_for_training_levels,
     select_reflection_traces,
     select_training_guard_tasks,
     split_train_dev_jobs,
     strip_outer_markdown_fences,
     trace_classification,
+    trace_partial_progress_score,
+    training_target_state_root,
     validate_heuristic_code,
     wait_for_shards,
 )
@@ -70,6 +87,247 @@ class _FakeLLM:
     def complete(self, prompt: str) -> str:
         self.prompts.append(prompt)
         return self.response
+
+
+class _SequenceLLM(_FakeLLM):
+    def __init__(self, responses: list[str]) -> None:
+        super().__init__("")
+        self.responses = iter(responses)
+
+    def complete(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return next(self.responses)
+
+
+def test_zero_global_gates_leave_local_pareto_scores_untouched() -> None:
+    rows = [
+        {
+            "game": "g",
+            "level": 0,
+            "score": 0.0,
+            "solved": False,
+            "baseline_score": 0.5,
+            "baseline_solved": True,
+            "expanded": 1000,
+            "baseline_expanded": 10,
+        },
+        {
+            "game": "g",
+            "level": 1,
+            "score": 0.5,
+            "solved": True,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+            "expanded": 10,
+            "baseline_expanded": 1000,
+        },
+        {
+            "game": "g",
+            "level": 2,
+            "score": 0.5,
+            "solved": True,
+            "baseline_score": 0.5,
+            "baseline_solved": True,
+            "expanded": 400,
+            "baseline_expanded": 100,
+        },
+        {
+            "game": "g",
+            "level": 3,
+            "score": 0.5,
+            "solved": True,
+            "baseline_score": 0.5,
+            "baseline_solved": True,
+            "expanded": 100,
+            "baseline_expanded": 100,
+        },
+    ]
+
+    scores = adjusted_candidate_scores(
+        rows,
+        global_lost_solve_gate_penalty=0.0,
+        global_net_solve_loss_gate_penalty=0.0,
+    )
+
+    assert scores[1] > 0.0
+    assert scores[2] < 0.0
+    assert scores[3] == pytest.approx(0.0)
+
+
+def test_replicate_aggregation_tracks_solve_probability_and_solved_efficiency() -> None:
+    task = PuzzleScriptLevelTask(
+        task_id=7,
+        game="game",
+        level=2,
+        budget=1000,
+        env_description="description",
+        game_text_path="game.txt",
+    )
+    rows = [
+        {
+            "solved": True,
+            "score": 0.8,
+            "expanded": 100,
+            "generated": 150,
+            "solution_length": 8,
+            "heuristic_code_path": "a.py",
+        },
+        {
+            "solved": False,
+            "score": 0.0,
+            "expanded": 1000,
+            "generated": 1400,
+            "solution_length": 0,
+            "heuristic_code_path": "b.py",
+            "synthesis_error": "bad code",
+        },
+        {
+            "solved": True,
+            "score": 0.6,
+            "expanded": 300,
+            "generated": 450,
+            "solution_length": 10,
+            "heuristic_code_path": "c.py",
+        },
+    ]
+
+    result = aggregate_replicate_results(task, rows)
+
+    assert result["replicate_count"] == 3
+    assert result["solve_rate"] == pytest.approx(2 / 3)
+    assert result["solved_expanded_mean"] == pytest.approx(200.0)
+    assert result["expanded"] == pytest.approx(1400 / 3)
+    assert result["candidate_error_rate"] == pytest.approx(1 / 3)
+
+
+def test_codex_cli_text_client_uses_structured_stateless_exec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        observed["command"] = command
+        observed["input"] = kwargs["input"]
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text('{"text":"generated proposal"}', encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("scripts.run_puzzlescript_batched_gepa.subprocess.run", fake_run)
+    client = CodexCLITextClient(
+        model="test-codex-model",
+        timeout_s=30.0,
+        executable="codex-test",
+        reasoning_effort="high",
+    )
+
+    assert client.complete("improve the prompt") == "generated proposal"
+    command = observed["command"]
+    assert isinstance(command, list)
+    assert command[:2] == ["codex-test", "exec"]
+    assert "--ephemeral" in command
+    assert ["--sandbox", "read-only"] == command[
+        command.index("--sandbox") : command.index("--sandbox") + 2
+    ]
+    assert ["--model", "test-codex-model"] == command[
+        command.index("--model") : command.index("--model") + 2
+    ]
+    assert command[-1] == "-"
+    assert "Do not inspect files" in str(observed["input"])
+
+
+def test_codex_cli_text_client_can_inspect_trace_artifacts_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        observed["command"] = command
+        observed["cwd"] = kwargs["cwd"]
+        observed["input"] = kwargs["input"]
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text('{"text":"trace-grounded proposal"}', encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("scripts.run_puzzlescript_batched_gepa.subprocess.run", fake_run)
+    client = CodexCLITextClient(
+        model="test-codex-model",
+        timeout_s=30.0,
+        working_directory=tmp_path,
+        allow_read_tools=True,
+    )
+
+    assert client.complete("inspect /trace/scored_results.json") == "trace-grounded proposal"
+    command = observed["command"]
+    assert isinstance(command, list)
+    assert "shell_tool" not in command
+    assert observed["cwd"] == tmp_path
+    assert "read-only shell tools" in str(observed["input"])
+
+
+def test_codex_cli_text_client_agentic_synthesis_is_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        observed["command"] = command
+        observed["cwd"] = kwargs["cwd"]
+        observed["input"] = kwargs["input"]
+        observed["has_timeout"] = "timeout" in kwargs
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text('{"text":"def heuristic_cost_to_go(ts, env_params, ctx): return 0.0"}')
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("scripts.run_puzzlescript_batched_gepa.subprocess.run", fake_run)
+    client = CodexCLITextClient(model="luna", timeout_s=30.0, agentic_workspace=True)
+
+    client.complete("write a heuristic")
+    command = observed["command"]
+    assert isinstance(command, list)
+    assert "shell_tool" not in command
+    assert ["--sandbox", "workspace-write"] == command[
+        command.index("--sandbox") : command.index("--sandbox") + 2
+    ]
+    assert Path(str(observed["cwd"])).name.startswith("gepa-codex-")
+    assert "candidate.py" in str(observed["input"])
+    assert observed["has_timeout"] is False
+
+
+def test_publish_search_pool_manifest_is_atomic(tmp_path: Path) -> None:
+    manifest = tmp_path / "eval" / "search_manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text("{}")
+
+    pointer = publish_search_pool_manifest(tmp_path / "pool", manifest)
+
+    assert pointer.read_text().strip() == str(manifest.resolve())
+    assert not list(pointer.parent.glob("*.tmp"))
+
+
+def test_win_condition_progress_is_rule_derived_and_dense() -> None:
+    positions = {
+        "crate": [(1, 1), (2, 2)],
+        "target": [(1, 1), (3, 3)],
+        "hazard": [(4, 4)],
+    }
+    winconditions = [
+        {"num": 1, "mask1_names": ["crate"], "mask2_names": ["target"]},
+        {"num": -1, "mask1_names": ["crate"], "mask2_names": ["hazard"]},
+    ]
+
+    assert win_condition_progress(winconditions, positions) == pytest.approx(0.75)
+
+
+def test_trace_partial_progress_uses_best_and_late_rule_progress() -> None:
+    trace = {
+        "root_snapshot": {"progress_score": 0.1},
+        "sampled_states": [{"snapshot": {"progress_score": 0.2}}],
+        "best_progress_snapshot": {"progress_score": 0.8},
+        "late_states": [{"snapshot": {"progress_score": 0.6}}],
+    }
+
+    assert trace_partial_progress_score(trace) == pytest.approx(0.8)
 
 
 def test_strip_outer_markdown_fences_accepts_python_fence() -> None:
@@ -314,6 +572,118 @@ def test_build_train_dev_tasks_rejects_invalid_dev_fraction() -> None:
         build_train_dev_tasks(tasks, dev_fraction=1.0, seed=0)
 
 
+def test_select_jobs_for_training_levels_can_promote_eval_game() -> None:
+    train_jobs = [{"name": "train-game"}]
+    eval_jobs = [{"name": "heldout-game"}, {"name": "unused-heldout-game"}]
+
+    selected = select_jobs_for_training_levels(
+        train_jobs,
+        eval_jobs,
+        {"heldout-game": [3]},
+    )
+
+    assert selected == [{"name": "heldout-game"}]
+
+
+def test_select_jobs_for_training_levels_keeps_default_train_boundary() -> None:
+    train_jobs = [{"name": "train-game"}]
+    eval_jobs = [{"name": "heldout-game"}]
+
+    selected = select_jobs_for_training_levels(train_jobs, eval_jobs, {})
+
+    assert selected == train_jobs
+
+
+def test_load_training_targets_accepts_manifest_object(tmp_path: Path) -> None:
+    manifest = tmp_path / "targets.json"
+    manifest.write_text(
+        """{
+  "source": "holdout comparison",
+  "targets": [
+    {"game": "Beam_Islands", "level": 3, "score_delta": -0.9},
+    {"game": "Darkness_Sokoban", "level": 0, "score_delta": -0.1}
+  ]
+}""",
+        encoding="utf-8",
+    )
+
+    targets = load_training_targets(manifest)
+
+    assert [(target["game"], target["level"]) for target in targets] == [
+        ("Beam_Islands", 3),
+        ("Darkness_Sokoban", 0),
+    ]
+    assert targets[0]["score_delta"] == -0.9
+
+
+def test_load_training_targets_rejects_duplicate_game_level(tmp_path: Path) -> None:
+    manifest = tmp_path / "targets.json"
+    manifest.write_text(
+        '[{"game": "Beam_Islands", "level": 3}, '
+        '{"game": "Beam_Islands", "level": 3}]',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        load_training_targets(manifest)
+
+
+def test_training_target_state_root_is_stable_and_filesystem_safe(tmp_path: Path) -> None:
+    state_root = training_target_state_root(
+        tmp_path,
+        index=2,
+        game="Push / Pull: Test",
+        level=7,
+    )
+
+    assert state_root == tmp_path / "targets" / "02-push-pull-test-level-07"
+
+
+def test_run_training_target_sweep_isolates_each_gepa_state(tmp_path: Path) -> None:
+    manifest = tmp_path / "targets.json"
+    manifest.write_text(
+        '[{"game": "Beam_Islands", "level": 3}, '
+        '{"game": "Darkness_Sokoban", "level": 0}]',
+        encoding="utf-8",
+    )
+    seen: list[tuple[Path, str, bool]] = []
+
+    def fake_run_target(args: SimpleNamespace) -> None:
+        args.state_root.mkdir(parents=True)
+        seen.append(
+            (args.state_root, args.training_levels, args.allow_case_specific_overfit)
+        )
+        (args.state_root / "gepa_result.json").write_text(
+            '{"best_idx": 0, "val_aggregate_scores": [0.5], "candidates": [{}]}',
+            encoding="utf-8",
+        )
+        (args.state_root / "best_prompt.txt").write_text("prompt", encoding="utf-8")
+
+    group_root = tmp_path / "sweep"
+    run_training_target_sweep(
+        SimpleNamespace(
+            training_targets_file=manifest,
+            state_root=group_root,
+            training_levels="",
+        ),
+        run_target=fake_run_target,
+    )
+
+    assert seen == [
+        (group_root / "targets" / "00-beam-islands-level-03", "Beam_Islands:3", False),
+        (
+            group_root / "targets" / "01-darkness-sokoban-level-00",
+            "Darkness_Sokoban:0",
+            False,
+        ),
+    ]
+    summary = json.loads((group_root / "sweep_summary.json").read_text(encoding="utf-8"))
+    assert [target["status"] for target in summary["targets"]] == [
+        "completed",
+        "completed",
+    ]
+
+
 def test_trace_classification_flags_moderate_solved_efficiency_regression() -> None:
     trace = {
         "result": {
@@ -470,6 +840,46 @@ def test_candidate_score_rewards_large_net_solve_gain_by_default() -> None:
     assert candidate_score(outputs) > 0.0
 
 
+def test_candidate_score_keeps_any_net_solve_gain_positive() -> None:
+    outputs = [
+        {
+            "game": "new",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 100,
+            "baseline_score": 0.0,
+            "baseline_solved": False,
+            "baseline_expanded": 10_000,
+        },
+        {
+            "game": "slow-a",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 10_000,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "baseline_expanded": 10,
+        },
+        {
+            "game": "slow-b",
+            "score": 0.9,
+            "solved": True,
+            "expanded": 10_000,
+            "baseline_score": 0.9,
+            "baseline_solved": True,
+            "baseline_expanded": 10,
+        },
+    ]
+
+    assert candidate_score(
+        outputs,
+        score_delta_weight=0.0,
+        common_solve_efficiency_weight=2.0,
+        common_solve_efficiency_clip=2.0,
+        new_solve_bonus=1.0,
+    ) > 0.0
+
+
 def test_candidate_scores_penalize_common_solve_expansion_slowdowns() -> None:
     outputs = [
         {
@@ -580,7 +990,7 @@ def test_candidate_scores_penalize_severe_low_headroom_slowdowns() -> None:
     assert scores[0] <= -0.9
 
 
-def test_candidate_score_penalizes_negative_mean_common_solve_efficiency() -> None:
+def test_candidate_score_uses_efficiency_without_overriding_net_solve_gain() -> None:
     outputs = [
         {
             "game": "new",
@@ -619,10 +1029,15 @@ def test_candidate_score_penalizes_negative_mean_common_solve_efficiency() -> No
         new_solve_bonus=4.0,
     )
 
-    assert score < 0.0
+    assert 0.0 < score < candidate_score(
+        outputs,
+        score_delta_weight=0.0,
+        common_solve_efficiency_weight=0.0,
+        new_solve_bonus=4.0,
+    )
 
 
-def test_candidate_score_uses_headroom_weighted_mean_efficiency_gate() -> None:
+def test_candidate_score_uses_headroom_weighted_efficiency_as_tiebreaker() -> None:
     outputs = [
         {
             "game": "new",
@@ -664,7 +1079,12 @@ def test_candidate_score_uses_headroom_weighted_mean_efficiency_gate() -> None:
         new_solve_bonus=4.0,
     )
 
-    assert score < 0.0
+    assert 0.0 < score < candidate_score(
+        outputs,
+        score_delta_weight=0.0,
+        common_solve_efficiency_weight=0.0,
+        new_solve_bonus=4.0,
+    )
 
 
 def test_candidate_score_does_not_reward_equal_new_lost_from_efficiency() -> None:
@@ -1509,18 +1929,111 @@ def test_make_reflective_dataset_aggregate_reports_code_shape_losses(
     assert "uses_action_transition_terms=1" in aggregate["Feedback"]
 
 
-def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
-    llm = _FakeLLM(
-        "Addendum: keep mechanics-specific object names primary and use score only as a tie-breaker."
+def test_aggregate_code_shape_losses_ignore_helpful_drops(tmp_path: Path) -> None:
+    base_code = tmp_path / "base_assignment.py"
+    base_code.write_text(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    remaining_crates = ctx.get('object_positions', {}).get('crate', [])\n"
+        "    remaining_targets = ctx.get('object_positions', {}).get('target', [])\n"
+        "    best_sum = 0\n"
+        "    for perm in permutations(remaining_crates):\n"
+        "        best_sum += len(remaining_targets)\n"
+        "    return float(best_sum)\n",
+        encoding="utf-8",
+    )
+    generated_code = (
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+        "    crates = ctx.get('object_positions', {}).get('crate', [])\n"
+        "    return float(len(crates))\n"
     )
     adapter = PuzzleScriptBatchedGEPAAdapter(
-        llm=llm,  # type: ignore[arg-type]
+        llm=object(),  # type: ignore[arg-type]
         state_root=Path("/tmp/gepa-state"),
         script_doctor=Path("/tmp/script-doctor"),
         search_config=SimpleNamespace(),  # type: ignore[arg-type]
         llm_concurrency=1,
         astar_timeout_s=1.0,
     )
+    eval_batch = SimpleNamespace(
+        trajectories=[
+            {
+                "task": {
+                    "game": "helpful-drop",
+                    "level": 0,
+                    "budget": 100,
+                    "env_description": "All target on crate.",
+                },
+                "heuristic_code": generated_code,
+                "synthesis_error": None,
+                "result": {
+                    "score": 0.95,
+                    "solved": True,
+                    "expanded": 80,
+                    "baseline_score": 0.85,
+                    "baseline_solved": True,
+                    "baseline_expanded": 500,
+                    "baseline_heuristic_code_path": str(base_code),
+                    "adjusted_score": 0.6,
+                },
+            },
+            {
+                "task": {
+                    "game": "harmful-drop",
+                    "level": 1,
+                    "budget": 100,
+                    "env_description": "All target on crate.",
+                },
+                "heuristic_code": generated_code,
+                "synthesis_error": None,
+                "result": {
+                    "score": 0.60,
+                    "solved": True,
+                    "expanded": 500,
+                    "baseline_score": 0.90,
+                    "baseline_solved": True,
+                    "baseline_expanded": 100,
+                    "baseline_heuristic_code_path": str(base_code),
+                    "adjusted_score": -0.4,
+                },
+            },
+        ]
+    )
+
+    dataset = adapter.make_reflective_dataset(
+        candidate={},
+        eval_batch=eval_batch,
+        components_to_update=["heuristic_prompt"],
+    )
+
+    aggregate = dataset["heuristic_prompt"][0]
+    assert aggregate["Comparison"]["code_shape_loss_counts"]["uses_assignment_matching"] == 1
+    assert "uses_assignment_matching=1" in aggregate["Feedback"]
+
+
+def test_hybrid_routes_local_synthesis_and_codex_proposals(tmp_path: Path) -> None:
+    synthesis_llm = _FakeLLM(
+        "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 0.0"
+    )
+    proposal_llm = _FakeLLM(
+        "Addendum: keep mechanics-specific object names primary and use score only as a tie-breaker."
+    )
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=synthesis_llm,  # type: ignore[arg-type]
+        proposal_llm=proposal_llm,  # type: ignore[arg-type]
+        state_root=tmp_path,
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+
+    adapter._synthesize_batch(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        batch=[PuzzleScriptLevelTask(0, "game", 0, 10, "description", "game.txt")],
+        eval_dir=tmp_path,
+    )
+    assert len(synthesis_llm.prompts) == 1
+    assert proposal_llm.prompts == []
 
     result = adapter.propose_new_texts(
         candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
@@ -1539,21 +2052,22 @@ def test_custom_proposer_requests_short_base_anchored_addendum() -> None:
         PUZZLESCRIPT_HEURISTIC_CONTRACT.rstrip() + "\n\n" + GEPA_ADDENDUM_HEADER
     )
     assert "keep mechanics-specific object names primary" in result["heuristic_prompt"]
-    assert "short addendum" in llm.prompts[0]
-    assert "Do not rewrite the full base prompt" in llm.prompts[0]
-    assert "Do not return the base prompt unchanged" in llm.prompts[0]
-    assert "one human heuristic designer's reusable decision procedure" in llm.prompts[0]
-    assert "train/validation performance" in llm.prompts[0]
-    assert "GEPA may" in llm.prompts[0]
-    assert "self-discover categories" in llm.prompts[0]
-    assert "Prompt-internal if-statements" in llm.prompts[0]
-    assert "runner will not implement buckets in code" in llm.prompts[0]
-    assert "repeated solved-efficiency regressions" in llm.prompts[0]
-    assert "preserve base passability/reachability" in llm.prompts[0]
-    assert "candidate added or over-weighted" in llm.prompts[0]
-    assert "preconditioned reasoning" in llm.prompts[0]
-    assert "missing goal objects" in llm.prompts[0]
-    assert "REGRESSION" in llm.prompts[0]
+    assert len(synthesis_llm.prompts) == 1
+    assert "short addendum" in proposal_llm.prompts[0]
+    assert "Do not rewrite the full base prompt" in proposal_llm.prompts[0]
+    assert "Do not return the base prompt unchanged" in proposal_llm.prompts[0]
+    assert "one human heuristic designer's reusable decision procedure" in proposal_llm.prompts[0]
+    assert "train/validation performance" in proposal_llm.prompts[0]
+    assert "GEPA may" in proposal_llm.prompts[0]
+    assert "self-discover categories" in proposal_llm.prompts[0]
+    assert "Prompt-internal if-statements" in proposal_llm.prompts[0]
+    assert "runner will not implement buckets in code" in proposal_llm.prompts[0]
+    assert "repeated solved-efficiency regressions" in proposal_llm.prompts[0]
+    assert "preserve base passability/reachability" in proposal_llm.prompts[0]
+    assert "candidate added or over-weighted" in proposal_llm.prompts[0]
+    assert "preconditioned reasoning" in proposal_llm.prompts[0]
+    assert "missing goal objects" in proposal_llm.prompts[0]
+    assert "REGRESSION" in proposal_llm.prompts[0]
 
 
 def test_custom_proposer_includes_current_addendum_when_revising() -> None:
@@ -1593,6 +2107,62 @@ def test_custom_proposer_includes_current_addendum_when_revising() -> None:
     assert current_addendum in llm.prompts[0]
     assert "Output a replacement addendum" in llm.prompts[0]
     assert "preserve the useful part" in llm.prompts[0]
+
+
+def test_custom_proposer_replaces_duplicate_in_general_mode() -> None:
+    llm = _FakeLLM("Prefer exact LEGEND aliases before generic roles.")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    dataset = {
+        "heuristic_prompt": [
+            {
+                "Comparison": {"classification": "lost_baseline_solve"},
+                "Feedback": "REGRESSION: base prompt solved but candidate failed.",
+            }
+        ]
+    }
+
+    first = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset=dataset,
+        components_to_update=["heuristic_prompt"],
+    )
+    second = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset=dataset,
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert second["heuristic_prompt"] != first["heuristic_prompt"]
+
+
+def test_custom_proposer_receives_recent_candidate_outcomes() -> None:
+    llm = _FakeLLM("Prefer exact LEGEND aliases before generic roles.")
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    adapter.candidate_outcome_history = [
+        "candidate=abc123 tasks=140 score=-0.25 new_solves=4 lost_solves=5"
+    ]
+
+    adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={"heuristic_prompt": []},
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "candidate=abc123 tasks=140 score=-0.25 new_solves=4 lost_solves=5" in llm.prompts[0]
 
 
 def test_custom_proposer_fallback_preserves_current_addendum_when_repairing_errors() -> None:
@@ -1921,6 +2491,58 @@ def test_custom_proposer_extracts_addendum_from_full_prompt_output() -> None:
 
     assert result["heuristic_prompt"] != PUZZLESCRIPT_HEURISTIC_CONTRACT
     assert "Prefer exact LEGEND names" in result["heuristic_prompt"]
+
+
+def test_full_prompt_proposer_can_rewrite_every_instruction() -> None:
+    replacement = (
+        "Study the supplied game and write one finite non-negative Python heuristic. "
+        "Return only the function and return zero for a winning state."
+    )
+    llm = _FakeLLM(replacement)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+        optimize_full_prompt=True,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={"heuristic_prompt": []},
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] == replacement
+    assert "rewrite the entire prompt" in llm.prompts[0].lower()
+
+
+def test_full_prompt_proposer_retries_noop_and_duplicate_with_distinct_focus() -> None:
+    replacement = "Write a compact, mechanics-derived heuristic and return only Python code."
+    llm = _SequenceLLM(
+        [PUZZLESCRIPT_HEURISTIC_CONTRACT, PUZZLESCRIPT_HEURISTIC_CONTRACT, replacement]
+    )
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+        optimize_full_prompt=True,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={"heuristic_prompt": []},
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] == replacement
+    assert len(llm.prompts) == 3
+    assert len(set(llm.prompts)) == 3
 
 
 def test_custom_proposer_uses_persistent_failure_exploration_for_noop_output() -> None:
@@ -2550,6 +3172,117 @@ def test_custom_proposer_uses_reachability_overfit_fallback_for_noop_output() ->
     assert "player-only" in result["heuristic_prompt"]
 
 
+def test_case_specific_overfit_can_drop_a_regressed_seed_addendum() -> None:
+    seed = build_seed_candidate("Use an intentionally bad case-wide shortcut.")
+    llm = _FakeLLM(seed["heuristic_prompt"])
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+        allow_case_specific_overfit=True,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate=seed,
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Inputs": {"game": "Beam_Islands", "level": 3},
+                    "Comparison": {"classification": "lost_baseline_solve"},
+                    "Baseline Output": {"heuristic_code": "return baseline_distance"},
+                    "Feedback": "The base solved, but the seeded prompt failed.",
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"].strip() == PUZZLESCRIPT_HEURISTIC_CONTRACT.strip()
+    assert "single-case overfitting diagnostic" in llm.prompts[0]
+    assert "Memorization is allowed" in llm.prompts[0]
+
+
+def test_case_specific_overfit_carries_baseline_code_after_base_noop() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+        allow_case_specific_overfit=True,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Inputs": {"game": "Beam_Islands", "level": 3},
+                    "Comparison": {"classification": "solved_regression"},
+                    "Baseline Output": {
+                        "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+                        "    return 10.0 * len(ctx.get('beam', [])) + "
+                        "(1.0 - ctx.get('score_normalized', 0.0)) * 5.0"
+                    },
+                    "Feedback": "The fresh base expanded more states than its reference.",
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert "Beam_Islands level 3" in result["heuristic_prompt"]
+    assert "known-successful baseline heuristic" in result["heuristic_prompt"]
+    assert "return 10.0 * len" in result["heuristic_prompt"]
+    assert "omit the score_normalized penalty" in result["heuristic_prompt"]
+
+
+def test_case_specific_overfit_replaces_a_repeated_rejected_proposal() -> None:
+    repeated_addendum = "Use the same rejected Beam distance formula again."
+    llm = _FakeLLM(repeated_addendum)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+        allow_case_specific_overfit=True,
+    )
+    records = {
+        "heuristic_prompt": [
+            {
+                "Inputs": {"game": "Beam_Islands", "level": 3},
+                "Comparison": {"classification": "solved_regression"},
+                "Baseline Output": {
+                    "heuristic_code": "def heuristic_cost_to_go(ts, env_params, ctx):\n"
+                    "    return 10.0 * len(ctx.get('beam', []))"
+                },
+            }
+        ]
+    }
+
+    first = adapter.propose_new_texts(
+        candidate=build_seed_candidate("Current accepted parent."),
+        reflective_dataset=records,
+        components_to_update=["heuristic_prompt"],
+    )
+    second = adapter.propose_new_texts(
+        candidate=build_seed_candidate("A different accepted parent."),
+        reflective_dataset=records,
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert repeated_addendum in first["heuristic_prompt"]
+    assert "known-successful baseline heuristic" in second["heuristic_prompt"]
+    assert "return 10.0 * len" in second["heuristic_prompt"]
+
+
 def test_custom_proposer_uses_reachability_overfit_fallback_for_solved_regression() -> None:
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
@@ -2969,6 +3702,21 @@ def test_initial_addendum_file_preserves_prompt_routing_text(tmp_path: Path) -> 
     assert resolved == addendum
     assert "If categories, conditionals, or routing are useful" in prompt
     assert "COLLISIONLAYERS, and state properties" in prompt
+
+
+def test_initial_addendum_file_accepts_full_seed_prompt(tmp_path: Path) -> None:
+    prompt_path = tmp_path / "best_prompt.txt"
+    prompt_path.write_text(
+        PUZZLESCRIPT_HEURISTIC_CONTRACT
+        + "\n\n"
+        + GEPA_ADDENDUM_HEADER
+        + "\nPreserve quantitative win-condition terms.",
+        encoding="utf-8",
+    )
+
+    resolved = read_initial_gepa_addendum("", prompt_path)
+
+    assert resolved == "Preserve quantitative win-condition terms."
 
 
 def test_code_contract_seed_file_builds_valid_prompt() -> None:
@@ -3433,6 +4181,15 @@ def test_nonbaseline_candidate_evaluation_reuses_exact_candidate_task_outputs(
     assert (eval_dirs[1] / "candidate_reuse.json").exists()
 
 
+def test_candidate_hash_ignores_surrounding_prompt_whitespace() -> None:
+    first = {"heuristic_prompt": "same prompt"}
+    second = {"heuristic_prompt": "\n  same prompt  \n"}
+
+    assert PuzzleScriptBatchedGEPAAdapter._candidate_hash(first) == (
+        PuzzleScriptBatchedGEPAAdapter._candidate_hash(second)
+    )
+
+
 def test_nonbaseline_candidate_evaluation_reuses_overlapping_task_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3550,6 +4307,86 @@ def test_build_reflection_feedback_includes_trace_diagnostics_for_solved_regress
     assert "Candidate trace diagnostics" in feedback
     assert "progress_range=0.200..0.500" in feedback
     assert "open_set_size_at_end=17" in feedback
+
+
+def test_reflection_feedback_compares_replicates_and_baseline_trace() -> None:
+    feedback = build_reflection_feedback(
+        {
+            "solved": False,
+            "solve_rate": 0.2,
+            "replicate_count": 5,
+            "expanded": 900,
+            "replicate_expansions": [800, 900, 1000],
+            "trace_summary": {"terminated_reason": "expansion_budget"},
+            "baseline_solved": True,
+            "baseline_solve_rate": 0.8,
+            "baseline_replicate_count": 5,
+            "baseline_expanded": 300,
+            "baseline_replicate_expansions": [250, 300, 350],
+            "baseline_trace_summary": {"terminated_reason": "solved"},
+        },
+        "lost_baseline_solve",
+    )
+
+    assert "solve_rate=0.800" in feedback
+    assert "solve_rate=0.200" in feedback
+    assert "baseline_termination=solved" in feedback
+    assert "candidate_termination=expansion_budget" in feedback
+    assert "baseline_expansions=[250, 300, 350]" in feedback
+
+
+def test_filter_unlearnable_tasks_drops_only_exhaustive_state_spaces() -> None:
+    tasks = [
+        PuzzleScriptLevelTask(i, "g", i, 100, "env", "/tmp/game.txt")
+        for i in range(3)
+    ]
+    baseline = [
+        {
+            "game": "g",
+            "level": 0,
+            "replicate_results": [
+                {"trace_summary": {"terminated_reason": "open_set_exhausted"}},
+                {"trace_summary": {"terminated_reason": "open_set_exhausted"}},
+            ],
+        },
+        {
+            "game": "g",
+            "level": 1,
+            "replicate_results": [
+                {"trace_summary": {"terminated_reason": "expansion_budget"}}
+            ],
+        },
+        {"game": "g", "level": 2, "error": "compile failed"},
+    ]
+
+    kept, dropped = filter_unlearnable_tasks(tasks, baseline)
+
+    assert [task.level for task in kept] == [1, 2]
+    assert [task.level for task in dropped] == [0]
+
+
+def test_generalizing_selection_rejects_one_game_efficiency_outlier() -> None:
+    baseline = [
+        {
+            "game": game,
+            "level": 0,
+            "solve_rate": 1.0,
+            "baseline_solve_rate": 1.0,
+            "solved_expanded_mean": 100.0,
+            "baseline_solved_expanded_mean": 100.0,
+        }
+        for game in ("a", "b", "c", "d")
+    ]
+    outlier = [dict(row) for row in baseline]
+    outlier[0]["solved_expanded_mean"] = 1.0
+    for row in outlier[1:]:
+        row["solved_expanded_mean"] = 120.0
+
+    selected, diagnostics = select_generalizing_candidate([baseline, outlier])
+
+    assert selected == 0
+    assert diagnostics[1]["positive_games"] == 1
+    assert diagnostics[1]["negative_games"] == 3
 
 
 def test_build_reflection_feedback_includes_solved_efficiency_gain_guidance() -> None:
@@ -3909,7 +4746,11 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert '--shutdown-timeout "${VLLM_SHUTDOWN_TIMEOUT:-30}"' in launcher
     assert f'--temperature "${{LLM_TEMPERATURE:-{DEFAULT_LLM_TEMPERATURE}}}"' in launcher
     assert '--val-split "${VAL_SPLIT:-dev}"' in launcher
+    assert '--training-levels "${TRAINING_LEVELS:-}"' in launcher
     assert '--max-gepa-iterations "${MAX_GEPA_ITERATIONS:-16}"' in launcher
+    assert "plot_puzzlescript_paper_results.py" in launcher
+    assert '--synthesis-backend "$SYNTHESIS_BACKEND"' in launcher
+    assert '--synthesis-codex-model "${SYNTHESIS_CODEX_MODEL:-}"' in launcher
     assert 'search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-16}' in launcher
     assert '--search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-16}"' in launcher
     assert '--search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}"' in launcher
@@ -3917,12 +4758,17 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert '--new-solve-bonus "${NEW_SOLVE_BONUS:-4.0}"' in launcher
     assert '--global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-0.0}"' in launcher
     assert '--score-delta-weight "${SCORE_DELTA_WEIGHT:-1.0}"' in launcher
-    assert '--global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}"' in launcher
+    assert (
+        '--global-net-solve-loss-gate-penalty '
+        '"${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-0.0}"'
+    ) in launcher
     assert '--initial-gepa-addendum "${INITIAL_GEPA_ADDENDUM:-}"' in launcher
     assert '--guard-levels "${GUARD_LEVELS:-}"' in launcher
     assert "Aperture_Science_Sokoban_Testing_Initiative:5" not in launcher
     assert 'RUN_HOLDOUT_COMPARE:-1' in launcher
     assert "scripts/compare_puzzlescript_batched_prompts.py" in launcher
+    assert '--synthesis-backend "$SYNTHESIS_BACKEND"' in launcher
+    assert '--synthesis-codex-model "${SYNTHESIS_CODEX_MODEL:-}"' in launcher
 
     holdout_launcher = Path("sbatch/compare_puzzlescript_holdout_gpu.s").read_text(
         encoding="utf-8"
@@ -3948,15 +4794,28 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     assert '--global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-4.0}}"' in smoke_launcher
 
 
-def test_gepa_validation_split_excludes_holdout_eval_jobs_from_metric() -> None:
+def test_holdout_comparison_can_reuse_codex_synthesis_backend() -> None:
+    client = build_synthesis_client(
+        SimpleNamespace(
+            synthesis_backend="codex-cli",
+            synthesis_codex_model="gpt-5.6-luna",
+            llm_timeout_s=600.0,
+            codex_executable="codex",
+            codex_reasoning_effort="high",
+        )
+    )
+
+    assert isinstance(client, CodexCLITextClient)
+    assert client.model == "gpt-5.6-luna"
+    assert client.reasoning_effort == "high"
+    assert client.allow_read_tools is False
+
+
+def test_gepa_validation_split_defaults_to_game_disjoint_dev() -> None:
     runner = Path("scripts/run_puzzlescript_batched_gepa.py").read_text(encoding="utf-8")
 
     assert 'parser.add_argument("--val-split", choices=("train", "dev"), default="dev")' in runner
-    task_split_block = runner[
-        runner.index("    train_jobs, _eval_jobs = load_env_grid(args.env_grid)") :
-        runner.index("    guard_level_selection = parse_guard_level_selection")
-    ]
-    assert "jobs=eval_jobs" not in task_split_block
+    assert "selected_levels_by_game=training_level_selection or None" in runner
 
 
 def test_search_array_launcher_skips_locked_setup_when_runtime_exists() -> None:
@@ -4062,5 +4921,76 @@ def test_compare_prompt_outputs_can_write_plot_artifacts(tmp_path: Path) -> None
         "holdout_score_delta_by_game.png",
         "holdout_solve_delta_by_game.png",
         "holdout_score_base_vs_optimized.png",
+    }
+    assert all(path.exists() and path.stat().st_size > 0 for path in paths)
+
+
+def test_gepa_iteration_limit_counts_completed_iterations() -> None:
+    assert not _gepa_iteration_limit_reached(SimpleNamespace(i=-1), 40)
+    assert not _gepa_iteration_limit_reached(SimpleNamespace(i=38), 40)
+    assert _gepa_iteration_limit_reached(SimpleNamespace(i=39), 40)
+
+
+def test_paper_plots_are_generated_from_saved_results(tmp_path: Path) -> None:
+    holdout_root = tmp_path / "holdout_compare"
+    holdout_root.mkdir()
+    per_level = [
+        {
+            "game": "gain",
+            "base_solved": False,
+            "optimized_solved": True,
+            "base_expanded": 100,
+            "optimized_expanded": 40,
+        },
+        {
+            "game": "gain",
+            "base_solved": True,
+            "optimized_solved": True,
+            "base_expanded": 80,
+            "optimized_expanded": 20,
+        },
+        {
+            "game": "loss",
+            "base_solved": True,
+            "optimized_solved": False,
+            "base_expanded": 30,
+            "optimized_expanded": 100,
+        },
+        {
+            "game": "loss",
+            "base_solved": False,
+            "optimized_solved": False,
+            "base_expanded": 100,
+            "optimized_expanded": 100,
+        },
+    ]
+    per_game = [
+        {"game": "gain", "n": 2, "base_solved": 1, "optimized_solved": 2},
+        {"game": "loss", "n": 2, "base_solved": 1, "optimized_solved": 0},
+    ]
+    (holdout_root / "per_level_comparison.json").write_text(json.dumps(per_level))
+    (holdout_root / "per_game_comparison.json").write_text(json.dumps(per_game))
+    (tmp_path / "gepa_result.json").write_text(
+        json.dumps(
+            {
+                "best_idx": 1,
+                "discovery_eval_counts": [0, 10, 20],
+                "total_metric_calls": 24,
+                "val_aggregate_scores": [0.0, 0.4, -0.2],
+            }
+        )
+    )
+
+    paths = write_paper_plots(tmp_path, bootstrap_samples=32)
+
+    assert {path.name for path in paths} == {
+        "figure1_search_budget_profile.pdf",
+        "figure1_search_budget_profile.png",
+        "figure2_game_generalization.pdf",
+        "figure2_game_generalization.png",
+        "figure3_paired_outcomes_efficiency.pdf",
+        "figure3_paired_outcomes_efficiency.png",
+        "figure4_gepa_optimization.pdf",
+        "figure4_gepa_optimization.png",
     }
     assert all(path.exists() and path.stat().st_size > 0 for path in paths)

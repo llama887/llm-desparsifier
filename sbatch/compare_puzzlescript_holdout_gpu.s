@@ -4,8 +4,8 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=01:15:00
-#SBATCH --gres=gpu:h100:2
+#SBATCH --time=30:00:00
+#SBATCH --gres=gpu:h100:1
 #SBATCH --account=torch_pr_45_tandon_advanced
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=fyy2003@nyu.edu
@@ -71,6 +71,16 @@ SETUP_LOCK="$SLURM_SUBMIT_DIR/sbatch/logs/puzzlescript_setup.lock"
 
 export PATH="$SD_PATH/.venv/bin:$NODE_DIR/bin:$PATH"
 export PYTHONUNBUFFERED=1
+export SYNTHESIS_BACKEND="${SYNTHESIS_BACKEND:-openai}"
+
+if [ "$SYNTHESIS_BACKEND" = "codex-cli" ]; then
+    CODEX_BIN="${CODEX_EXECUTABLE:-codex}"
+    command -v "$CODEX_BIN" >/dev/null 2>&1 || {
+        echo "[codex] executable not found: $CODEX_BIN" >&2
+        exit 2
+    }
+    "$CODEX_BIN" login status
+fi
 
 if [ -n "${STATE_ROOT:-}" ]; then
     RUN_STATE_ROOT="$STATE_ROOT"
@@ -195,27 +205,60 @@ echo "[run] state_root=$RUN_STATE_ROOT"
 echo "[run] optimized_prompt=$OPTIMIZED_PROMPT"
 echo "[run] model=$LOCAL_LLM_MODEL base_url=$OPENAI_BASE_URL"
 echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-16}"
+echo "[run] synthesis_backend=$SYNTHESIS_BACKEND codex_model=${SYNTHESIS_CODEX_MODEL:-}"
+echo "[run] replicates=${REPLICATES:-1}"
 
-"$SD_PATH/.venv/bin/python" -u scripts/compare_puzzlescript_batched_prompts.py \
-    --env-grid "${ENV_GRID:-configs/gepa_puzzlescript_envs.yaml}" \
-    --state-root "$RUN_STATE_ROOT" \
-    --script-doctor "$SD_PATH" \
-    --optimized-prompt "$OPTIMIZED_PROMPT" \
-    --levels-per-game "${LEVELS_PER_GAME:-0}" \
-    --max-expansions "${MAX_EXPANSIONS:-50000}" \
-    --astar-timeout-s "${ASTAR_TIMEOUT_S:-30}" \
-    --model "$LOCAL_LLM_MODEL" \
-    --openai-base-url "$OPENAI_BASE_URL" \
-    --openai-api-key "$OPENAI_API_KEY" \
-    --max-model-tokens "${MAX_MODEL_TOKENS:-8192}" \
-    --temperature "${LLM_TEMPERATURE:-0.0}" \
-    --top-p "${LLM_TOP_P:-0.95}" \
-    --llm-timeout-s "${LLM_TIMEOUT_S:-600}" \
-    --llm-concurrency "${LLM_CONCURRENCY:-16}" \
-    --submit-search-array \
-    --search-array-script "$SEARCH_ARRAY_SCRIPT" \
-    --search-array-count "${SEARCH_ARRAY_COUNT:-101}" \
-    --search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-16}" \
-    --search-poll-interval-s "${SEARCH_POLL_INTERVAL_S:-15}" \
-    --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}" \
-    --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}"
+for replicate in $(seq 1 "${REPLICATES:-1}"); do
+    printf -v replicate_name "replicate-%02d" "$replicate"
+    replicate_root="$RUN_STATE_ROOT/$replicate_name"
+    if [ -s "$replicate_root/comparison_summary.json" ]; then
+        echo "[replicate] skip completed $replicate_name"
+        continue
+    fi
+    echo "[replicate] start $replicate_name state_root=$replicate_root"
+    replicate_complete=0
+    for attempt in $(seq 1 "${REPLICATE_ATTEMPTS:-3}"); do
+        echo "[replicate] $replicate_name attempt=$attempt/${REPLICATE_ATTEMPTS:-3}"
+        if "$SD_PATH/.venv/bin/python" -u scripts/compare_puzzlescript_batched_prompts.py \
+        --env-grid "${ENV_GRID:-configs/gepa_puzzlescript_envs.yaml}" \
+        --state-root "$replicate_root" \
+        --script-doctor "$SD_PATH" \
+        --optimized-prompt "$OPTIMIZED_PROMPT" \
+        --levels-per-game "${LEVELS_PER_GAME:-0}" \
+        --max-expansions "${MAX_EXPANSIONS:-50000}" \
+        --astar-timeout-s "${ASTAR_TIMEOUT_S:-30}" \
+        --model "$LOCAL_LLM_MODEL" \
+        --openai-base-url "$OPENAI_BASE_URL" \
+        --openai-api-key "$OPENAI_API_KEY" \
+        --max-model-tokens "${MAX_MODEL_TOKENS:-8192}" \
+        --temperature "${LLM_TEMPERATURE:-0.0}" \
+        --top-p "${LLM_TOP_P:-0.95}" \
+        --llm-timeout-s "${LLM_TIMEOUT_S:-600}" \
+        --llm-concurrency "${LLM_CONCURRENCY:-16}" \
+        --synthesis-backend "$SYNTHESIS_BACKEND" \
+        --synthesis-codex-model "${SYNTHESIS_CODEX_MODEL:-}" \
+        --codex-executable "${CODEX_EXECUTABLE:-codex}" \
+        --codex-reasoning-effort "${CODEX_REASONING_EFFORT:-high}" \
+        --submit-search-array \
+        --search-array-script "$SEARCH_ARRAY_SCRIPT" \
+        --search-array-count "${SEARCH_ARRAY_COUNT:-101}" \
+        --search-array-concurrency "${SEARCH_ARRAY_CONCURRENCY:-16}" \
+        --search-poll-interval-s "${SEARCH_POLL_INTERVAL_S:-15}" \
+        --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}" \
+        --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}"; then
+            replicate_complete=1
+            break
+        fi
+        echo "[replicate] retrying $replicate_name after failed attempt=$attempt" >&2
+    done
+    if [ "$replicate_complete" != "1" ]; then
+        echo "[replicate] failed $replicate_name after ${REPLICATE_ATTEMPTS:-3} attempts" >&2
+        exit 1
+    fi
+    echo "[replicate] complete $replicate_name"
+done
+
+"$SD_PATH/.venv/bin/python" -u scripts/summarize_puzzlescript_holdout_replicates.py \
+    "$RUN_STATE_ROOT" \
+    --bootstrap-samples "${BOOTSTRAP_SAMPLES:-10000}" \
+    --seed "${BOOTSTRAP_SEED:-0}"

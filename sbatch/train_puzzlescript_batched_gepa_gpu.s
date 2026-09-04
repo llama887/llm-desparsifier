@@ -116,6 +116,17 @@ export GPU_HEARTBEAT_COMPUTE_GAIN_SECONDS="${GPU_HEARTBEAT_COMPUTE_GAIN_SECONDS:
 export GPU_HEARTBEAT_MATMULS_PER_CHUNK="${GPU_HEARTBEAT_MATMULS_PER_CHUNK:-8}"
 export GPU_HEARTBEAT_DTYPE="${GPU_HEARTBEAT_DTYPE:-bfloat16}"
 export GPU_HEARTBEAT_LOG_INTERVAL_S="${GPU_HEARTBEAT_LOG_INTERVAL_S:-60}"
+export SYNTHESIS_BACKEND="${SYNTHESIS_BACKEND:-openai}"
+export REFLECTION_BACKEND="${REFLECTION_BACKEND:-same}"
+
+if [ "$SYNTHESIS_BACKEND" = "codex-cli" ] || [ "$REFLECTION_BACKEND" = "codex-cli" ]; then
+    CODEX_BIN="${CODEX_EXECUTABLE:-codex}"
+    command -v "$CODEX_BIN" >/dev/null 2>&1 || {
+        echo "[codex] executable not found: $CODEX_BIN" >&2
+        exit 2
+    }
+    "$CODEX_BIN" login status
+fi
 
 cleanup() {
     if [ -n "${HEARTBEAT_PID:-}" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
@@ -133,6 +144,11 @@ echo "[gpu] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 nice -n 19 "$SD_PATH/.venv/bin/python" -u sbatch/gpu_heartbeat.py &
 HEARTBEAT_PID=$!
 echo "[gpu] Started GPU heartbeat with PID: $HEARTBEAT_PID"
+sleep 1
+if ! kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
+    echo "[gpu] heartbeat exited during startup" >&2
+    exit 2
+fi
 
 export LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-openai/gpt-oss-120b}"
 if [ -z "${VLLM_PORT:-}" ]; then
@@ -206,12 +222,20 @@ SCORING_BASELINE_OUTPUTS_FILE_ARG=()
 if [ -n "${SCORING_BASELINE_OUTPUTS_FILE:-}" ]; then
     SCORING_BASELINE_OUTPUTS_FILE_ARG=(--scoring-baseline-outputs-file "$SCORING_BASELINE_OUTPUTS_FILE")
 fi
+TRAINING_TARGETS_FILE_ARG=()
+if [ -n "${TRAINING_TARGETS_FILE:-}" ]; then
+    TRAINING_TARGETS_FILE_ARG=(--training-targets-file "$TRAINING_TARGETS_FILE")
+fi
 
 echo "[run] state_root=$RUN_STATE_ROOT"
 echo "[run] model=$LOCAL_LLM_MODEL base_url=$OPENAI_BASE_URL"
+echo "[run] synthesis_backend=$SYNTHESIS_BACKEND synthesis_codex_model=${SYNTHESIS_CODEX_MODEL:-}"
+echo "[run] reflection_backend=$REFLECTION_BACKEND codex_model=${CODEX_MODEL:-} codex_reasoning_effort=${CODEX_REASONING_EFFORT:-high}"
 echo "[run] search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-16}"
 echo "[run] search_extra_sbatch_args=${SEARCH_EXTRA_SBATCH_ARGS:-}"
 echo "[run] val_split=${VAL_SPLIT:-dev} dev_fraction=${DEV_FRACTION:-0.25}"
+echo "[run] training_levels=${TRAINING_LEVELS:-}"
+echo "[run] training_targets_file=${TRAINING_TARGETS_FILE:-}"
 echo "[run] initial_gepa_addendum_file=${INITIAL_GEPA_ADDENDUM_FILE:-}"
 echo "[run] scoring_baseline_outputs_file=${SCORING_BASELINE_OUTPUTS_FILE:-}"
 
@@ -220,6 +244,8 @@ echo "[run] scoring_baseline_outputs_file=${SCORING_BASELINE_OUTPUTS_FILE:-}"
     --state-root "$RUN_STATE_ROOT" \
     --script-doctor "$SD_PATH" \
     --levels-per-game "${LEVELS_PER_GAME:-0}" \
+    --training-levels "${TRAINING_LEVELS:-}" \
+    "${TRAINING_TARGETS_FILE_ARG[@]}" \
     --max-expansions "${MAX_EXPANSIONS:-50000}" \
     --max-gepa-expansions-per-level "${MAX_GEPA_EXPANSIONS_PER_LEVEL:-10000}" \
     --astar-timeout-s "${ASTAR_TIMEOUT_S:-30}" \
@@ -231,6 +257,12 @@ echo "[run] scoring_baseline_outputs_file=${SCORING_BASELINE_OUTPUTS_FILE:-}"
     --top-p "${LLM_TOP_P:-0.95}" \
     --llm-timeout-s "${LLM_TIMEOUT_S:-600}" \
     --llm-concurrency "${LLM_CONCURRENCY:-16}" \
+    --synthesis-backend "$SYNTHESIS_BACKEND" \
+    --synthesis-codex-model "${SYNTHESIS_CODEX_MODEL:-}" \
+    --reflection-backend "$REFLECTION_BACKEND" \
+    --codex-executable "${CODEX_EXECUTABLE:-codex}" \
+    --codex-model "${CODEX_MODEL:-}" \
+    --codex-reasoning-effort "${CODEX_REASONING_EFFORT:-high}" \
     --submit-search-array \
     --search-array-script "$SEARCH_ARRAY_SCRIPT" \
     --search-array-count "${SEARCH_ARRAY_COUNT:-101}" \
@@ -252,7 +284,7 @@ echo "[run] scoring_baseline_outputs_file=${SCORING_BASELINE_OUTPUTS_FILE:-}"
     --common-solve-efficiency-weight "${COMMON_SOLVE_EFFICIENCY_WEIGHT:-0.75}" \
     --common-solve-efficiency-clip "${COMMON_SOLVE_EFFICIENCY_CLIP:-1.0}" \
     --global-lost-solve-gate-penalty "${GLOBAL_LOST_SOLVE_GATE_PENALTY:-0.0}" \
-    --global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-${LOST_SOLVE_PENALTY:-8.0}}" \
+    --global-net-solve-loss-gate-penalty "${GLOBAL_NET_SOLVE_LOSS_GATE_PENALTY:-0.0}" \
     --reflection-minibatch-size "${REFLECTION_MINIBATCH_SIZE:-0}" \
     --initial-gepa-addendum "${INITIAL_GEPA_ADDENDUM:-}" \
     "${INITIAL_GEPA_ADDENDUM_FILE_ARG[@]}" \
@@ -285,6 +317,10 @@ if [ "${RUN_HOLDOUT_COMPARE:-1}" = "1" ]; then
         --top-p "${HOLDOUT_LLM_TOP_P:-${LLM_TOP_P:-0.95}}" \
         --llm-timeout-s "${HOLDOUT_LLM_TIMEOUT_S:-${LLM_TIMEOUT_S:-600}}" \
         --llm-concurrency "${HOLDOUT_LLM_CONCURRENCY:-${LLM_CONCURRENCY:-16}}" \
+        --synthesis-backend "$SYNTHESIS_BACKEND" \
+        --synthesis-codex-model "${SYNTHESIS_CODEX_MODEL:-}" \
+        --codex-executable "${CODEX_EXECUTABLE:-codex}" \
+        --codex-reasoning-effort "${CODEX_REASONING_EFFORT:-high}" \
         --submit-search-array \
         --search-array-script "$SEARCH_ARRAY_SCRIPT" \
         --search-array-count "${HOLDOUT_SEARCH_ARRAY_COUNT:-${SEARCH_ARRAY_COUNT:-101}}" \
@@ -292,4 +328,6 @@ if [ "${RUN_HOLDOUT_COMPARE:-1}" = "1" ]; then
         --search-poll-interval-s "${HOLDOUT_SEARCH_POLL_INTERVAL_S:-${SEARCH_POLL_INTERVAL_S:-15}}" \
         --search-array-stall-timeout-s "${HOLDOUT_SEARCH_ARRAY_STALL_TIMEOUT_S:-${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}}" \
         --extra-sbatch-args "${HOLDOUT_SEARCH_EXTRA_SBATCH_ARGS:-${SEARCH_EXTRA_SBATCH_ARGS:-}}"
+    "$SD_PATH/.venv/bin/python" -u scripts/plot_puzzlescript_paper_results.py \
+        --state-root "$RUN_STATE_ROOT"
 fi

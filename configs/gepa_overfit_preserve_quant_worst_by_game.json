@@ -1,0 +1,115 @@
+{
+  "description": "One worst regressed holdout level for every game whose preserve-quant aggregate score was below the original base prompt.",
+  "optimized_prompt": "artifacts/manual_prompts/preserve_quant_a19949f48f_prompt.txt",
+  "source_comparison": "artifacts/puzzlescript_holdout_compare_preserve_quant_a19949f48f_h100_20260702_232948/per_level_comparison.json",
+  "targets": [
+    {
+      "base_expanded": 13628,
+      "base_solved": true,
+      "game": "Aperture_Science_Sokoban_Testing_Initiative",
+      "level": 3,
+      "optimized_expanded": 14857,
+      "optimized_solved": false,
+      "score_delta": -0.7274454510909781
+    },
+    {
+      "base_expanded": 1712,
+      "base_solved": true,
+      "game": "Beam_Islands",
+      "level": 3,
+      "optimized_expanded": 9984,
+      "optimized_solved": false,
+      "score_delta": -0.9657606847863043
+    },
+    {
+      "base_expanded": 6790,
+      "base_solved": true,
+      "game": "Crates_and_Portals",
+      "level": 15,
+      "optimized_expanded": 16764,
+      "optimized_solved": false,
+      "score_delta": -0.8642027159456811
+    },
+    {
+      "base_expanded": 132,
+      "base_solved": true,
+      "game": "Darkness_Sokoban",
+      "level": 0,
+      "optimized_expanded": 211,
+      "optimized_solved": true,
+      "score_delta": -0.0015799684006320147
+    },
+    {
+      "base_expanded": 8215,
+      "base_solved": true,
+      "game": "Inswaption",
+      "level": 7,
+      "optimized_expanded": 16335,
+      "optimized_solved": false,
+      "score_delta": -0.8357032859342813
+    },
+    {
+      "base_expanded": 6743,
+      "base_solved": true,
+      "game": "Memory_Push",
+      "level": 6,
+      "optimized_expanded": 30742,
+      "optimized_solved": false,
+      "score_delta": -0.8651426971460571
+    },
+    {
+      "base_expanded": 22045,
+      "base_solved": true,
+      "game": "No_Right_Turn_Sokoban",
+      "level": 3,
+      "optimized_expanded": 41632,
+      "optimized_solved": true,
+      "score_delta": -0.39173216535669286
+    },
+    {
+      "base_expanded": 7199,
+      "base_solved": true,
+      "game": "Not_Normal_Crates",
+      "level": 12,
+      "optimized_expanded": 10016,
+      "optimized_solved": false,
+      "score_delta": -0.8560228795424092
+    },
+    {
+      "base_expanded": 10906,
+      "base_solved": true,
+      "game": "Remote_Control_Sokoban",
+      "level": 1,
+      "optimized_expanded": 16539,
+      "optimized_solved": true,
+      "score_delta": -0.11265774684506302
+    },
+    {
+      "base_expanded": 34937,
+      "base_solved": true,
+      "game": "Soko-bine",
+      "level": 6,
+      "optimized_expanded": 50000,
+      "optimized_solved": false,
+      "score_delta": -0.3012739745205096
+    },
+    {
+      "base_expanded": 2109,
+      "base_solved": true,
+      "game": "Sokoban_Dungeon",
+      "level": 1,
+      "optimized_expanded": 4509,
+      "optimized_solved": true,
+      "score_delta": -0.047999040019199635
+    },
+    {
+      "base_expanded": 174,
+      "base_solved": true,
+      "game": "sokoban_sanity",
+      "level": 1,
+      "optimized_expanded": 503,
+      "optimized_solved": true,
+      "score_delta": -0.0065798684026320275
+    }
+  ]
+}

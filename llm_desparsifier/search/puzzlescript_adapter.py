@@ -7,10 +7,45 @@ reason about object positions, win conditions, and game rules.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import numpy as np
+
+
+def win_condition_progress(
+    winconditions: list[dict[str, Any]],
+    object_positions: dict[str, list[tuple[int, int]]],
+) -> float:
+    """Return the mean fraction of PuzzleScript win conditions satisfied.
+
+    The signal uses only compiled win-condition masks resolved to object names
+    and current object positions. It is therefore independent of the generated
+    heuristic and remains comparable across prompt candidates. ``all`` and
+    ``no`` conditions receive fractional overlap credit; ``some`` conditions
+    remain binary because the rules do not imply a safe distance metric.
+    """
+
+    scores: list[float] = []
+    for condition in winconditions:
+        left = {
+            position
+            for name in condition.get("mask1_names", [])
+            for position in object_positions.get(str(name), [])
+        }
+        right = {
+            position
+            for name in condition.get("mask2_names", [])
+            for position in object_positions.get(str(name), [])
+        }
+        overlap = len(left & right)
+        kind = int(condition.get("num", 1))
+        if kind == -1:  # no A on B
+            scores.append(1.0 - overlap / max(1, len(left)))
+        elif kind == 0:  # some A on B
+            scores.append(float(overlap > 0))
+        else:  # all A on B
+            scores.append(1.0 if not left else overlap / len(left))
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 def decode_object_grid(
@@ -106,6 +141,7 @@ def build_puzzlescript_ctx(
     # Parse win conditions from compiled JSON
     raw_wcs = compiled_json.get("winconditions", [])
     wc_texts = []
+    progress_conditions: list[dict[str, Any]] = []
     for wc in raw_wcs:
         mask1_objs = []
         mask2_objs = []
@@ -123,6 +159,13 @@ def build_puzzlescript_ctx(
         else:
             desc = f"all {', '.join(mask1_objs)} on {', '.join(mask2_objs)}"
         wc_texts.append(desc)
+        progress_conditions.append(
+            {
+                "num": num,
+                "mask1_names": mask1_objs,
+                "mask2_names": mask2_objs,
+            }
+        )
 
     ascii_state = render_ascii(object_grid, w, h)
 
@@ -137,6 +180,7 @@ def build_puzzlescript_ctx(
         "ascii_state": ascii_state,
         "score": engine.get_score(),
         "score_normalized": engine.get_score_normalized(),
+        "win_condition_progress": win_condition_progress(progress_conditions, object_grid),
         "is_winning": engine.is_winning(),
         "action_names": {0: "up", 1: "left", 2: "down", 3: "right", 4: "action"},
         "n_rules": len(compiled_json.get("rules", [])),
@@ -250,7 +294,7 @@ def build_env_description(
     lines = [
         f"Game: {title}",
         f"Objects: {', '.join(obj_names)}",
-        f"Actions: up(0), left(1), down(2), right(3), action(4)",
+        "Actions: up(0), left(1), down(2), right(3), action(4)",
         f"Win conditions: {'; '.join(wc_texts)}",
         "",
         "PuzzleScript Legend (object aliases and composite objects):",

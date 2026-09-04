@@ -9,16 +9,12 @@ C++ engine for game simulation.
 from __future__ import annotations
 
 import heapq
-import json
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
-import numpy as np
-
-from puzzlescript_adapter import (
-    build_puzzlescript_ctx,
-)
+from puzzlescript_adapter import build_puzzlescript_ctx
 
 MAX_AGAIN = 50
 
@@ -52,15 +48,29 @@ def _state_key(engine) -> tuple:
 
 
 def _compact_ctx_snapshot(ctx: dict[str, Any]) -> dict[str, Any]:
-    """Return a small state summary suitable for reflection prompts."""
+    """Return a compact, candidate-independent state summary for reflection."""
 
     object_counts = {
         name: len(positions)
         for name, positions in sorted(ctx.get("object_positions", {}).items())
         if positions
     }
+    engine_progress = max(0.0, min(1.0, float(ctx.get("score_normalized", 0.0))))
+    win_progress_value = ctx.get("win_condition_progress")
+    win_progress = (
+        None
+        if win_progress_value is None
+        else max(0.0, min(1.0, float(win_progress_value)))
+    )
+    progress_score = (
+        engine_progress
+        if win_progress is None
+        else 0.5 * engine_progress + 0.5 * win_progress
+    )
     return {
-        "score_normalized": float(ctx.get("score_normalized", 0.0)),
+        "score_normalized": engine_progress,
+        "win_condition_progress": win_progress,
+        "progress_score": progress_score,
         "is_winning": bool(ctx.get("is_winning", False)),
         "object_counts": object_counts,
         "ascii_state": str(ctx.get("ascii_state", "")),
@@ -110,6 +120,10 @@ def puzzlescript_astar(
     generated = 1
     root_snapshot = _compact_ctx_snapshot(ctx)
     expansion_samples: list[dict[str, Any]] = []
+    progress_samples: deque[dict[str, Any]] = deque(maxlen=12)
+    late_states: deque[dict[str, Any]] = deque(maxlen=6)
+    best_progress = float(root_snapshot["progress_score"])
+    best_progress_snapshot = root_snapshot
     best_seen_f = h0
     best_seen_h = h0
     terminated_reason = "open_set_exhausted"
@@ -135,16 +149,22 @@ def puzzlescript_astar(
             current_h = max(0.0, float(heuristic_fn(current_ctx)))
         except Exception:
             current_h = 0.0
+        current_snapshot = _compact_ctx_snapshot(current_ctx)
+        trace_state = {
+            "expanded_index": expanded,
+            "g_cost": g,
+            "h_cost": current_h,
+            "f_cost": float(current_f),
+            "snapshot": current_snapshot,
+        }
+        late_states.append(trace_state)
+        current_progress = float(current_snapshot["progress_score"])
+        if current_progress > best_progress + 1e-12:
+            best_progress = current_progress
+            best_progress_snapshot = current_snapshot
+            progress_samples.append(trace_state)
         if len(expansion_samples) < 6:
-            expansion_samples.append(
-                {
-                    "expanded_index": expanded,
-                    "g_cost": g,
-                    "h_cost": current_h,
-                    "f_cost": float(current_f),
-                    "snapshot": _compact_ctx_snapshot(current_ctx),
-                }
-            )
+            expansion_samples.append(trace_state)
         best_seen_f = min(best_seen_f, float(current_f))
         best_seen_h = min(best_seen_h, current_h)
 
@@ -173,6 +193,10 @@ def puzzlescript_astar(
                     "terminated_reason": "solved",
                     "root_snapshot": root_snapshot,
                     "sampled_states": expansion_samples,
+                    "progress_samples": list(progress_samples),
+                    "late_states": list(late_states),
+                    "best_progress": best_progress,
+                    "best_progress_snapshot": best_progress_snapshot,
                     "best_seen_f": float(min(best_seen_f, float(next_g))),
                     "best_seen_h": float(min(best_seen_h, 0.0)),
                     "open_set_size_at_end": len(open_set),
@@ -222,6 +246,10 @@ def puzzlescript_astar(
         "terminated_reason": terminated_reason,
         "root_snapshot": root_snapshot,
         "sampled_states": expansion_samples,
+        "progress_samples": list(progress_samples),
+        "late_states": list(late_states),
+        "best_progress": best_progress,
+        "best_progress_snapshot": best_progress_snapshot,
         "best_seen_f": float(best_seen_f),
         "best_seen_h": float(best_seen_h),
         "open_set_size_at_end": len(open_set),
