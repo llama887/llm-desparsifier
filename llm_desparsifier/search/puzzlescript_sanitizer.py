@@ -19,7 +19,8 @@ from typing import Any, Callable
 _BANNED_NAMES = frozenset({
     "exec", "eval", "compile", "open", "__import__", "globals", "locals",
     "getattr", "setattr", "delattr", "breakpoint", "exit", "quit",
-    "__builtins__", "os", "sys", "subprocess", "shutil",
+    "__builtins__", "os", "sys", "subprocess", "shutil", "vars", "dir",
+    "help", "input", "type", "object", "super",
 })
 _NONFINITE_FLOAT_STRINGS = frozenset({
     "inf",
@@ -32,6 +33,7 @@ _NONFINITE_FLOAT_STRINGS = frozenset({
     "+nan",
     "-nan",
 })
+_SEARCH_STRATEGY_RE = re.compile(r"^[a-z][a-z0-9_+-]{0,47}$")
 
 
 def _is_direct_nonfinite_expr(node: ast.AST) -> bool:
@@ -71,9 +73,30 @@ def _strip_markdown_fences(code: str) -> str:
     return code.strip()
 
 
+def _strategy_label(tree: ast.Module, entrypoint: str) -> str:
+    labels: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "SEARCH_STRATEGY"
+                   for target in node.targets):
+            continue
+        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+            raise ValueError("SEARCH_STRATEGY must be a literal string")
+        labels.append(node.value.value)
+    if len(labels) > 1:
+        raise ValueError("SEARCH_STRATEGY must be declared at most once")
+    if labels and entrypoint != "search_plan":
+        raise ValueError("SEARCH_STRATEGY is only valid with search_plan")
+    label = labels[0] if labels else "custom_unspecified"
+    if entrypoint == "search_plan" and not _SEARCH_STRATEGY_RE.fullmatch(label):
+        raise ValueError("SEARCH_STRATEGY must be a 1-48 character lowercase identifier")
+    return label
+
+
 class _PuzzleScriptHeuristicValidator(ast.NodeVisitor):
     def __init__(self) -> None:
-        self.found_function = False
+        self.entrypoints: list[str] = []
 
     def visit_Import(self, node: ast.Import) -> None:
         raise ValueError("imports are not allowed")
@@ -83,13 +106,24 @@ class _PuzzleScriptHeuristicValidator(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         if node.name == "heuristic_cost_to_go":
-            if self.found_function:
+            if node.name in self.entrypoints:
                 raise ValueError("duplicate heuristic_cost_to_go definition")
-            self.found_function = True
+            self.entrypoints.append(node.name)
             arg_names = [arg.arg for arg in node.args.args]
             if arg_names != ["ts", "env_params", "ctx"]:
                 raise ValueError(
                     "heuristic_cost_to_go must accept (ts, env_params, ctx)")
+        elif node.name == "search_plan":
+            if node.name in self.entrypoints:
+                raise ValueError("duplicate search_plan definition")
+            self.entrypoints.append(node.name)
+            if [arg.arg for arg in node.args.args] != ["api", "seed"]:
+                raise ValueError("search_plan must accept (api, seed)")
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr.startswith("_"):
+            raise ValueError("private and dunder attribute access is not allowed")
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -108,29 +142,46 @@ class _PuzzleScriptHeuristicValidator(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def sanitize_and_compile_puzzlescript_heuristic(code: str) -> Callable[..., float]:
-    """Validate and compile a PuzzleScript heuristic function.
-
-    Less strict than the XLand sanitizer: allows normal dict access,
-    list comprehensions, etc. Still bans imports and dangerous builtins.
-    """
+def sanitize_and_compile_puzzlescript_search(code: str) -> tuple[str, Callable[..., Any]]:
+    """Compile one legacy heuristic or bounded custom-search entrypoint."""
     cleaned = _strip_markdown_fences(code)
     tree = ast.parse(cleaned)
     validator = _PuzzleScriptHeuristicValidator()
     validator.visit(tree)
-    if not validator.found_function:
-        raise ValueError("expected a heuristic_cost_to_go definition")
-    namespace: dict[str, Any] = {"math": math, "abs": abs, "min": min,
+    if len(validator.entrypoints) != 1:
+        raise ValueError(
+            "expected exactly one heuristic_cost_to_go or search_plan definition"
+        )
+    entrypoint = validator.entrypoints[0]
+    strategy_label = _strategy_label(tree, entrypoint)
+    namespace: dict[str, Any] = {"__builtins__": {}, "math": math, "abs": abs, "min": min,
                                   "max": max, "sum": sum, "len": len,
                                   "range": range, "enumerate": enumerate,
                                   "zip": zip, "sorted": sorted,
                                   "float": float, "int": int,
                                   "tuple": tuple, "list": list,
                                   "dict": dict, "set": set, "bool": bool,
-                                  "str": str, "isinstance": isinstance,
-                                  "any": any, "all": all}
-    exec(compile(tree, "<heuristic>", "exec"), namespace)  # noqa: S102
-    func = namespace.get("heuristic_cost_to_go")
+                                  "str": str, "repr": repr, "isinstance": isinstance,
+                                  "any": any, "all": all, "ord": ord, "chr": chr,
+                                  "round": round, "Exception": Exception,
+                                  "TypeError": TypeError, "ValueError": ValueError,
+                                  "KeyError": KeyError, "IndexError": IndexError}
+    exec(compile(tree, "<puzzlescript-search>", "exec"), namespace)  # noqa: S102
+    func = namespace.get(entrypoint)
     if not callable(func):
-        raise ValueError("compiled heuristic_cost_to_go is not callable")
+        raise ValueError(f"compiled {entrypoint} is not callable")
+    if entrypoint == "search_plan":
+        setattr(func, "_search_algorithm", strategy_label)
+    return ("heuristic" if entrypoint == "heuristic_cost_to_go" else "custom_search"), func
+
+
+def sanitize_and_compile_puzzlescript_heuristic(code: str) -> Callable[..., float]:
+    """Validate and compile a legacy PuzzleScript heuristic function.
+
+    Less strict than the XLand sanitizer: allows normal dict access,
+    list comprehensions, etc. Still bans imports and dangerous builtins.
+    """
+    strategy, func = sanitize_and_compile_puzzlescript_search(code)
+    if strategy != "heuristic":
+        raise ValueError("expected a heuristic_cost_to_go definition")
     return func

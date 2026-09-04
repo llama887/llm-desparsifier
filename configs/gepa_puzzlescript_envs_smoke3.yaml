@@ -1,0 +1,14 @@
+# 3-game training subset for smoke-testing blind-relative-time.
+jobs:
+- name: Sokoban_Flipped
+  levels: 21
+  objects: 5
+  grid: 6x8
+- name: Algorithm-Generated_Sokoban_Levels
+  levels: 40
+  objects: 7
+  grid: 6x6
+- name: Heroes_of_Sokoban
+  levels: 31
+  objects: 0
+  grid: ''

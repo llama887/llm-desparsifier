@@ -25,6 +25,8 @@ import multiprocessing as mp
 import os
 import random
 import re
+import resource
+import threading
 import subprocess
 import sys
 import tempfile
@@ -47,8 +49,8 @@ if str(_SEARCH_ROOT) not in sys.path:
 
 from puzzle_evaluator import PuzzleScriptEvaluator  # noqa: E402
 from puzzlescript_adapter import build_env_description, build_puzzlescript_ctx  # noqa: E402
-from puzzlescript_astar import puzzlescript_astar  # noqa: E402
-from puzzlescript_sanitizer import sanitize_and_compile_puzzlescript_heuristic  # noqa: E402
+from puzzlescript_astar import puzzlescript_search  # noqa: E402
+from puzzlescript_sanitizer import sanitize_and_compile_puzzlescript_search  # noqa: E402
 
 DEFAULT_ENV_GRID = Path("configs/gepa_puzzlescript_envs.yaml")
 DEFAULT_STATE_ROOT = Path("artifacts/gepa_puzzlescript_batched_state")
@@ -67,6 +69,12 @@ DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS = 5000
 DEFAULT_REFLECTION_FEEDBACK_CHARS = 3000
 DEFAULT_REFLECTION_MAX_RECORDS = 24
 DEFAULT_SEARCH_TASK_WALL_TIMEOUT_S = 120.0
+
+# Heap ceiling (RLIMIT_DATA) applied inside each search child process. A generated
+# artifact that allocates past this fails as one scored task instead of taking
+# the whole Slurm step down with an OOM kill. Override with
+# LLM_DESPARSIFIER_SEARCH_MEM_LIMIT_MB=0 to disable.
+DEFAULT_SEARCH_TASK_MEMORY_LIMIT_MB = 3072
 DEFAULT_DEV_FRACTION = 0.25
 DEFAULT_MAX_GEPA_ITERATIONS = 16
 DEFAULT_LOST_SOLVE_PENALTY = 8.0
@@ -86,14 +94,143 @@ DEFAULT_SOLVED_GAIN_SCORE_MARGIN = 0.01
 DEFAULT_SOLVED_GAIN_EXPANSION_MARGIN = 100.0
 DEFAULT_SOLVED_GAIN_EXPANSION_RATIO = 1.2
 DEFAULT_EFFICIENCY_HEADROOM_EXPANSIONS = 500.0
+
+# Per-level budgets are set as a multiple of measured blind (h=0) A* effort, so
+# the budget tracks each level's actual difficulty instead of being a flat
+# constant that is generous on easy levels and hopeless on hard ones.
+DEFAULT_BLIND_BUDGET_MULTIPLIER = 2.0
+
+# Solve-rate shortfall is a constraint, not a score term. Violating it subtracts
+# this much per unit of shortfall, which is far outside the range of any
+# achievable speedup mean, so an infeasible candidate can never outrank a
+# feasible one.
+CONSTRAINT_VIOLATION_PENALTY = 1000.0
+
+OBJECTIVE_ADJUSTED = "adjusted"
+OBJECTIVE_SPEEDUP_CONSTRAINED = "speedup-constrained"
+OBJECTIVE_BASE_RELATIVE_TIME = "base-relative-time"
+OBJECTIVE_BLIND_RELATIVE_TIME = "blind-relative-time"
+
+# Score charged to a level the candidate failed to solve, in log2 wall-time
+# units against blind search. Efficiency is undefined where nothing was solved,
+# so a failure has to be priced rather than dropped: dropping it makes "solve
+# only the easy levels quickly" the optimum. -3.0 reads as "counted as eight
+# times slower than blind search" -- a real cost, but bounded and continuous
+# rather than the -8.0 cliff that made every proposal downside-only.
+# Kept only as the floor's safety margin knob; the unsolved score itself is
+# derived from the clip below rather than set independently. A standalone value
+# here is how v13 ended up rewarding failure: unsolved sat at -3.0 while a slow
+# solve could score -14, so abandoning a level beat solving it by up to 11 log2
+# units, and the winning candidate dropped to 18.00/24 solves while tripling
+# its speed.
+DEFAULT_BLIND_RELATIVE_UNSOLVED_LOG2 = -3.0
+# How much worse than the worst possible solve a failure scores. Strictly
+# positive so that solving, at any speed, always beats giving up.
+DEFAULT_UNSOLVED_MARGIN = 1.0
+# How bad a *solved* level is allowed to look. Separate from the upper clip on
+# purpose. A single clip has to do two unrelated jobs: bound the reward for
+# being fast, and set how much a failure costs (the floor must sit below the
+# worst solve or quitting outscores solving slowly). Tying them together makes
+# the choice binary -- a wide clip forces a -15 floor and reliability swamps
+# speed, a narrow one saturates the speed signal. Splitting them lets speed
+# stay richly rewarded while a failure stays proportionate.
+DEFAULT_SLOW_SOLVE_CLIP = 2.0
+# Clip on a single level's log2 speedup, so one freak level cannot carry a
+# candidate. Set from measurement, not taste: across the smoke runs solved
+# rows ranged -1.12 to +12.14 with a median of +4.32, and a clip of 8.0
+# saturated 32% of them -- flattening the gradient exactly where the best
+# artifacts sit. 14.0 (a 16384x swing) leaves the observed range intact while
+# still bounding a pathological outlier.
+DEFAULT_BLIND_RELATIVE_CLIP = 14.0
+# Levels whose blind reference solves faster than this are dropped from the
+# task set. Wall-time ratios below roughly a second are dominated by node
+# speed, contention and process startup on a shared cluster.
+DEFAULT_MIN_REFERENCE_SECONDS = 0.0
+
+# Floor applied to both sides of a wall-time ratio. Solves faster than this are
+# reported at the floor rather than dropped: an artifact that solves instantly
+# is the case the comparison most needs to price, so excluding it would hide
+# exactly the regressions worth catching.
+MIN_MEASURABLE_SOLVE_SECONDS = 1e-4
+
+_OBJECTIVE_MODE = OBJECTIVE_ADJUSTED
+_OBJECTIVE_BLIND_REFERENCE: dict[tuple[str, int], dict[str, Any]] = {}
+_OBJECTIVE_SOLVE_SLACK = 0.0
+_OBJECTIVE_UNSOLVED_LOG2 = DEFAULT_BLIND_RELATIVE_UNSOLVED_LOG2
+_OBJECTIVE_SPEEDUP_CLIP = DEFAULT_BLIND_RELATIVE_CLIP
+_OBJECTIVE_SLOW_SOLVE_CLIP = DEFAULT_SLOW_SOLVE_CLIP
+
+
+def configure_objective(
+    *,
+    mode: str = OBJECTIVE_ADJUSTED,
+    blind_reference: Mapping[tuple[str, int], Mapping[str, Any]] | None = None,
+    solve_slack: float = 0.0,
+    unsolved_log2: float = DEFAULT_BLIND_RELATIVE_UNSOLVED_LOG2,
+    speedup_clip: float = DEFAULT_BLIND_RELATIVE_CLIP,
+    slow_solve_clip: float = DEFAULT_SLOW_SOLVE_CLIP,
+) -> None:
+    """Select the scoring objective for this process.
+
+    Every scoring path routes through `adjusted_candidate_scores`, so setting
+    this once keeps the training minibatch, the validation aggregate, and the
+    end-of-run holdout comparison measuring the same quantity.
+    """
+    global _OBJECTIVE_MODE, _OBJECTIVE_BLIND_REFERENCE, _OBJECTIVE_SOLVE_SLACK
+    global _OBJECTIVE_UNSOLVED_LOG2, _OBJECTIVE_SPEEDUP_CLIP
+    global _OBJECTIVE_SLOW_SOLVE_CLIP
+    if mode not in (
+        OBJECTIVE_ADJUSTED,
+        OBJECTIVE_SPEEDUP_CONSTRAINED,
+        OBJECTIVE_BASE_RELATIVE_TIME,
+        OBJECTIVE_BLIND_RELATIVE_TIME,
+    ):
+        raise ValueError(f"unknown objective: {mode}")
+    if mode == OBJECTIVE_SPEEDUP_CONSTRAINED and not blind_reference:
+        raise ValueError(
+            "the speedup-constrained objective needs a blind reference; run "
+            "scripts/calibrate_puzzlescript_budgets.py first"
+        )
+    if mode == OBJECTIVE_BLIND_RELATIVE_TIME:
+        if not blind_reference:
+            raise ValueError(
+                "the blind-relative-time objective needs a blind reference; run "
+                "scripts/calibrate_puzzlescript_budgets.py first"
+            )
+        if not any(
+            float(entry.get("blind_time_s", 0.0) or 0.0) > 0.0
+            for entry in blind_reference.values()
+        ):
+            raise ValueError(
+                "the blind reference carries no blind_time_s timings, so a "
+                "wall-time ratio cannot be formed; recalibrate it"
+            )
+    _OBJECTIVE_MODE = mode
+    _OBJECTIVE_BLIND_REFERENCE = dict(blind_reference or {})
+    _OBJECTIVE_SOLVE_SLACK = max(0.0, float(solve_slack))
+    _OBJECTIVE_UNSOLVED_LOG2 = float(unsolved_log2)
+    _OBJECTIVE_SPEEDUP_CLIP = abs(float(speedup_clip))
+    _OBJECTIVE_SLOW_SOLVE_CLIP = abs(float(slow_solve_clip))
 DEFAULT_EFFICIENCY_HEADROOM_SCALE_CAP = 3.0
-DEFAULT_PROPOSED_PROMPT_MAX_CHARS = 4000
-DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS = 1200
-CASE_SPECIFIC_OVERFIT_ADDENDUM_MAX_CHARS = 4000
+DEFAULT_PROPOSED_PROMPT_MAX_CHARS: int | None = None
+DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS: int | None = None
+CASE_SPECIFIC_OVERFIT_ADDENDUM_MAX_CHARS: int | None = None
+CASE_SPECIFIC_REFLECTION_HEURISTIC_CODE_CHARS = 4000
 FULL_PROMPT_PROPOSAL_FOCI = (
     "Remove unsupported instructions and simplify the downstream agent's decision process.",
     "Improve rule and win-condition parsing across non-Sokoban mechanics.",
     "Preserve solve probability while making heuristic ordering less brittle across samples.",
+)
+FULL_PROMPT_NOOP_FALLBACKS = (
+    "When validated A* repeatedly exhausts its expansion budget after plateaued progress, "
+    "choose search_plan and use a deterministic hybrid of progress and novelty queues; keep "
+    "the heuristic route otherwise.",
+    "When useful paths must temporarily reduce measured progress, choose search_plan and use "
+    "deterministic bounded depth diversification instead of another scalar A* heuristic; keep "
+    "the heuristic route otherwise.",
+    "When irreversible mechanics create repeated dead ends, choose search_plan and alternate "
+    "a conservative deadlock-aware queue with breadth exploration; keep the heuristic route "
+    "when those mechanics are absent.",
 )
 DEFAULT_REFLECTION_DATASET_CHARS = 64000
 DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S = 300.0
@@ -120,58 +257,27 @@ _CONTEXT_LENGTH_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-PUZZLESCRIPT_HEURISTIC_CONTRACT = """You are writing a heuristic function for A* search on one PuzzleScript grid puzzle.
+PUZZLESCRIPT_HEURISTIC_CONTRACT = """Study the supplied PuzzleScript source, mechanics, and initial level. Produce the deterministic bounded search artifact you expect to solve the level most efficiently. Follow the runtime API contract below."""
 
-Output exactly Python code defining:
-def heuristic_cost_to_go(ts, env_params, ctx) -> float
+IMMUTABLE_SEARCH_CONTRACT_HEADER = "NON-NEGOTIABLE DUAL-ROUTE CONTRACT"
+IMMUTABLE_SEARCH_CONTRACT = f"""{IMMUTABLE_SEARCH_CONTRACT_HEADER}:
+Use the supplied agent workspace as the authoritative runtime contract. Finish
+with exactly one supported entrypoint in candidate.py. Both the validated A*
+heuristic route and bounded custom-search route remain available. The evaluator
+enforces syntax, sandbox, expansion, wall-clock, and replay boundaries."""
 
-Do not output markdown fences, backticks, prose, imports, print, exec, eval, open,
-or file/network access. For PuzzleScript games, ts and env_params are None; the
-function must use only ctx plus constants you derive from the prompt-time game
-source. The full source, LEGEND, COLLISIONLAYERS, RULES, WINCONDITIONS, and
-initial level state may be present in the prompt for analysis, but they are not
-runtime inputs except through ctx.
+CUSTOM_SEARCH_PROBE = """NON-NEGOTIABLE CUSTOM-SEARCH PROBE:
+For this train/dev diagnostic generation, define search_plan rather than the
+legacy heuristic and set SEARCH_STRATEGY. Use a mechanics-grounded exploration
+strategy that materially differs from the validated A* loop. Prefer novelty,
+alternating/hybrid queues, bounded diversification, or conservative deadlock-
+aware ordering when justified by the supplied rules. This probe is feedback-only
+and does not contribute to the candidate scalar score."""
 
-Runtime ctx keys include:
-  ctx.get('game_title'): title string
-  ctx.get('object_positions'): dict mapping object name -> list of (x,y) tuples
-  ctx.get('grid_width'), ctx.get('grid_height'): grid dimensions
-  ctx.get('win_conditions_text'): human-readable win conditions
-  ctx.get('ascii_state'): text grid of current state
-  ctx.get('score'): engine score, lower is closer to solved
-  ctx.get('score_normalized'): engine progress in [0,1], higher is closer
-  ctx.get('is_winning'): True if state is already won
-  ctx.get('object_names'): list of all object type names
-  ctx.get('action_names'): action id/name mapping
-
-Read the actual PuzzleScript mechanics before choosing features. Do not assume
-the objective is crate-on-target or even Sokoban-like just because object names
-look familiar. Derive the main progress terms from WINCONDITIONS, then use RULES
-and COLLISIONLAYERS to decide whether distances, reachability, ordering,
-alignment, terrain consumption, swapping, pulling, sliding, teleportation,
-gravity, beams, or one-way effects matter.
-
-Heuristic requirements:
-- Return a non-negative float; lower means closer to a win.
-- Return 0.0 when ctx.get('is_winning') is True.
-- Produce varied values across plausible successor states; constant heuristics
-  turn A* into blind search.
-- Prefer conservative, finite penalties. Only use very large deadlock penalties
-  for conditions that are provably impossible under this game's rules.
-- Use ctx['score_normalized'] or ctx['score'] as a small fallback or tie-breaker
-  when the game-specific features are uncertain; do not make them the only
-  signal unless there is no reliable object-level signal.
-- If unsure, build a finite fallback from win_conditions_text, object names,
-  object counts, player-to-interaction distance, and score_normalized instead
-  of hard-coding a Sokoban template.
-- Do not assume exact object keys such as "player", "crate", or "target".
-  Inspect ctx['object_names'], ctx['object_positions'], WINCONDITIONS, and
-  LEGEND aliases to collect player variants, crate-like objects, target-like
-  objects, exits, portals, terrain, and other mechanic-specific roles.
-- Prefer robust helper logic that derives object roles from names and win text
-  over a single hard-coded Sokoban key. If aliases exist, use all matching
-  variants instead of treating missing "player" or "crate" as an invalid state.
-"""
+LEGACY_ASTAR_PROBE = """NON-NEGOTIABLE LEGACY-ASTAR PROBE:
+For this train/dev diagnostic generation, define heuristic_cost_to_go rather
+than search_plan. This probe is feedback-only and does not contribute to the
+candidate scalar score."""
 
 
 @dataclass(frozen=True)
@@ -183,6 +289,20 @@ class PuzzleScriptLevelTask:
     env_description: str
     game_text_path: str
     replicate: int = 0
+    probe_route: str = ""
+    # Level shown to the synthesis agent. It is scored on `level`, so when the
+    # two differ an artifact cannot bank a precomputed plan for the instance it
+    # is graded on. -1 means "same as level" (no holdout).
+    dev_level: int = -1
+
+    @property
+    def visible_level(self) -> int:
+        """Return the level the synthesis agent may develop against."""
+        return self.level if self.dev_level < 0 else self.dev_level
+
+    @property
+    def has_sibling_holdout(self) -> bool:
+        return self.dev_level >= 0 and self.dev_level != self.level
 
 
 @dataclass(frozen=True)
@@ -197,10 +317,180 @@ class SearchArrayConfig:
     pool_dir: Optional[Path] = None
 
 
+_VALIDATED_SEARCH_SCAFFOLD = '''SEARCH_STRATEGY = "bounded_astar"
+
+def _estimate(ctx):
+    if ctx.get("is_winning", False):
+        return 0.0
+    value = ctx.get("score", 0.0)
+    return max(0.0, float(value)) if isinstance(value, (int, float)) else 0.0
+
+def search_plan(api, seed):
+    start = api.initial()
+    if api.is_winning(start):
+        return []
+    frontier = [(_estimate(api.ctx(start)), 0, 0, start, [])]
+    best_depth = {api.key(start): 0}
+    counter = 0
+    while frontier:
+        best_i = 0
+        for i in range(1, len(frontier)):
+            if frontier[i][:3] < frontier[best_i][:3]:
+                best_i = i
+        _, depth, _, state, path = frontier.pop(best_i)
+        for action, child in api.successors(state):
+            child_depth = depth + 1
+            key = api.key(child)
+            if child_depth >= best_depth.get(key, api.expansion_budget() + 1):
+                continue
+            child_path = path + [action]
+            if api.is_winning(child):
+                return child_path
+            best_depth[key] = child_depth
+            counter += 1
+            priority = child_depth + _estimate(api.ctx(child))
+            tie = (counter + int(seed)) % 1000003
+            frontier.append((priority, child_depth, tie, child, child_path))
+    return []
+'''
+
+
+def build_codex_synthesis_workspace(
+    task: PuzzleScriptLevelTask,
+    *,
+    script_doctor: Path,
+    initial_code: str | None = None,
+) -> dict[str, str]:
+    """Materialize the task-bound files used by the Codex coding agent."""
+    search_root = (_PROJECT_ROOT / "llm_desparsifier" / "search").resolve()
+    game_text = Path(task.game_text_path).read_text(encoding="utf-8")
+    candidate = (initial_code or _VALIDATED_SEARCH_SCAFFOLD).strip() + "\n"
+    api_doc = '''"""Exact generated-artifact contract; inspect this file before editing candidate.py.
+
+Allowed entrypoints (define exactly one):
+  heuristic_cost_to_go(ts, env_params, ctx) -> float
+  search_plan(api, seed) -> list[int]
+
+For custom search, states are opaque integer handles. successors(state) returns
+(action, child_state) pairs and consumes exactly one expansion. The hard budget
+is enforced inside successors(). Returned actions are replayed and must win.
+
+Typical use is `state = api.initial()`, `api.key(state)`, `api.ctx(state)`,
+`api.is_winning(state)`, and `for action, child in api.successors(state)`.
+
+Safe builtins: abs, min, max, sum, len, range, enumerate, zip, sorted, float,
+int, tuple, list, dict, set, bool, str, repr, isinstance, any, all, ord, chr,
+round, Exception, TypeError, ValueError, KeyError, IndexError. Imports, file and
+network access, subprocesses, eval, and exec are forbidden in candidate.py.
+"""
+
+class PuzzleScriptSearchAPI:
+    def initial(self) -> int: ...
+    def key(self, state: int) -> tuple: ...
+    def ctx(self, state: int) -> dict: ...
+    def is_winning(self, state: int) -> bool: ...
+    def successors(self, state: int) -> list[tuple[int, int]]: ...
+    def expansion_budget(self) -> int: ...
+'''
+    holdout_note = (
+        '''`game.puzzlescript` contains the supplied mechanics. Level {dev} is your
+development level and the only level `evaluate.py` runs. You will be graded on a
+DIFFERENT, undisclosed level of this same game, so an action sequence recorded
+for level {dev} is worth nothing. Spend your effort on search that works from
+any initial state of these mechanics: pruning, ordering, deadlock detection, and
+state abstraction all transfer; a memorized plan does not.'''.format(
+            dev=task.visible_level
+        )
+        if task.has_sibling_holdout
+        else '''`game.puzzlescript` contains the supplied mechanics and level {dev} is the
+only evaluation target.'''.format(dev=task.visible_level)
+    )
+    readme = f'''# Current PuzzleScript coding task
+
+Edit `candidate.py`, starting from the validated bounded A* implementation.
+Inspect `puzzlescript_api.py` for the exact runtime API and safe builtins.
+{holdout_note}
+
+The artifact is scored on how few states it expands before it wins, so a search
+that reaches the goal cheaply beats one that reaches it after exploring more.
+Returning a hardcoded action list expands nothing, but it only scores when it
+actually wins the level being graded.
+
+Run `python validate.py`, then `python evaluate.py --seed 0` (and fresh seeds)
+before finishing. Evaluation is bounded to this task. Keep the best validated
+artifact in candidate.py and return that file's Python source.
+'''
+    validate_script = f'''from pathlib import Path
+import sys
+sys.path.insert(0, {str(search_root)!r})
+from puzzlescript_sanitizer import sanitize_and_compile_puzzlescript_search
+
+code = Path("candidate.py").read_text(encoding="utf-8")
+strategy, _ = sanitize_and_compile_puzzlescript_search(code)
+print("valid strategy=" + strategy)
+'''
+    evaluate_script = f'''from pathlib import Path
+import json
+import subprocess
+import sys
+
+sys.path.insert(0, {str(_PROJECT_ROOT.resolve())!r})
+from scripts.run_puzzlescript_batched_gepa import (
+    PuzzleScriptEvaluator,
+    apply_search_task_memory_limit,
+    evaluate_search_task,
+)
+
+def worker(seed):
+    apply_search_task_memory_limit()
+    task = {{
+        "task_id": 0,
+        "game": {task.game!r},
+        "level": {int(task.visible_level)},
+        "budget": {int(task.budget)},
+        "game_text_path": str(Path("game.puzzlescript").resolve()),
+        "heuristic_code_path": str(Path("candidate.py").resolve()),
+        "replicate": int(seed),
+    }}
+    evaluator = PuzzleScriptEvaluator(Path({str(script_doctor.resolve())!r}))
+    result = evaluate_search_task(evaluator=evaluator, task=task, astar_timeout_s=30.0)
+    print(json.dumps(result, indent=2, sort_keys=True, default=str))
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--worker":
+        worker(int(sys.argv[2]))
+    else:
+        seed = int(sys.argv[2]) if len(sys.argv) == 3 and sys.argv[1] == "--seed" else 0
+        completed = subprocess.run(
+            [sys.executable, __file__, "--worker", str(seed)],
+            text=True,
+            capture_output=True,
+            timeout=45,
+            check=False,
+        )
+        sys.stdout.write(completed.stdout)
+        sys.stderr.write(completed.stderr)
+        raise SystemExit(completed.returncode)
+'''
+    return {
+        "README.md": readme,
+        "candidate.py": candidate,
+        "puzzlescript_api.py": api_doc,
+        "validate.py": validate_script,
+        "evaluate.py": evaluate_script,
+        "game.puzzlescript": game_text,
+    }
+
+
 class TextCompletionClient(Protocol):
     """Minimal text-generation interface used by GEPA synthesis and reflection."""
 
-    def complete(self, prompt: str) -> str:
+    def complete(
+        self,
+        prompt: str,
+        *,
+        workspace_files: Mapping[str, str] | None = None,
+    ) -> str:
         """Return one model completion for the supplied prompt."""
 
 
@@ -261,6 +551,115 @@ class OpenAITextClient:
         raise RuntimeError("unreachable context retry loop exit")
 
 
+# Wording that means the account, not the request, is the problem. Retrying
+# these is pointless and scoring them as candidate errors is actively harmful.
+_CODEX_TERMINAL_MARKERS = (
+    "usage limit",
+    "quota",
+    "insufficient_quota",
+    "out of credits",
+    "billing",
+    "plan limit",
+    "upgrade your plan",
+)
+
+# Wording that means "slow down" or "try again", not "you are out". These must
+# be retried rather than aborted: raising synthesis concurrency makes them
+# routine, and treating them as terminal would kill a healthy run.
+_CODEX_TRANSIENT_MARKERS = (
+    "rate limit",
+    "429",
+    "too many requests",
+    "overloaded",
+    "temporarily unavailable",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection refused",
+    "network",
+    "502",
+    "503",
+    "504",
+)
+
+# Consecutive transport failures tolerated before the run is declared unusable.
+DEFAULT_CODEX_FAILURE_BUDGET = 12
+
+# Per-call retry policy for transient failures.
+DEFAULT_CODEX_RETRIES = 3
+DEFAULT_CODEX_RETRY_BASE_S = 10.0
+# Agentic synthesis is a coding agent that reads, writes and validates a
+# candidate; observed runs average roughly 25 minutes, so the short text
+# timeout would kill healthy work. This is a hang watchdog rather than a
+# latency budget: large enough to leave real synthesis alone, small enough
+# that a wedged Codex cannot stall the optimizer for hours the way one did
+# during the luna v12 baseline.
+DEFAULT_CODEX_AGENTIC_TIMEOUT_S = 3600.0
+
+
+def classify_codex_failure(detail: str) -> str:
+    """Return 'terminal', 'transient', or 'unknown' for a Codex failure."""
+    lowered = detail.lower()
+    if any(marker in lowered for marker in _CODEX_TERMINAL_MARKERS):
+        return "terminal"
+    if any(marker in lowered for marker in _CODEX_TRANSIENT_MARKERS):
+        return "transient"
+    return "unknown"
+
+
+class CodexUnavailableError(RuntimeError):
+    """Raised when the Codex backend stops answering for everything.
+
+    A run that keeps going after this point does not produce a weaker result,
+    it produces a fictitious one: every un-synthesized level is scored as a
+    candidate error, so an outage is written into the artifacts as if the
+    prompt had failed. Aborting is the only honest outcome.
+    """
+
+
+class _CodexHealth:
+    """Track consecutive Codex failures across every call site in the run."""
+
+    def __init__(self, budget: int = DEFAULT_CODEX_FAILURE_BUDGET) -> None:
+        self.budget = max(1, int(budget))
+        self.consecutive_failures = 0
+        self.tripped_reason: Optional[str] = None
+        self._lock = threading.Lock()
+
+    def record_success(self) -> None:
+        with self._lock:
+            self.consecutive_failures = 0
+
+    def record_failure(self, detail: str) -> Optional[str]:
+        """Return a fatal reason when the backend should be considered down.
+
+        Only exhausted quota is terminal on sight. Transient pushback is
+        expected at high concurrency and is retried by the caller; it counts
+        toward the consecutive-failure budget so a backend that is down for
+        good still stops the run.
+        """
+        terminal = classify_codex_failure(detail) == "terminal"
+        with self._lock:
+            self.consecutive_failures += 1
+            count = self.consecutive_failures
+            if terminal:
+                self.tripped_reason = f"Codex reported exhausted quota: {detail}"
+            elif count >= self.budget:
+                self.tripped_reason = (
+                    f"{count} consecutive Codex failures; last error: {detail}"
+                )
+            else:
+                return None
+            return self.tripped_reason
+
+    @property
+    def tripped(self) -> bool:
+        return self.tripped_reason is not None
+
+
+CODEX_HEALTH = _CodexHealth()
+
+
 @dataclass
 class CodexCLITextClient:
     """Use a logged-in Codex CLI as a structured completion or read-only agent."""
@@ -272,8 +671,16 @@ class CodexCLITextClient:
     working_directory: Optional[Path] = None
     allow_read_tools: bool = False
     agentic_workspace: bool = False
+    retries: int = DEFAULT_CODEX_RETRIES
+    retry_base_s: float = DEFAULT_CODEX_RETRY_BASE_S
+    agentic_timeout_s: float = DEFAULT_CODEX_AGENTIC_TIMEOUT_S
 
-    def complete(self, prompt: str) -> str:
+    def complete(
+        self,
+        prompt: str,
+        *,
+        workspace_files: Mapping[str, str] | None = None,
+    ) -> str:
         schema = {
             "type": "object",
             "properties": {"text": {"type": "string"}},
@@ -282,11 +689,11 @@ class CodexCLITextClient:
         }
         if self.agentic_workspace:
             backend_prompt = (
-                "Act as a coding agent in the isolated current workspace. Use shell tools "
-                "to draft the requested Python function in candidate.py and test it with "
-                "Python before answering. Do not inspect paths outside the current "
-                "workspace, use the network, or launch jobs. Put the final function code "
-                "in the `text` field.\n\n"
+                "Act as a coding agent in the isolated current workspace. Read README.md "
+                "and the supplied API files, start from candidate.py, and run the local "
+                "validation and evaluation commands before finishing. Do not inspect paths "
+                "outside this workspace, use the network, or launch jobs. Leave the best "
+                "validated artifact in candidate.py and put its source in the `text` field.\n\n"
                 + prompt
             )
         elif self.allow_read_tools:
@@ -306,6 +713,12 @@ class CodexCLITextClient:
             )
         with tempfile.TemporaryDirectory(prefix="gepa-codex-") as temp_dir:
             temp_root = Path(temp_dir)
+            if workspace_files:
+                for name, contents in workspace_files.items():
+                    path = Path(name)
+                    if path.name != name or path.is_absolute():
+                        raise ValueError(f"unsafe agent workspace filename: {name}")
+                    (temp_root / name).write_text(contents, encoding="utf-8")
             schema_path = temp_root / "schema.json"
             output_path = temp_root / "output.json"
             schema_path.write_text(json.dumps(schema), encoding="utf-8")
@@ -339,19 +752,59 @@ class CodexCLITextClient:
                     ["--config", f'model_reasoning_effort="{self.reasoning_effort}"']
                 )
             command.append("-")
-            completed = subprocess.run(
-                command,
-                cwd=temp_root if self.agentic_workspace else (self.working_directory or temp_root),
-                input=backend_prompt,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            if completed.returncode != 0:
-                detail = truncate_text(completed.stderr.strip(), 4000)
+            attempts = max(1, int(self.retries) + 1)
+            for attempt in range(attempts):
+                call_timeout_s = (
+                    self.agentic_timeout_s
+                    if self.agentic_workspace
+                    else self.timeout_s
+                )
+                try:
+                    completed = subprocess.run(
+                        command,
+                        cwd=temp_root
+                        if self.agentic_workspace
+                        else (self.working_directory or temp_root),
+                        input=backend_prompt,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=call_timeout_s,
+                    )
+                except subprocess.TimeoutExpired:
+                    # Codex can finish its work and still never exit, e.g. when
+                    # the agentic sandbox leaves a detached child holding the
+                    # inherited pipes. Untimed, that wedges the whole run in
+                    # silence: one such call stalled luna v12 for nine hours.
+                    # Report it as an ordinary failed attempt so the retry and
+                    # health bookkeeping below treat it as a transient fault.
+                    completed = subprocess.CompletedProcess(
+                        command,
+                        -9,
+                        "",
+                        f"Codex CLI timed out after {call_timeout_s:.0f}s "
+                        "and was killed.",
+                    )
+                if completed.returncode == 0:
+                    break
+                detail = truncate_middle_text(completed.stderr.strip(), 4000)
+                fatal = CODEX_HEALTH.record_failure(detail)
+                if fatal:
+                    raise CodexUnavailableError(fatal)
+                kind = classify_codex_failure(detail)
+                if kind == "transient" and attempt + 1 < attempts:
+                    delay = self.retry_base_s * (3.0**attempt) * (0.5 + random.random())
+                    print(
+                        f"[llm] transient Codex failure, retrying in {delay:.0f}s "
+                        f"(attempt {attempt + 1}/{attempts})",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    continue
                 raise RuntimeError(
                     f"Codex CLI completion failed with exit code {completed.returncode}: {detail}"
                 )
+            CODEX_HEALTH.record_success()
             try:
                 payload = json.loads(output_path.read_text(encoding="utf-8"))
                 text = payload["text"]
@@ -359,6 +812,11 @@ class CodexCLITextClient:
                 raise RuntimeError("Codex CLI returned an invalid structured response") from exc
             if not isinstance(text, str) or not text.strip():
                 raise RuntimeError("Codex CLI returned an empty text completion")
+            candidate_path = temp_root / "candidate.py"
+            if self.agentic_workspace and workspace_files and candidate_path.is_file():
+                candidate_text = candidate_path.read_text(encoding="utf-8").strip()
+                if candidate_text:
+                    return candidate_text
             return text.strip()
 
 
@@ -396,6 +854,21 @@ def truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+
+
+def truncate_middle_text(text: str, limit: int) -> str:
+    """Truncate from the middle, keeping both ends of the text.
+
+    Subprocess diagnostics put the reason for a failure last, after echoing
+    whatever was sent in. Head-only truncation therefore discards exactly the
+    part worth reading.
+    """
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    dropped = len(text) - limit
+    return text[:head] + f"\n...[truncated {dropped} chars]...\n" + text[-tail:]
 
 
 def reflection_env_summary(text: str) -> str:
@@ -460,6 +933,35 @@ def _common_solve_efficiency_log2_delta(row: Mapping[str, Any]) -> Optional[floa
     return math.log2((baseline_expanded + 1.0) / (expanded + 1.0))
 
 
+def _row_solved_expanded(row: Mapping[str, Any], *, prefix: str = "") -> Optional[float]:
+    """Return mean expansions across a row's solved replicates."""
+    expanded = _optional_result_float(row, f"{prefix}solved_expanded_mean")
+    if expanded is None:
+        expanded = _optional_result_float(row, f"{prefix}expanded")
+    return expanded
+
+
+def _is_replay_solve(row: Mapping[str, Any], *, prefix: str = "") -> bool:
+    """Return whether a solve used no expansions at all.
+
+    An artifact that returns a precomputed action list wins without searching.
+    That is a legitimate way to solve a level, but it carries no information
+    about search efficiency, so it must not be averaged into the efficiency
+    statistic as if it were an infinitely fast search.
+    """
+    if _row_solve_rate(row, prefix=prefix) <= 0.0:
+        return False
+    expanded = _row_solved_expanded(row, prefix=prefix)
+    return expanded is not None and expanded <= 0.0
+
+
+def _is_searched_common_solve(row: Mapping[str, Any]) -> bool:
+    """Return whether both prompts solved the row by actually searching."""
+    if _common_solve_efficiency_log2_delta(row) is None:
+        return False
+    return not _is_replay_solve(row) and not _is_replay_solve(row, prefix="baseline_")
+
+
 def _is_high_headroom_common_solve(
     row: Mapping[str, Any],
     *,
@@ -472,11 +974,9 @@ def _is_high_headroom_common_solve(
     examples are the common-solve cases where the base prompt expanded enough
     states that an efficiency lesson is worth highlighting to GEPA.
     """
-    if _common_solve_efficiency_log2_delta(row) is None:
+    if not _is_searched_common_solve(row):
         return False
-    baseline_expanded = _optional_result_float(row, "baseline_solved_expanded_mean")
-    if baseline_expanded is None:
-        baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    baseline_expanded = _row_solved_expanded(row, prefix="baseline_")
     return baseline_expanded is not None and baseline_expanded >= max(0.0, threshold)
 
 
@@ -495,11 +995,9 @@ def _common_solve_efficiency_headroom_scale(
     below solve/loss events while distinguishing barely-expensive common solves
     from cases where the base prompt spent thousands of expansions.
     """
-    if _common_solve_efficiency_log2_delta(row) is None:
+    if not _is_searched_common_solve(row):
         return 0.0
-    baseline_expanded = _optional_result_float(row, "baseline_solved_expanded_mean")
-    if baseline_expanded is None:
-        baseline_expanded = _optional_result_float(row, "baseline_expanded")
+    baseline_expanded = _row_solved_expanded(row, prefix="baseline_")
     if baseline_expanded is None or baseline_expanded <= 0:
         return 0.0
     positive_threshold = max(1.0, threshold)
@@ -849,12 +1347,14 @@ def candidate_prompt_issue(prompt_text: str) -> Optional[str]:
     stripped = cleaned.strip()
     if not stripped:
         return "candidate prompt is empty"
+    if re.search(r"\bdo\s+not\s+define\s+search_plan\b", stripped, re.IGNORECASE):
+        return "candidate prompt disables the immutable custom-search route"
     first_content_line = next(
         (line.strip() for line in stripped.splitlines() if line.strip()),
         "",
     )
     if re.match(
-        r"^(?:async\s+def|def\s+heuristic_cost_to_go\s*\(|import\s+|from\s+\S+\s+import\s+)",
+        r"^(?:async\s+def|def\s+(?:heuristic_cost_to_go|search_plan)\s*\(|import\s+|from\s+\S+\s+import\s+)",
         first_content_line,
     ):
         return "candidate prompt is a Python implementation rather than instruction text"
@@ -869,10 +1369,10 @@ def candidate_prompt_issue(prompt_text: str) -> Optional[str]:
         return "candidate prompt is a Python implementation rather than instruction text"
     if any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "heuristic_cost_to_go"
+        and node.name in {"heuristic_cost_to_go", "search_plan"}
         for node in tree.body
     ):
-        return "candidate prompt contains a heuristic implementation instead of instructions"
+        return "candidate prompt contains a search implementation instead of instructions"
     return None
 
 
@@ -1306,12 +1806,65 @@ def aggregate_replicate_results(
     """Aggregate fresh heuristic samples into one stable GEPA task result."""
     if not rows:
         raise ValueError("Cannot aggregate an empty replicate set.")
-    solved_rows = [row for row in rows if bool(row.get("solved", False))]
-    result = dict((solved_rows or list(rows))[0])
-    count = len(rows)
+    scored_rows = [row for row in rows if not str(row.get("probe_route", ""))] or list(rows)
+    solved_rows = [row for row in scored_rows if bool(row.get("solved", False))]
+    representative = max(
+        scored_rows,
+        key=lambda row: (
+            bool(row.get("solved", False)),
+            float(row.get("score", 0.0) or 0.0),
+            -float(row.get("expanded", 0.0) or 0.0),
+        ),
+    )
+    result = dict(representative)
+    count = len(scored_rows)
 
-    def mean(key: str, selected: Sequence[Mapping[str, Any]] = rows) -> float:
+    def mean(key: str, selected: Sequence[Mapping[str, Any]] = scored_rows) -> float:
         return sum(float(row.get(key, 0.0) or 0.0) for row in selected) / len(selected)
+
+    by_algorithm: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        algorithm = str(
+            row.get("search_algorithm")
+            or row.get("search_strategy")
+            or "unknown"
+        )
+        by_algorithm.setdefault(algorithm, []).append(row)
+    strategy_breakdown: dict[str, dict[str, Any]] = {}
+    for algorithm, strategy_rows in sorted(by_algorithm.items()):
+        strategy_solved = [row for row in strategy_rows if bool(row.get("solved", False))]
+        strategy_representative = max(
+            strategy_rows,
+            key=lambda row: (
+                bool(row.get("solved", False)),
+                float(row.get("score", 0.0) or 0.0),
+                -float(row.get("expanded", 0.0) or 0.0),
+            ),
+        )
+        strategy_breakdown[algorithm] = {
+            "search_strategy": str(strategy_representative.get("search_strategy", "unknown")),
+            "count": len(strategy_rows),
+            "solved": len(strategy_solved),
+            "solve_rate": len(strategy_solved) / len(strategy_rows),
+            "mean_expanded": sum(
+                float(row.get("expanded", 0.0) or 0.0) for row in strategy_rows
+            )
+            / len(strategy_rows),
+            "mean_score": sum(
+                float(row.get("score", 0.0) or 0.0) for row in strategy_rows
+            )
+            / len(strategy_rows),
+            "candidate_error_rate": sum(is_candidate_error(row) for row in strategy_rows)
+            / len(strategy_rows),
+            "probe_count": sum(bool(str(row.get("probe_route", ""))) for row in strategy_rows),
+            "termination_reasons": [
+                row.get("trace_summary", {}).get("terminated_reason", "unknown")
+                for row in strategy_rows
+                if isinstance(row.get("trace_summary"), Mapping)
+            ],
+            "representative_code_path": strategy_representative.get("heuristic_code_path"),
+            "representative_feedback": strategy_representative.get("feedback", ""),
+        }
 
     solve_rate = len(solved_rows) / count
     result.update(
@@ -1326,24 +1879,53 @@ def aggregate_replicate_results(
         expanded=mean("expanded"),
         generated=mean("generated"),
         solved_expanded_mean=mean("expanded", solved_rows) if solved_rows else None,
+        solved_time_mean=mean("time_s", solved_rows) if solved_rows else None,
         solution_length=mean("solution_length", solved_rows) if solved_rows else 0.0,
-        candidate_error_rate=sum(is_candidate_error(row) for row in rows) / count,
-        replicate_expansions=[row.get("expanded") for row in rows],
+        candidate_error_rate=sum(is_candidate_error(row) for row in scored_rows) / count,
+        probe_count=len(rows) - count,
+        strategy_breakdown=strategy_breakdown,
+        replicate_expansions=[row.get("expanded") for row in scored_rows],
         replicate_termination_reasons=[
             row.get("trace_summary", {}).get("terminated_reason")
-            for row in rows
+            for row in scored_rows
             if isinstance(row.get("trace_summary"), Mapping)
         ],
+        replicate_search_strategies=[str(row.get("search_strategy", "unknown")) for row in rows],
+        replicate_search_algorithms=[str(row.get("search_algorithm", "unknown")) for row in rows],
         replicate_results=[dict(row) for row in rows],
+        route_probe_results=[dict(row) for row in rows if str(row.get("probe_route", ""))],
     )
-    synthesis_errors = [str(row["synthesis_error"]) for row in rows if row.get("synthesis_error")]
+    synthesis_errors = [
+        str(row["synthesis_error"])
+        for row in scored_rows
+        if row.get("synthesis_error")
+    ]
     result["synthesis_error"] = "; ".join(synthesis_errors) if synthesis_errors else None
     result["feedback"] = (
-        f"Fresh heuristic replicates solved {len(solved_rows)}/{count}; "
+        f"Fresh search-code replicates solved {len(solved_rows)}/{count}; "
         f"mean score={result['score']:.4f}, mean expansions={result['expanded']:.1f}, "
+        f"algorithms={result['replicate_search_algorithms']}, probes={result['probe_count']}, "
         f"candidate error rate={result['candidate_error_rate']:.3f}."
     )
     return result
+
+
+def should_add_route_probes(
+    task: PuzzleScriptLevelTask,
+    baseline: Mapping[str, Any] | None,
+) -> bool:
+    """Probe both routes only on train/dev levels with search headroom."""
+    if not baseline:
+        return False
+    solve_rate = float(
+        baseline.get("solve_rate", float(bool(baseline.get("solved", False))))
+    )
+    expanded = baseline.get("solved_expanded_mean", baseline.get("expanded", 0.0))
+    try:
+        expanded_value = float(expanded or 0.0)
+    except (TypeError, ValueError):
+        expanded_value = 0.0
+    return solve_rate < 1.0 or expanded_value >= max(1000.0, 0.2 * task.budget)
 
 
 def filter_unlearnable_tasks(
@@ -1597,6 +2179,327 @@ def candidate_score(
     return sum(scores) / len(scores)
 
 
+def load_blind_reference(path: Optional[Path]) -> dict[tuple[str, int], dict[str, Any]]:
+    """Load measured blind (h=0) A* effort keyed by (game, level).
+
+    This is the fixed reference the efficiency objective is stated against.
+    Comparing a candidate against the previous prompt cannot show that search
+    got more efficient in absolute terms; comparing it against blind search on
+    the same level can.
+    """
+    if path is None:
+        return {}
+    payload = json.loads(Path(path).expanduser().resolve().read_text(encoding="utf-8"))
+    reference: dict[tuple[str, int], dict[str, Any]] = {}
+    for entry in payload.get("levels", {}).values():
+        reference[(str(entry["game"]), int(entry["level"]))] = {
+            "blind_solved": bool(entry.get("blind_solved")),
+            "blind_expanded": int(entry.get("blind_expanded", 0) or 0),
+            # Carried so a wall-time objective can state its ratio against the
+            # same fixed reference the expansion objective uses.
+            "blind_time_s": float(entry.get("blind_time_s", 0.0) or 0.0),
+            # Distinguishes a level blind search merely ran out of budget on
+            # (a usable frontier reference) from one it errored on or proved
+            # exhausted (no usable measurement at all).
+            "terminated_reason": str(entry.get("terminated_reason", "") or ""),
+            "ceiling": int(entry.get("measurement_ceiling", 0) or 0),
+        }
+    return reference
+
+
+def blind_reference_is_usable(
+    entry: Optional[Mapping[str, Any]],
+    *,
+    include_frontier: bool = False,
+) -> bool:
+    """Return whether a level carries a reference an efficiency score can use.
+
+    A level blind search solved always qualifies. A level it merely ran out of
+    expansion budget on qualifies only when `include_frontier` is set: the
+    recorded time is then a censored lower bound ("blind spent this long and
+    still failed"), which is exactly the comparison the frontier levels exist
+    to make. Levels blind search errored on or exhausted carry no usable
+    measurement and never qualify.
+    """
+    if not entry:
+        return False
+    if entry.get("blind_solved"):
+        return True
+    if not include_frontier:
+        return False
+    if str(entry.get("terminated_reason", "")) != "expansion_budget":
+        return False
+    return float(entry.get("blind_time_s", 0.0) or 0.0) > 0.0
+
+
+def blind_reference_budget(
+    entry: Optional[Mapping[str, Any]],
+    *,
+    multiplier: float = DEFAULT_BLIND_BUDGET_MULTIPLIER,
+    fallback: int,
+    ceiling: int = 0,
+) -> int:
+    """Return the expansion budget for one level.
+
+    A level blind search can solve gets `multiplier x` its blind cost, which
+    leaves room for a good heuristic to win comfortably while giving a weak one
+    nowhere to hide. A level blind search cannot solve has no measured cost, so
+    it keeps the measurement ceiling.
+    """
+    if not entry:
+        return max(1, int(fallback))
+    cap = max(0, int(ceiling or entry.get("ceiling") or 0))
+    if not entry.get("blind_solved"):
+        return max(1, cap or int(fallback))
+    scaled = int(round(max(0.0, multiplier) * float(entry.get("blind_expanded", 0) or 0)))
+    scaled = max(1, scaled)
+    return min(scaled, cap) if cap else scaled
+
+
+def row_blind_speedup_log2(
+    row: Mapping[str, Any],
+    reference: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> Optional[float]:
+    """Return log2(blind expansions / candidate expansions) for one level.
+
+    None means the level carries no efficiency information: either blind search
+    never solved it, so there is no reference, or the candidate did not solve
+    it. A solve that expanded nothing is a precomputed plan rather than a fast
+    search, so it scores a neutral 0.0 instead of an unbounded speedup.
+    """
+    entry = reference.get((str(row.get("game")), int(row.get("level", -1))))
+    if not entry or not entry.get("blind_solved"):
+        return None
+    if _row_solve_rate(row) <= 0.0:
+        return None
+    blind = float(entry.get("blind_expanded", 0) or 0)
+    if blind <= 0.0:
+        return None
+    expanded = _row_solved_expanded(row)
+    if expanded is None:
+        return None
+    if expanded <= 0.0:
+        return 0.0
+    return math.log2((blind + 1.0) / (expanded + 1.0))
+
+
+def row_base_relative_time_log2(row: Mapping[str, Any]) -> Optional[float]:
+    """Return log2(base wall time / candidate wall time) for one level.
+
+    Wall time is the only cost both artifact styles share. Scoring engine
+    expansions instead lets a candidate look better merely by switching from an
+    internally-modelled search to an engine-driven one, because an artifact
+    that never calls successors() reports zero expansions while still doing the
+    work. Timing the whole solve prices that work wherever it happens.
+
+    None means the pair carries no information: either side failed to solve, or
+    a solve was too fast to time reliably.
+    """
+    if _row_solve_rate(row) <= 0.0 or _row_solve_rate(row, prefix="baseline_") <= 0.0:
+        return None
+    candidate = _optional_result_float(row, "solved_time_mean")
+    base = _optional_result_float(row, "baseline_solved_time_mean")
+    if candidate is None or base is None:
+        return None
+    # Clamp rather than discard. Dropping sub-millisecond solves would silently
+    # ignore a candidate that replaced an instant solve with a slow one.
+    base = max(base, MIN_MEASURABLE_SOLVE_SECONDS)
+    candidate = max(candidate, MIN_MEASURABLE_SOLVE_SECONDS)
+    return math.log2(base / candidate)
+
+
+def base_relative_time_scores(
+    outputs: Sequence[Mapping[str, Any]],
+    *,
+    solve_slack: float = 0.0,
+) -> list[float]:
+    """Score a candidate by how much faster it is than the un-optimized prompt.
+
+    This is the quantity GEPA exists to improve, stated directly instead of
+    inferred from two absolute measurements. Solve rate stays a feasibility
+    constraint rather than a score term, so a candidate cannot buy speed by
+    giving up levels.
+    """
+    rows = list(outputs)
+    if not rows:
+        return []
+    weights = _macro_game_weights(rows)
+    deltas = [row_base_relative_time_log2(row) for row in rows]
+    eligible_count = sum(1 for value in deltas if value is not None)
+
+    solved = sum(1 for row in rows if _row_solve_rate(row) > 0.0)
+    baseline_solved = sum(
+        1 for row in rows if _row_solve_rate(row, prefix="baseline_") > 0.0
+    )
+    shortfall = max(0.0, (baseline_solved - solved) / len(rows) - max(0.0, solve_slack))
+
+    scores: list[float] = []
+    for value, weight in zip(deltas, weights, strict=True):
+        contribution = 0.0
+        if value is not None and eligible_count:
+            contribution = value * weight * (len(rows) / eligible_count)
+        scores.append(contribution - CONSTRAINT_VIOLATION_PENALTY * shortfall)
+    return scores
+
+
+def constrained_speedup_scores(
+    outputs: Sequence[Mapping[str, Any]],
+    reference: Mapping[tuple[str, int], Mapping[str, Any]],
+    *,
+    solve_slack: float = 0.0,
+) -> list[float]:
+    """Score candidates by search speedup, gated on not losing solves.
+
+    The research claim is that search becomes more efficient and that a higher
+    solve rate follows from that. Folding both into one weighted sum made solve
+    events dominate by roughly eleven to one and put a high-variance term in the
+    gradient. Here mean log2 speedup against blind search is the objective and
+    solve rate is a feasibility constraint, so a candidate that trades search
+    quality for solves cannot win.
+
+    The returned list is one value per task, as GEPA requires, arranged so the
+    arithmetic mean is the macro-game-weighted objective.
+    """
+    rows = list(outputs)
+    if not rows:
+        return []
+    weights = _macro_game_weights(rows)
+    speedups = [row_blind_speedup_log2(row, reference) for row in rows]
+    eligible = [value is not None for value in speedups]
+    eligible_count = sum(eligible)
+
+    solved = sum(1 for row in rows if _row_solve_rate(row) > 0.0)
+    baseline_solved = sum(
+        1 for row in rows if _row_solve_rate(row, prefix="baseline_") > 0.0
+    )
+    shortfall = max(0.0, (baseline_solved - solved) / len(rows) - max(0.0, solve_slack))
+
+    scores: list[float] = []
+    for value, weight in zip(speedups, weights, strict=True):
+        # Levels with no reference contribute nothing to the objective but still
+        # count toward the constraint through the solve tallies above.
+        contribution = 0.0
+        if value is not None and eligible_count:
+            contribution = value * weight * (len(rows) / eligible_count)
+        scores.append(contribution - CONSTRAINT_VIOLATION_PENALTY * shortfall)
+    return scores
+
+
+def effective_unsolved_log2(
+    unsolved_log2: float,
+    clip: float,
+    slow_solve_clip: float | None = None,
+) -> float:
+    """Return the score charged for an unsolved level.
+
+    Solved levels are clipped to [-clip, +clip], so a failure must sit at or
+    below -clip or the objective pays a candidate to abandon any level it could
+    only solve slowly. v13 shipped with the two set independently (-3.0 against
+    a clip of 14.0) and its best-scoring candidate did exactly that: 3x faster
+    on what it solved, 18.00/24 solves against the seed's 19.67.
+
+    A caller may ask for something even lower, but never something higher.
+    """
+    lower = abs(clip if slow_solve_clip is None else slow_solve_clip)
+    floor = -(lower + DEFAULT_UNSOLVED_MARGIN)
+    return min(float(unsolved_log2), floor)
+
+
+def row_blind_relative_time_log2(
+    row: Mapping[str, Any],
+    reference: Mapping[tuple[str, int], Mapping[str, Any]],
+    *,
+    unsolved_log2: float,
+    clip: float,
+    slow_solve_clip: float | None = None,
+) -> Optional[float]:
+    """Return log2(blind wall time / candidate wall time) for one level.
+
+    The reference is fixed blind search rather than the previous prompt, so the
+    value reads as "this many doublings faster than uninformed search" in
+    absolute terms and stays comparable across runs, models and iterations.
+    Wall time rather than expansions because the dual-route contract lets a
+    search_plan artifact do its work inside the engine and report zero
+    expansions while still paying the cost.
+
+    A level the candidate failed scores `unsolved_log2` rather than dropping
+    out. Efficiency is undefined where nothing was solved, so omitting failures
+    would make "solve only the easy levels quickly" the optimum.
+
+    None means the level carries no reference at all, which is a property of
+    the task set rather than of the candidate.
+    """
+    entry = reference.get((str(row.get("game")), int(row.get("level", -1))))
+    if not blind_reference_is_usable(entry, include_frontier=True):
+        return None
+    blind_time = float((entry or {}).get("blind_time_s", 0.0) or 0.0)
+    if blind_time <= 0.0:
+        return None
+    floor = effective_unsolved_log2(unsolved_log2, clip, slow_solve_clip)
+    lower = abs(clip if slow_solve_clip is None else slow_solve_clip)
+    rate = _row_solve_rate(row)
+    if rate <= 0.0:
+        return floor
+    candidate = _optional_result_float(row, "solved_time_mean")
+    if candidate is None:
+        return floor
+    # Deliberately no zero-expansion guard here. row_blind_speedup_log2 needs
+    # one because zero expansions makes *its* metric meaningless, but on wall
+    # time zero expansions is not evidence of cheating: an artifact that runs
+    # its own heap and returns a finished path never calls successors(), so the
+    # evaluator counts nothing while the work still happened and is still
+    # timed. The smoke run's zero-expansion rows were 200-line push-level A*
+    # implementations with matching heuristics, not precomputed plans, and
+    # guarding them to 0.0 discarded the best artifacts in the run. Hardcoding
+    # is prevented by the sibling-level holdout, which never shows the agent
+    # the scored level, not by counting expansions.
+    blind_time = max(blind_time, MIN_MEASURABLE_SOLVE_SECONDS)
+    candidate = max(candidate, MIN_MEASURABLE_SOLVE_SECONDS)
+    speed = max(-lower, min(clip, math.log2(blind_time / candidate)))
+    # Score the expectation across replicates rather than crediting any nonzero
+    # solve rate as a full solve at the speed of its lucky run. Treating a
+    # 1-in-3 solve as reliable is the other way "do not solve" pays: v13's
+    # best-scoring candidate solved 8 of 24 levels only sometimes and was
+    # charged nothing for it, while a candidate that solved them every time
+    # scored no better.
+    return rate * speed + (1.0 - rate) * floor
+
+
+def blind_relative_time_scores(
+    outputs: Sequence[Mapping[str, Any]],
+    reference: Mapping[tuple[str, int], Mapping[str, Any]],
+    *,
+    unsolved_log2: float,
+    clip: float,
+    slow_solve_clip: float | None = None,
+) -> list[float]:
+    """Score a candidate on speed against blind search, with no solve gate.
+
+    There is no lost-solve penalty and no feasibility constraint. A dropped
+    solve is already priced on the level where it happened, so the objective
+    stays continuous instead of falling off the cliff that made every proposal
+    in the sol run downside-only. Because the reference is external and fixed,
+    a level the seed prompt never solved still contributes: solving it is just
+    a large positive term, which is the headroom a per-run baseline cannot
+    express.
+
+    Levels with no blind reference score a neutral 0.0. Pair this objective
+    with --require-blind-reference so the task set has none of them.
+    """
+    rows = list(outputs)
+    if not rows:
+        return []
+    weights = _macro_game_weights(rows)
+    scores: list[float] = []
+    for row, weight in zip(rows, weights, strict=True):
+        value = row_blind_relative_time_log2(
+            row, reference, unsolved_log2=unsolved_log2, clip=clip,
+            slow_solve_clip=slow_solve_clip,
+        )
+        scores.append(0.0 if value is None else value * weight)
+    return scores
+
+
 def adjusted_candidate_scores(
     outputs: Sequence[Mapping[str, Any]],
     *,
@@ -1623,6 +2526,22 @@ def adjusted_candidate_scores(
     solves must produce strictly more new solves than losses before expansion
     efficiency can make the aggregate positive.
     """
+    if _OBJECTIVE_MODE == OBJECTIVE_BLIND_RELATIVE_TIME:
+        return blind_relative_time_scores(
+            outputs,
+            _OBJECTIVE_BLIND_REFERENCE,
+            unsolved_log2=_OBJECTIVE_UNSOLVED_LOG2,
+            clip=_OBJECTIVE_SPEEDUP_CLIP,
+            slow_solve_clip=_OBJECTIVE_SLOW_SOLVE_CLIP,
+        )
+    if _OBJECTIVE_MODE == OBJECTIVE_BASE_RELATIVE_TIME:
+        return base_relative_time_scores(outputs, solve_slack=_OBJECTIVE_SOLVE_SLACK)
+    if _OBJECTIVE_MODE == OBJECTIVE_SPEEDUP_CONSTRAINED:
+        return constrained_speedup_scores(
+            outputs,
+            _OBJECTIVE_BLIND_REFERENCE,
+            solve_slack=_OBJECTIVE_SOLVE_SLACK,
+        )
     rows = list(outputs)
     weights = _macro_game_weights(rows)
     gate_value = 0.0 if global_lost_solve_gate_penalty is None else global_lost_solve_gate_penalty
@@ -1837,6 +2756,21 @@ def build_level_env_description(
     )
 
 
+def assign_sibling_dev_levels(selected: Sequence[int], *, seed: int = 0) -> dict[int, int]:
+    """Pair each scored level with a different level of the same game.
+
+    The pairing is a deterministic rotation, so every scored level gets exactly
+    one visible sibling and every level is used as a development level once.
+    A game with a single level cannot be paired and maps to itself.
+    """
+    levels = list(selected)
+    if len(levels) < 2:
+        return {level: level for level in levels}
+    order = sorted(levels)
+    shift = 1 + (int(seed) % (len(order) - 1))
+    return {level: order[(index + shift) % len(order)] for index, level in enumerate(order)}
+
+
 def build_level_tasks(
     *,
     evaluator: PuzzleScriptEvaluator,
@@ -1845,6 +2779,13 @@ def build_level_tasks(
     levels_per_game: int,
     budget: int,
     selected_levels_by_game: Mapping[str, Sequence[int]] | None = None,
+    sibling_level_holdout: bool = False,
+    sibling_seed: int = 0,
+    blind_reference: Mapping[tuple[str, int], Mapping[str, Any]] | None = None,
+    blind_budget_multiplier: float = DEFAULT_BLIND_BUDGET_MULTIPLIER,
+    require_blind_reference: bool = False,
+    min_reference_seconds: float = DEFAULT_MIN_REFERENCE_SECONDS,
+    include_frontier_levels: bool = False,
 ) -> list[PuzzleScriptLevelTask]:
     tasks: list[PuzzleScriptLevelTask] = []
     for entry in jobs:
@@ -1877,20 +2818,74 @@ def build_level_tasks(
                 requested_levels = max(1, int(entry.get("levels", n_levels) or n_levels))
                 selected = select_level_indices(n_levels, requested_levels, levels_per_game)
             base_desc = build_env_description(compiled, engine.get_id_dict(), game_text)
+            dev_by_level = (
+                assign_sibling_dev_levels(selected, seed=sibling_seed)
+                if sibling_level_holdout
+                else {level: level for level in selected}
+            )
+            unpaired = [level for level, dev in dev_by_level.items() if dev == level]
+            if sibling_level_holdout and unpaired:
+                print(
+                    f"[inputs] {name}: {len(unpaired)} level(s) have no sibling "
+                    "and keep the scored level visible",
+                    flush=True,
+                )
             for level in selected:
+                dev_level = int(dev_by_level.get(level, level))
+                # Named apart from the env-grid `entry` above; reusing that
+                # name silently rebound the game's config partway through.
+                blind_entry = (blind_reference or {}).get((name, int(level)))
+                if require_blind_reference and not blind_reference_is_usable(
+                    blind_entry, include_frontier=include_frontier_levels
+                ):
+                    # No usable blind measurement means no speedup can be
+                    # defined here.
+                    continue
+                if min_reference_seconds > 0.0:
+                    reference_time = float(
+                        (blind_entry or {}).get("blind_time_s", 0.0) or 0.0
+                    )
+                    if reference_time < min_reference_seconds:
+                        print(
+                            f"[inputs] dropping {name} level={level}: blind "
+                            f"reference {reference_time:.4f}s under "
+                            f"--min-reference-seconds {min_reference_seconds:.4f}",
+                            flush=True,
+                        )
+                        continue
+                if sibling_level_holdout and dev_level == int(level):
+                    print(
+                        f"[inputs] dropping {name} level={level}: no sibling level "
+                        "to hide the scored instance behind",
+                        flush=True,
+                    )
+                    continue
                 try:
-                    env_description = build_level_env_description(base_desc, engine, compiled, level)
+                    # The agent sees the development level, never the scored one.
+                    env_description = build_level_env_description(
+                        base_desc, engine, compiled, dev_level
+                    )
                 except Exception as exc:
                     print(f"[inputs] skipping {name} level={level}: {exc}")
                     continue
+                level_budget = (
+                    blind_reference_budget(
+                        blind_entry,
+                        multiplier=blind_budget_multiplier,
+                        fallback=int(budget),
+                    )
+                    if blind_reference
+                    else int(budget)
+                )
                 tasks.append(
                     PuzzleScriptLevelTask(
                         task_id=len(tasks),
                         game=name,
                         level=int(level),
-                        budget=int(budget),
+                        budget=int(level_budget),
                         env_description=env_description,
                         game_text_path=str(game_text_path),
+                        dev_level=dev_level,
                     )
                 )
         except Exception as exc:
@@ -1898,12 +2893,25 @@ def build_level_tasks(
     return tasks
 
 
+def materialize_search_prompt(prompt_text: str) -> str:
+    """Append the evaluator-owned dual-route contract once."""
+    prompt = prompt_text.strip()
+    if IMMUTABLE_SEARCH_CONTRACT_HEADER not in prompt:
+        prompt += "\n\n" + IMMUTABLE_SEARCH_CONTRACT
+    return prompt
+
+
 def build_synthesis_prompt(prompt_text: str, task: PuzzleScriptLevelTask) -> str:
+    prompt = materialize_search_prompt(prompt_text)
+    if task.probe_route == "custom_search":
+        prompt += "\n\n" + CUSTOM_SEARCH_PROBE
+    elif task.probe_route == "heuristic":
+        prompt += "\n\n" + LEGACY_ASTAR_PROBE
     return (
-        prompt_text.strip()
+        prompt
         + "\n\nPuzzleScript game and level context:\n"
         + task.env_description
-        + "\n\nReturn only the Python function. Do not include markdown fences."
+        + "\n\nUse the supplied coding workspace and leave the best validated artifact in candidate.py."
     )
 
 
@@ -1912,12 +2920,24 @@ def build_repair_prompt(
     task: PuzzleScriptLevelTask,
     bad_code: str,
     issue: str,
+    *,
+    include_code: bool = True,
 ) -> str:
-    return (
+    prompt = (
         build_synthesis_prompt(prompt_text, task)
         + "\n\nThe previous output failed validation. Repair it once.\n"
         + f"Validation issue: {issue}\n"
-        + "Repair requirements: output exactly one heuristic_cost_to_go function. "
+    )
+    if not include_code:
+        return (
+            prompt
+            + "The previous candidate is already in candidate.py. Inspect the supplied "
+            + "workspace documentation, repair it, run the bounded validation/evaluation "
+            + "commands, and leave the best validated artifact in candidate.py."
+        )
+    return (
+        prompt
+        + "Repair requirements: output exactly one heuristic_cost_to_go or search_plan function. "
         + "No import statements, decorators, imported helpers, file access, or "
         + "cached library utilities are allowed anywhere, including inside helper "
         + "functions. Never return float('inf'), math.inf, nan, or any other "
@@ -1931,10 +2951,163 @@ def build_repair_prompt(
 
 def validate_heuristic_code(code: str) -> Optional[str]:
     try:
-        sanitize_and_compile_puzzlescript_heuristic(code)
+        sanitize_and_compile_puzzlescript_search(code)
     except Exception as exc:
         return str(exc)
     return None
+
+
+def baseline_provenance(
+    *,
+    prompt_text: str,
+    model: str,
+    reasoning_effort: str,
+    agentic: bool,
+    tasks: Sequence[Any],
+) -> dict[str, Any]:
+    """Describe what produced a scoring baseline, so reuse can be checked.
+
+    Seeding a run with a baseline synthesized under a different prompt, model,
+    or task definition silently compares candidates against the wrong
+    reference, which yields a clean-looking result that means nothing. Matching
+    on (game, level) coverage alone cannot catch that.
+    """
+    digest = hashlib.sha256()
+    for task in tasks:
+        digest.update(
+            f"{task.game}\x00{int(task.level)}\x00{int(getattr(task, 'dev_level', -1))}"
+            f"\x00{int(task.budget)}\x00".encode("utf-8")
+        )
+    return {
+        "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "agentic": bool(agentic),
+        "task_set_sha256": digest.hexdigest(),
+        "task_count": len(tasks),
+    }
+
+
+def check_baseline_provenance(
+    path: Path,
+    expected: Mapping[str, Any],
+    *,
+    allow_mismatch: bool = False,
+) -> None:
+    """Refuse to seed from a baseline that was not produced the same way."""
+    sidecar = path.with_suffix(path.suffix + ".provenance.json")
+    if not sidecar.is_file():
+        message = (
+            f"No provenance sidecar next to {path}. It cannot be shown to match "
+            "the current prompt, model, and task set."
+        )
+        if not allow_mismatch:
+            raise RuntimeError(message + " Pass --allow-baseline-provenance-mismatch to override.")
+        print(f"[baseline] WARNING: {message}", flush=True)
+        return
+    recorded = json.loads(sidecar.read_text(encoding="utf-8"))
+    differing = [
+        field
+        for field in ("prompt_sha256", "model", "reasoning_effort", "agentic", "task_set_sha256")
+        if recorded.get(field) != expected.get(field)
+    ]
+    if not differing:
+        print(f"[baseline] provenance matches: {sidecar.name}", flush=True)
+        return
+    message = f"Seeded baseline does not match this run; differing fields: {', '.join(differing)}"
+    if not allow_mismatch:
+        raise RuntimeError(message + ". Pass --allow-baseline-provenance-mismatch to override.")
+    print(f"[baseline] WARNING: {message}", flush=True)
+
+
+def synthesis_cache_key(
+    *,
+    prompt: str,
+    workspace_files: Mapping[str, str] | None,
+    model: str,
+    reasoning_effort: str,
+    agentic: bool,
+    replicate: int,
+) -> str:
+    """Hash everything the synthesis agent can observe.
+
+    Synthesis is the expensive, quota-consuming half of an evaluation; the
+    search that scores it is cheap and already spread across the array pool.
+    Most changes between runs are scoring-side — budgets aside, the agent sees
+    none of them — so keying on the agent's own inputs lets a re-scored run
+    reuse every artifact. Anything the agent could read is in the key, so a
+    changed prompt, workspace file, or model is a miss by construction.
+
+    The replicate index is part of the key: replicates exist to measure
+    synthesis variance, so collapsing them onto one cached artifact would
+    silently destroy the thing they measure.
+    """
+    digest = hashlib.sha256()
+    for part in (prompt, model, reasoning_effort, str(bool(agentic)), str(int(replicate))):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\x00")
+    for name in sorted(workspace_files or {}):
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update((workspace_files or {})[name].encode("utf-8"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+class SynthesisCache:
+    """Content-addressed store of synthesized artifacts, shared across runs."""
+
+    def __init__(self, root: Optional[Path]) -> None:
+        self.root = Path(root).expanduser().resolve() if root else None
+        if self.root is not None:
+            self.root.mkdir(parents=True, exist_ok=True)
+        self.hits = 0
+        self.misses = 0
+        self._lock = threading.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return self.root is not None
+
+    def path_for(self, key: str) -> Optional[Path]:
+        return None if self.root is None else self.root / f"{key}.py"
+
+    def get(self, key: str) -> Optional[str]:
+        path = self.path_for(key)
+        if path is None or not path.is_file():
+            with self._lock:
+                self.misses += 1
+            return None
+        try:
+            code = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if not code.strip():
+            return None
+        with self._lock:
+            self.hits += 1
+        return code
+
+    def put(self, key: str, code: str) -> None:
+        path = self.path_for(key)
+        if path is None or not code.strip():
+            return
+        # Write-then-rename so a killed run cannot leave a half-written entry
+        # that a later run would treat as a valid artifact.
+        temp = path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            temp.write_text(code, encoding="utf-8")
+            temp.replace(path)
+        except OSError:
+            temp.unlink(missing_ok=True)
+
+    def summary(self) -> str:
+        total = self.hits + self.misses
+        rate = (self.hits / total) if total else 0.0
+        return f"synthesis cache: hits={self.hits} misses={self.misses} rate={rate:.1%}"
+
+
+SYNTHESIS_CACHE = SynthesisCache(None)
 
 
 def synthesize_heuristic_code(
@@ -1942,17 +3115,64 @@ def synthesize_heuristic_code(
     llm: TextCompletionClient,
     prompt_text: str,
     task: PuzzleScriptLevelTask,
+    script_doctor: Path,
 ) -> tuple[str, Optional[str]]:
-    first = llm.complete(build_synthesis_prompt(prompt_text, task))
+    agentic = isinstance(llm, CodexCLITextClient) and llm.agentic_workspace
+    synthesis_prompt = build_synthesis_prompt(prompt_text, task)
+    workspace = (
+        build_codex_synthesis_workspace(task, script_doctor=script_doctor)
+        if agentic
+        else None
+    )
+    cache_key = ""
+    if SYNTHESIS_CACHE.enabled:
+        cache_key = synthesis_cache_key(
+            prompt=synthesis_prompt,
+            workspace_files=workspace,
+            model=getattr(llm, "model", ""),
+            reasoning_effort=getattr(llm, "reasoning_effort", ""),
+            agentic=agentic,
+            replicate=int(getattr(task, "replicate", 0)),
+        )
+        cached = SYNTHESIS_CACHE.get(cache_key)
+        if cached is not None and validate_heuristic_code(cached) is None:
+            return cached, None
+    first = (
+        llm.complete(synthesis_prompt, workspace_files=workspace)
+        if agentic
+        else llm.complete(synthesis_prompt)
+    )
     code = strip_outer_markdown_fences(first)
     issue = validate_heuristic_code(code)
     if issue is None:
+        if cache_key:
+            SYNTHESIS_CACHE.put(cache_key, code)
         return code, None
 
-    repaired = llm.complete(build_repair_prompt(prompt_text, task, code, issue))
+    repaired = (
+        llm.complete(
+            build_repair_prompt(
+                prompt_text,
+                task,
+                code,
+                issue,
+                include_code=False,
+            ),
+            workspace_files=build_codex_synthesis_workspace(
+                task,
+                script_doctor=script_doctor,
+                initial_code=code,
+            ),
+        )
+        if agentic
+        else llm.complete(build_repair_prompt(prompt_text, task, code, issue))
+    )
     repaired_code = strip_outer_markdown_fences(repaired)
     repaired_issue = validate_heuristic_code(repaired_code)
     if repaired_issue is None:
+        # Cache the repaired artifact too: a miss here costs two LLM calls.
+        if cache_key:
+            SYNTHESIS_CACHE.put(cache_key, repaired_code)
         return repaired_code, None
     return repaired_code, repaired_issue
 
@@ -1984,6 +3204,14 @@ def search_failure_result(task: Mapping[str, Any], *, feedback: str, error: str)
         "generated": 0,
         "solution_length": 0,
         "feedback": feedback,
+        "search_strategy": "invalid",
+        "search_algorithm": "invalid",
+        "probe_route": str(task.get("probe_route", "")),
+        "trace_summary": {
+            "search_strategy": "invalid",
+            "search_algorithm": "invalid",
+            "terminated_reason": "error",
+        },
         "heuristic_code_path": str(code_path),
         "error": error,
     }
@@ -2009,22 +3237,27 @@ def evaluate_search_task(
         )
 
     try:
-        raw_fn = sanitize_and_compile_puzzlescript_heuristic(code)
+        strategy, raw_fn = sanitize_and_compile_puzzlescript_search(code)
 
-        def heuristic_fn(ctx: dict[str, Any]) -> float:
-            return float(raw_fn(None, None, ctx))
+        if strategy == "heuristic":
+            def artifact_fn(ctx: dict[str, Any]) -> float:
+                return float(raw_fn(None, None, ctx))
+        else:
+            artifact_fn = raw_fn
 
         game_text = Path(str(task["game_text_path"])).read_text(encoding="utf-8")
         json_str = evaluator.compile_game(game_text)
         compiled = json.loads(json_str)
         engine = evaluator.load_engine(json_str)
         engine.load_level(level)
-        result = puzzlescript_astar(
+        result = puzzlescript_search(
             engine=engine,
             compiled_json=compiled,
-            heuristic_fn=heuristic_fn,
+            strategy=strategy,
+            artifact_fn=artifact_fn,
             max_expansions=budget,
             timeout_s=astar_timeout_s,
+            seed=int(task.get("seed", 0)) + int(task.get("replicate", 0)),
         )
         score = heuristic_score(result.solved, result.expanded_states, budget)
         partial_progress = trace_partial_progress_score(result.trace_summary)
@@ -2032,6 +3265,8 @@ def evaluate_search_task(
             f"Game={game} level={level} solved={result.solved} "
             f"score={score:.4f} expanded={result.expanded_states}/{budget} "
             f"generated={result.generated_states} solution_length={result.solution_length} "
+            f"strategy={strategy} "
+            f"algorithm={result.trace_summary.get('search_algorithm', strategy)} "
             f"terminated={result.trace_summary.get('terminated_reason', 'unknown')} "
             f"partial_progress={partial_progress:.3f}"
         )
@@ -2054,6 +3289,9 @@ def evaluate_search_task(
             "solution_length": result.solution_length,
             "time_s": result.time_s,
             "feedback": feedback,
+            "search_strategy": strategy,
+            "search_algorithm": result.trace_summary.get("search_algorithm", strategy),
+            "probe_route": str(task.get("probe_route", "")),
             "trace_summary": result.trace_summary,
             "heuristic_code_path": str(code_path),
         }
@@ -2065,6 +3303,61 @@ def evaluate_search_task(
         )
 
 
+def search_task_memory_limit_mb() -> int:
+    """Return the per-search heap cap in MiB (0 disables the cap)."""
+    raw = os.environ.get("LLM_DESPARSIFIER_SEARCH_MEM_LIMIT_MB")
+    if raw is None or not raw.strip():
+        return DEFAULT_SEARCH_TASK_MEMORY_LIMIT_MB
+    try:
+        return max(0, int(float(raw)))
+    except ValueError:
+        return DEFAULT_SEARCH_TASK_MEMORY_LIMIT_MB
+
+
+def apply_search_task_memory_limit(
+    limit_mb: Optional[int] = None,
+) -> Optional[tuple[int, int]]:
+    """Cap the calling process's heap so a runaway search self-limits.
+
+    Generated search artifacts choose their own frontier and visited-set
+    representations, so no engine-side budget can bound their allocations. The
+    cap turns that failure mode into a MemoryError inside one child process,
+    which is recorded as an ordinary failed task, instead of an OOM kill that
+    ends the whole controller or array step.
+
+    Returns the previous ``RLIMIT_AS`` pair when a cap was installed, so the
+    caller can restore it before doing work that must not fail, such as
+    reporting the result back to the parent process.
+    """
+    megabytes = search_task_memory_limit_mb() if limit_mb is None else max(0, int(limit_mb))
+    if megabytes <= 0:
+        return None
+    limit = megabytes * 1024 * 1024
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_DATA)
+    except (OSError, ValueError):  # pragma: no cover - platform dependent.
+        return None
+    if hard != resource.RLIM_INFINITY:
+        limit = min(limit, hard)
+    if soft != resource.RLIM_INFINITY and soft <= limit:
+        return None
+    try:
+        resource.setrlimit(resource.RLIMIT_DATA, (limit, hard))
+    except (OSError, ValueError):  # pragma: no cover - platform dependent.
+        return None
+    return (soft, hard)
+
+
+def restore_memory_limit(previous: Optional[tuple[int, int]]) -> None:
+    """Undo a cap installed by `apply_search_task_memory_limit`."""
+    if previous is None:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_DATA, previous)
+    except (OSError, ValueError):  # pragma: no cover - platform dependent.
+        return
+
+
 def _search_task_worker(
     script_doctor: str,
     task: dict[str, Any],
@@ -2072,19 +3365,36 @@ def _search_task_worker(
     result_queue: Any,
 ) -> None:
     """Evaluate one search task in a child process and return its result."""
+    previous_limit = None
     try:
+        previous_limit = apply_search_task_memory_limit()
         evaluator = PuzzleScriptEvaluator(Path(script_doctor))
         result = evaluate_search_task(
             evaluator=evaluator,
             task=task,
             astar_timeout_s=astar_timeout_s,
         )
+    except MemoryError:
+        restore_memory_limit(previous_limit)
+        limit_mb = search_task_memory_limit_mb()
+        result = search_failure_result(
+            task,
+            feedback=(
+                "Search evaluation exceeded the "
+                f"{limit_mb} MiB per-task memory cap. The artifact retained too "
+                "many states; shrink the frontier, the visited set, or the "
+                "per-state bookkeeping."
+            ),
+            error=f"search task memory limit {limit_mb} MiB exceeded",
+        )
     except BaseException as exc:  # pragma: no cover - defensive child-process boundary.
+        restore_memory_limit(previous_limit)
         result = search_failure_result(
             task,
             feedback=f"Search evaluation worker failed: {exc}",
             error=str(exc),
         )
+    restore_memory_limit(previous_limit)
     result_queue.put(result)
 
 
@@ -2407,11 +3717,31 @@ def _result_summary(prefix: str, result: Mapping[str, Any], *, baseline: bool = 
         f"{prefix}: solved={bool(result.get(f'{key_prefix}solved', False))} "
         f"solve_rate={solve_rate:.3f} "
         f"replicates={result.get(f'{key_prefix}replicate_count', 1)} "
+        f"strategy={result.get(f'{key_prefix}search_strategy', 'unknown')} "
+        f"algorithm={result.get(f'{key_prefix}search_algorithm', 'unknown')} "
         f"score={float(result.get(f'{key_prefix}score', 0.0)):.4f} "
         f"expanded={result.get(f'{key_prefix}solved_expanded_mean', result.get(f'{key_prefix}expanded', 'unknown'))} "
         f"generated={result.get(f'{key_prefix}generated', 'unknown')} "
         f"solution_length={result.get(f'{key_prefix}solution_length', 'unknown')}"
     )
+
+
+def _strategy_breakdown_line(result: Mapping[str, Any]) -> str:
+    breakdown = result.get("strategy_breakdown")
+    if not isinstance(breakdown, Mapping) or not breakdown:
+        return ""
+    parts: list[str] = []
+    for algorithm, values in sorted(breakdown.items()):
+        if not isinstance(values, Mapping):
+            continue
+        parts.append(
+            f"{algorithm} solves={int(values.get('solved', 0))}/"
+            f"{int(values.get('count', 0))} "
+            f"mean_expanded={float(values.get('mean_expanded', 0.0)):.1f} "
+            f"probes={int(values.get('probe_count', 0))} "
+            f"errors={float(values.get('candidate_error_rate', 0.0)):.3f}"
+        )
+    return "Strategy evidence: " + "; ".join(parts) if parts else ""
 
 
 def _compact_trace_diagnostics(result: Mapping[str, Any]) -> str:
@@ -2560,6 +3890,9 @@ def build_reflection_feedback(
         lines.append("Base raw feedback:\n" + baseline_feedback)
     if candidate_feedback:
         lines.append("Candidate raw feedback:\n" + candidate_feedback)
+    strategy_line = _strategy_breakdown_line(result)
+    if strategy_line:
+        lines.append(strategy_line)
     mechanics_line = _mechanics_diagnostic_line(mechanics_signature)
     if mechanics_line and classification != "stable_or_improved":
         lines.append(mechanics_line)
@@ -2606,6 +3939,12 @@ def build_comparison_payload(
         "baseline_replicate_count": result.get("baseline_replicate_count", 1),
         "candidate_replicate_expansions": result.get("replicate_expansions", []),
         "baseline_replicate_expansions": result.get("baseline_replicate_expansions", []),
+        "candidate_search_strategy": result.get("search_strategy", "unknown"),
+        "candidate_search_algorithm": result.get("search_algorithm", "unknown"),
+        "candidate_strategy_breakdown": result.get("strategy_breakdown", {}),
+        "baseline_search_strategy": result.get("baseline_search_strategy", "unknown"),
+        "baseline_search_algorithm": result.get("baseline_search_algorithm", "unknown"),
+        "baseline_strategy_breakdown": result.get("baseline_strategy_breakdown", {}),
         "candidate_score": raw_score,
         "baseline_score": baseline_score,
         "score_delta": raw_score - baseline_score,
@@ -3022,7 +4361,7 @@ def read_initial_gepa_addendum(inline_addendum: str, addendum_file: Path | None)
     return file_text or inline
 
 
-def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
+def _clean_proposed_prompt(text: str, *, max_chars: int | None) -> str:
     cleaned = strip_outer_markdown_fences(text).strip()
     cleaned = re.sub(
         r"^(?:revised global prompt|new instruction|prompt)\s*:\s*",
@@ -3034,12 +4373,12 @@ def _clean_proposed_prompt(text: str, *, max_chars: int) -> str:
         return ""
     if _has_dangling_prompt_tail(cleaned):
         return ""
-    if len(cleaned) <= max_chars:
+    if max_chars is None or len(cleaned) <= max_chars:
         return cleaned
     return ""
 
 
-def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
+def _clean_proposed_addendum(text: str, *, max_chars: int | None) -> str:
     """Clean a proposed GEPA prompt addendum and reject drift-prone shapes."""
     cleaned = strip_outer_markdown_fences(text).strip()
     addendum_labels = list(
@@ -3071,7 +4410,7 @@ def _clean_proposed_addendum(text: str, *, max_chars: int) -> str:
     )
     if any(marker in cleaned for marker in full_prompt_markers):
         return ""
-    if len(cleaned) > max_chars:
+    if max_chars is not None and len(cleaned) > max_chars:
         return ""
     if _has_dangling_prompt_tail(cleaned):
         return ""
@@ -3213,7 +4552,7 @@ def _merge_current_addendum_with_fallback(
     current_addendum: str,
     fallback_addendum: str,
     *,
-    max_chars: int,
+    max_chars: int | None,
 ) -> str:
     """Return a fallback repair that preserves the current prompt insight when possible.
 
@@ -3236,6 +4575,8 @@ def _merge_current_addendum_with_fallback(
     cleaned = _clean_proposed_addendum(combined, max_chars=max_chars)
     if cleaned:
         return cleaned
+    if max_chars is None:
+        return fallback
     compact_fallback = _compact_code_contract_fallback(fallback)
     if compact_fallback:
         compact = _clean_proposed_addendum(compact_fallback, max_chars=max_chars)
@@ -4634,11 +5975,15 @@ class PuzzleScriptBatchedGEPAAdapter:
         result["baseline_error"] = baseline.get("error")
         result["baseline_expanded"] = baseline.get("expanded")
         result["baseline_solved_expanded_mean"] = baseline.get("solved_expanded_mean")
+        result["baseline_solved_time_mean"] = baseline.get("solved_time_mean")
         result["baseline_generated"] = baseline.get("generated")
         result["baseline_solution_length"] = baseline.get("solution_length")
         result["baseline_partial_progress_score"] = baseline.get("partial_progress_score", 0.0)
         result["baseline_feedback"] = baseline.get("feedback")
         result["baseline_heuristic_code_path"] = baseline.get("heuristic_code_path")
+        result["baseline_search_strategy"] = baseline.get("search_strategy", "unknown")
+        result["baseline_search_algorithm"] = baseline.get("search_algorithm", "unknown")
+        result["baseline_strategy_breakdown"] = baseline.get("strategy_breakdown", {})
         result["baseline_candidate_error_rate"] = baseline.get("candidate_error_rate", 0.0)
         result["baseline_replicate_count"] = baseline.get("replicate_count", 1)
         result["baseline_replicate_results_path"] = baseline.get("replicate_results_path")
@@ -4771,7 +6116,20 @@ class PuzzleScriptBatchedGEPAAdapter:
         rows: list[Optional[dict[str, Any]]] = [None] * len(batch)
 
         def _one(index: int, task: PuzzleScriptLevelTask) -> tuple[int, dict[str, Any]]:
-            code, error = synthesize_heuristic_code(llm=self.llm, prompt_text=prompt_text, task=task)
+            if CODEX_HEALTH.tripped:
+                raise CodexUnavailableError(str(CODEX_HEALTH.tripped_reason))
+            try:
+                code, error = synthesize_heuristic_code(
+                    llm=self.llm,
+                    prompt_text=prompt_text,
+                    task=task,
+                    script_doctor=self.script_doctor,
+                )
+            except CodexUnavailableError:
+                raise
+            except Exception as exc:
+                code = ""
+                error = f"Synthesis client failed: {type(exc).__name__}: {exc}"
             code_path = heuristics_dir / (
                 f"{task.task_id:04d}-{safe_name(task.game)}-level-{task.level:02d}"
                 f"-rep-{task.replicate:02d}.py"
@@ -5145,13 +6503,29 @@ class PuzzleScriptBatchedGEPAAdapter:
             physical_tasks: list[PuzzleScriptLevelTask] = []
             physical_owners: dict[int, tuple[int, PuzzleScriptLevelTask]] = {}
             for original_index, task in zip(missing_indices, missing_tasks, strict=True):
-                for replicate in range(self.synthesis_replicates):
+                replicate_specs = [
+                    (replicate, "") for replicate in range(self.synthesis_replicates)
+                ]
+                baseline = self.baseline_by_key.get((task.game, task.level))
+                if should_add_route_probes(task, baseline):
+                    replicate_specs.extend(
+                        [
+                            (self.synthesis_replicates, "heuristic"),
+                            (self.synthesis_replicates + 1, "custom_search"),
+                        ]
+                    )
+                for replicate, probe_route in replicate_specs:
                     physical_id = (
                         task.task_id
-                        if self.synthesis_replicates == 1
+                        if len(replicate_specs) == 1
                         else len(physical_tasks)
                     )
-                    physical_task = replace(task, task_id=physical_id, replicate=replicate)
+                    physical_task = replace(
+                        task,
+                        task_id=physical_id,
+                        replicate=replicate,
+                        probe_route=probe_route,
+                    )
                     physical_tasks.append(physical_task)
                     physical_owners[physical_id] = (original_index, task)
             task_rows = self._synthesize_batch(
@@ -5331,7 +6705,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             classification = trace_classification(trace)
             mechanics_signature = trace_mechanics_signature(trace)
             code_chars = (
-                CASE_SPECIFIC_OVERFIT_ADDENDUM_MAX_CHARS
+                CASE_SPECIFIC_REFLECTION_HEURISTIC_CODE_CHARS
                 if self.allow_case_specific_overfit
                 else DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS
             )
@@ -5373,6 +6747,33 @@ class PuzzleScriptBatchedGEPAAdapter:
                 "code_shape": generated_shape,
                 "synthesis_error": trace.get("synthesis_error"),
             }
+            strategy_examples: dict[str, dict[str, Any]] = {}
+            breakdown = result.get("strategy_breakdown")
+            if isinstance(breakdown, Mapping):
+                for algorithm, values in breakdown.items():
+                    if not isinstance(values, Mapping):
+                        continue
+                    example = {
+                        "search_strategy": values.get("search_strategy", "unknown"),
+                        "count": values.get("count", 0),
+                        "solved": values.get("solved", 0),
+                        "solve_rate": values.get("solve_rate", 0.0),
+                        "mean_expanded": values.get("mean_expanded", 0.0),
+                        "mean_score": values.get("mean_score", 0.0),
+                        "probe_count": values.get("probe_count", 0),
+                        "termination_reasons": values.get("termination_reasons", []),
+                    }
+                    code_path = values.get("representative_code_path")
+                    if artifact_tools:
+                        example["code_path"] = code_path
+                    else:
+                        example["code"] = _read_optional_text(
+                            code_path,
+                            max_chars=code_chars,
+                        )
+                    strategy_examples[str(algorithm)] = example
+            if strategy_examples:
+                generated_output["strategy_examples"] = strategy_examples
             if artifact_tools:
                 baseline_output["heuristic_code_path"] = result.get(
                     "baseline_heuristic_code_path"
@@ -5418,14 +6819,7 @@ class PuzzleScriptBatchedGEPAAdapter:
         reflective_dataset: dict[str, list[dict[str, Any]]],
         components_to_update: list[str],
     ) -> dict[str, str]:
-        """Propose compact global prompt revisions from comparative feedback.
-
-        GEPA's default instruction proposer tends to append broad examples. For
-        this research path we keep one global prompt, so the reflection request
-        explicitly asks for small, generalizable edits that preserve base-solved
-        behavior and only encode lessons supported by regression/new-solve
-        evidence.
-        """
+        """Propose evidence-based revisions to the single global prompt."""
         new_texts: dict[str, str] = {}
         for component in components_to_update:
             current_prompt = candidate[component]
@@ -5446,15 +6840,28 @@ Inspect candidate.json, scored_results.json, replicate_results.json, trace summa
 and heuristic files from accepted and rejected candidates. Do not modify artifacts
 or run searches. Do not inspect any holdout data or paths outside this run root.
 """
-                reflection_prompt = f"""Rewrite the entire prompt used by a separate coding agent to generate one PuzzleScript A* heuristic.
+                reflection_prompt = f"""Rewrite the entire prompt guidance used by a separate coding agent to generate one bounded PuzzleScript search artifact.
 
-You may change, delete, reorder, or add any instruction. The next evaluation will
-enforce the code contract, so preserve only constraints you judge useful. Produce
-one reusable prompt for unseen games; do not memorize game titles or levels.
-Optimize validation solve probability first and solved-search efficiency second.
+The evaluator appends an immutable contract that permits either a legacy A*
+heuristic or custom search_plan. Do not disable either route. You may change,
+delete, reorder, or add other guidance. Produce one reusable prompt for unseen
+games; do not memorize game titles or levels. Use per-strategy probe evidence to
+teach when A* is sufficient and when materially different bounded exploration
+such as novelty, hybrid queues, diversification, or deadlock-aware search helps.
+
+The score is mean log2(blind_expansions / candidate_expansions) on levels that
+were solved by searching, subject to a hard constraint that the solve rate must
+not fall below the base prompt's. Fewer expansions per solve is the objective;
+solve rate is a floor, not something to trade against. Two consequences follow.
+A solve that expands nothing came from a precomputed action list, scores zero,
+and teaches the optimizer nothing, so guidance that encourages recording a plan
+is worthless here. And the agent is shown a different level of the game than the
+one it is graded on, so only search behavior that transfers between instances of
+the same mechanics can pay off.
 Use the causal comparisons, replicate rates, rejected-child evidence, and artifact
-traces below. Output only the complete replacement prompt, without markdown or commentary.
-Keep it under {DEFAULT_PROPOSED_PROMPT_MAX_CHARS} characters.
+traces below. Rewrite as much or as little as the evidence warrants, and leave it unchanged
+when no rewrite is justified. Output only the complete replacement prompt,
+without markdown or commentary.
 
 Current full prompt:
 {current_prompt}
@@ -5466,31 +6873,11 @@ Recent evaluated outcomes:
 {recent_outcomes}
 {artifact_access}
 """
-                revised_prompt = ""
-                proposal_key = (component, "")
-                focus_offset = len(self.proposal_history)
-                for attempt in range(3):
-                    focus = FULL_PROMPT_PROPOSAL_FOCI[
-                        (focus_offset + attempt) % len(FULL_PROMPT_PROPOSAL_FOCI)
-                    ]
-                    revised_prompt = _clean_proposed_prompt(
-                        self.proposal_llm.complete(
-                            reflection_prompt
-                            + f"\nThis proposal's required focus: {focus}\n"
-                            + "Return a materially different complete prompt."
-                        ),
-                        max_chars=DEFAULT_PROPOSED_PROMPT_MAX_CHARS,
-                    )
-                    proposal_key = (component, revised_prompt.strip())
-                    if (
-                        revised_prompt
-                        and revised_prompt.strip() != current_prompt.strip()
-                        and proposal_key not in self.proposal_history
-                    ):
-                        break
-                else:
-                    revised_prompt = current_prompt
-                    proposal_key = (component, revised_prompt.strip())
+                revised_prompt = _clean_proposed_prompt(
+                    self.proposal_llm.complete(reflection_prompt),
+                    max_chars=DEFAULT_PROPOSED_PROMPT_MAX_CHARS,
+                ) or current_prompt
+                proposal_key = (component, revised_prompt.strip())
                 new_texts[component] = revised_prompt
                 self.proposal_history.add(proposal_key)
                 continue
@@ -5587,7 +6974,6 @@ Hard requirements:
   rules prove they cannot reappear; aliases, transforms, collision layers, and
   rule-created objects often make missing-object checks unsafe.
 - Preserve general principles that created new solves only when they do not conflict with base-solved cases.
-- Keep the addendum under {max_chars} characters.
 - Output only the addendum text. Do not include markdown, commentary, labels, or headings.
 
 Base prompt that will remain unchanged:
@@ -5604,7 +6990,11 @@ Recent evaluated candidate outcomes (including rejected candidates):
 {artifact_access}
 """
             proposed = self.proposal_llm.complete(reflection_prompt)
-            cleaned = _clean_proposed_addendum(proposed, max_chars=max_chars)
+            cleaned = (
+                ""
+                if proposed.strip() in {base_prompt.strip(), current_prompt.strip()}
+                else _clean_proposed_addendum(proposed, max_chars=max_chars)
+            )
             revised_prompt = (
                 _compose_prompt_with_addendum(base_prompt, cleaned) if cleaned else current_prompt
             )
@@ -5760,6 +7150,28 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         eval_jobs,
         training_level_selection,
     )
+    global SYNTHESIS_CACHE
+    SYNTHESIS_CACHE = SynthesisCache(getattr(args, "synthesis_cache_dir", None))
+    if SYNTHESIS_CACHE.enabled:
+        print(f"[llm] synthesis cache: {SYNTHESIS_CACHE.root}", flush=True)
+    blind_reference = load_blind_reference(getattr(args, "blind_reference", None))
+    if blind_reference:
+        print(f"[inputs] blind reference levels={len(blind_reference)}", flush=True)
+    configure_objective(
+        mode=str(getattr(args, "objective", OBJECTIVE_ADJUSTED)),
+        blind_reference=blind_reference,
+        solve_slack=float(getattr(args, "solve_slack", 0.0)),
+        unsolved_log2=float(
+            getattr(args, "unsolved_log2", DEFAULT_BLIND_RELATIVE_UNSOLVED_LOG2)
+        ),
+        speedup_clip=float(
+            getattr(args, "speedup_clip", DEFAULT_BLIND_RELATIVE_CLIP)
+        ),
+        slow_solve_clip=float(
+            getattr(args, "slow_solve_clip", DEFAULT_SLOW_SOLVE_CLIP)
+        ),
+    )
+    print(f"[gepa] objective={getattr(args, 'objective', OBJECTIVE_ADJUSTED)}", flush=True)
     all_train_tasks = build_level_tasks(
         evaluator=evaluator,
         jobs=selected_jobs,
@@ -5767,6 +7179,17 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         levels_per_game=args.levels_per_game,
         budget=max(1, args.max_gepa_expansions_per_level),
         selected_levels_by_game=training_level_selection or None,
+        sibling_level_holdout=bool(getattr(args, "sibling_level_holdout", False)),
+        sibling_seed=int(getattr(args, "sibling_seed", 0)),
+        blind_reference=blind_reference,
+        blind_budget_multiplier=float(getattr(args, "blind_budget_multiplier", DEFAULT_BLIND_BUDGET_MULTIPLIER)),
+        require_blind_reference=bool(getattr(args, "require_blind_reference", False)),
+        min_reference_seconds=float(
+            getattr(args, "min_reference_seconds", DEFAULT_MIN_REFERENCE_SECONDS)
+        ),
+        include_frontier_levels=bool(
+            getattr(args, "include_frontier_levels", False)
+        ),
     )
     if training_level_selection:
         requested_training_keys = {
@@ -5857,6 +7280,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
             timeout_s=args.llm_timeout_s,
             executable=args.codex_executable,
             reasoning_effort=args.codex_reasoning_effort,
+            agentic_timeout_s=args.agentic_timeout_s,
             agentic_workspace=getattr(args, "synthesis_agentic", True),
         )
     else:
@@ -5930,8 +7354,22 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         for task in reassign_task_ids(unique_tasks_by_key([*train_tasks, *val_tasks]))
     ]
     scoring_baseline_outputs: Optional[list[dict[str, Any]]] = None
+    expected_provenance = baseline_provenance(
+        prompt_text=PUZZLESCRIPT_HEURISTIC_CONTRACT,
+        model=str(getattr(args, "synthesis_codex_model", "") or ""),
+        reasoning_effort=str(getattr(args, "codex_reasoning_effort", "") or ""),
+        agentic=bool(getattr(args, "synthesis_agentic", True)),
+        tasks=baseline_tasks,
+    )
     if initial_gepa_addendum:
         if args.scoring_baseline_outputs_file is not None:
+            check_baseline_provenance(
+                args.scoring_baseline_outputs_file,
+                expected_provenance,
+                allow_mismatch=bool(
+                    getattr(args, "allow_baseline_provenance_mismatch", False)
+                ),
+            )
             scoring_baseline_outputs = load_scoring_baseline_outputs(
                 args.scoring_baseline_outputs_file,
                 baseline_tasks,
@@ -5955,8 +7393,15 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
                 capture_traces=False,
             )
             scoring_baseline_outputs = [dict(row) for row in scoring_baseline_batch.outputs]
-        (state_root / "scoring_baseline_outputs.json").write_text(
+        scoring_baseline_path = state_root / "scoring_baseline_outputs.json"
+        scoring_baseline_path.write_text(
             json.dumps(scoring_baseline_outputs, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+        scoring_baseline_path.with_suffix(
+            scoring_baseline_path.suffix + ".provenance.json"
+        ).write_text(
+            json.dumps(expected_provenance, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         adapter.set_scoring_baseline_outputs(scoring_baseline_outputs)
@@ -5974,17 +7419,32 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         f"initial_gepa_addendum_chars={len(initial_gepa_addendum)}",
         flush=True,
     )
-    baseline_batch = adapter.evaluate(
-        batch=baseline_tasks,
-        candidate=seed_candidate,
-        capture_traces=False,
+    skip_baseline_eval = bool(getattr(args, "skip_baseline_eval", False)) or (
+        args.objective == OBJECTIVE_BLIND_RELATIVE_TIME
     )
-    baseline_outputs = [dict(row) for row in baseline_batch.outputs]
-    adapter.set_baseline_outputs(
-        baseline_outputs,
-        candidate=seed_candidate,
-        scoring_outputs=scoring_baseline_outputs,
-    )
+    if skip_baseline_eval:
+        # Nothing downstream reads a per-run baseline under this objective, and
+        # the pass is not cheap: luna v12 spent most of a day on it. Skipping it
+        # also keeps scores comparable across runs, since no quantity is stated
+        # relative to a reference that changes with the run.
+        print(
+            "[gepa] skipping seed prompt baseline: scoring against the fixed "
+            "blind reference instead",
+            flush=True,
+        )
+        baseline_outputs = []
+    else:
+        baseline_batch = adapter.evaluate(
+            batch=baseline_tasks,
+            candidate=seed_candidate,
+            capture_traces=False,
+        )
+        baseline_outputs = [dict(row) for row in baseline_batch.outputs]
+        adapter.set_baseline_outputs(
+            baseline_outputs,
+            candidate=seed_candidate,
+            scoring_outputs=scoring_baseline_outputs,
+        )
     if scoring_baseline_outputs is not None:
         for row in baseline_outputs:
             adapter._attach_baseline_metadata(row)  # noqa: SLF001 - runner owns adapter wiring.
@@ -6032,8 +7492,18 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         json.dumps(baseline_summary, indent=2, sort_keys=True, default=str) + "\n",
         encoding="utf-8",
     )
-    train_tasks, dropped_train_tasks = filter_unlearnable_tasks(train_tasks, baseline_outputs)
-    val_tasks, dropped_val_tasks = filter_unlearnable_tasks(val_tasks, baseline_outputs)
+    if baseline_outputs:
+        train_tasks, dropped_train_tasks = filter_unlearnable_tasks(
+            train_tasks, baseline_outputs
+        )
+        val_tasks, dropped_val_tasks = filter_unlearnable_tasks(
+            val_tasks, baseline_outputs
+        )
+    else:
+        # With no baseline pass there is no evidence that any task is
+        # unlearnable, so the split stays exactly as the input filters built it.
+        dropped_train_tasks = []
+        dropped_val_tasks = []
     if not train_tasks or not val_tasks:
         raise RuntimeError("Baseline filtering left an empty GEPA train or validation set.")
     optimization_split = {
@@ -6100,7 +7570,10 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     )
     best_prompt_path = state_root / "best_prompt.txt"
     best_prompt_path.write_text(
-        result.candidates[selected_idx].get(HEURISTIC_COMPONENT, "") + "\n",
+        materialize_search_prompt(
+            result.candidates[selected_idx].get(HEURISTIC_COMPONENT, "")
+        )
+        + "\n",
         encoding="utf-8",
     )
     print(f"[gepa] result: {result_path}")
@@ -6238,6 +7711,134 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--script-doctor", type=Path, default=DEFAULT_SCRIPT_DOCTOR)
     parser.add_argument("--levels-per-game", type=int, default=0)
     parser.add_argument(
+        "--blind-reference",
+        type=Path,
+        default=None,
+        help="Blind (h=0) A* reference table from "
+        "scripts/calibrate_puzzlescript_budgets.py. Enables per-level budgets "
+        "and the absolute speedup metric.",
+    )
+    parser.add_argument(
+        "--synthesis-cache-dir",
+        type=Path,
+        default=None,
+        help="Content-addressed store of synthesized artifacts, reused across "
+        "runs. Keyed by everything the synthesis agent sees, so a scoring-only "
+        "change costs no LLM calls.",
+    )
+    parser.add_argument(
+        "--allow-baseline-provenance-mismatch",
+        action="store_true",
+        help="Seed from a scoring baseline even when it was not produced by "
+        "this prompt, model, and task set. Almost always wrong.",
+    )
+    parser.add_argument(
+        "--require-blind-reference",
+        action="store_true",
+        help="Train only on levels blind A* solved. Those are the levels where "
+        "a speedup ratio is defined; the rest would consume the search budget "
+        "without contributing to the objective.",
+    )
+    parser.add_argument(
+        "--blind-budget-multiplier",
+        type=float,
+        default=DEFAULT_BLIND_BUDGET_MULTIPLIER,
+        help="Per-level expansion budget as a multiple of measured blind effort.",
+    )
+    parser.add_argument(
+        "--objective",
+        choices=(
+            OBJECTIVE_ADJUSTED,
+            OBJECTIVE_SPEEDUP_CONSTRAINED,
+            OBJECTIVE_BASE_RELATIVE_TIME,
+            OBJECTIVE_BLIND_RELATIVE_TIME,
+        ),
+        default=OBJECTIVE_ADJUSTED,
+        help="'speedup-constrained' maximizes mean log2(blind/candidate) "
+        "expansions subject to not losing solves, instead of folding solve "
+        "events and efficiency into one weighted sum.",
+    )
+    parser.add_argument(
+        "--solve-slack",
+        type=float,
+        default=0.0,
+        help="Fraction of solve rate the constraint tolerates losing.",
+    )
+    parser.add_argument(
+        "--unsolved-log2",
+        type=float,
+        default=DEFAULT_BLIND_RELATIVE_UNSOLVED_LOG2,
+        help=(
+            "blind-relative-time: score charged to a level the candidate did "
+            "not solve, in log2 wall-time units. Clamped to at most "
+            "-(speedup-clip + 1) so that abandoning a level can never outscore "
+            "solving it slowly; pass a lower value to penalise failure harder."
+        ),
+    )
+    parser.add_argument(
+        "--speedup-clip",
+        type=float,
+        default=DEFAULT_BLIND_RELATIVE_CLIP,
+        help=(
+            "blind-relative-time: upper clip on a level's log2 speedup. Keep "
+            "this wide so being fast stays worth doing."
+        ),
+    )
+    parser.add_argument(
+        "--slow-solve-clip",
+        type=float,
+        default=DEFAULT_SLOW_SOLVE_CLIP,
+        help=(
+            "blind-relative-time: how bad a slow solve is allowed to look, and "
+            "hence how much a failure costs (the floor sits one unit below). "
+            "Small keeps speed in charge; large makes reliability dominate."
+        ),
+    )
+    parser.add_argument(
+        "--include-frontier-levels",
+        action="store_true",
+        help=(
+            "Also train on levels blind search ran out of expansion budget on. "
+            "Their recorded time is a censored lower bound, so solving one "
+            "scores a large speedup. These are the levels a smarter search has "
+            "to win, and excluding them means the objective only ever measures "
+            "problems plain A* already solves."
+        ),
+    )
+    parser.add_argument(
+        "--min-reference-seconds",
+        type=float,
+        default=DEFAULT_MIN_REFERENCE_SECONDS,
+        help=(
+            "Drop levels whose blind reference solves faster than this. Below "
+            "roughly a second a wall-time ratio measures cluster noise rather "
+            "than search quality, and the surviving levels make a harder set."
+        ),
+    )
+    parser.add_argument(
+        "--skip-baseline-eval",
+        action="store_true",
+        help=(
+            "Skip the seed-prompt baseline pass. Implied by "
+            "--objective blind-relative-time, which scores against the fixed "
+            "blind reference and never reads a per-run baseline."
+        ),
+    )
+    parser.add_argument(
+        "--sibling-level-holdout",
+        action="store_true",
+        help="Show the synthesis agent a different level of the same game than "
+        "the one it is scored on. A precomputed plan for the visible level "
+        "cannot score, so solves must come from search that generalizes across "
+        "instances of the same mechanics.",
+    )
+    parser.add_argument(
+        "--sibling-seed",
+        type=int,
+        default=0,
+        help="Rotation offset used to pair scored levels with visible siblings.",
+    )
+    parser.add_argument(
         "--training-levels",
         type=str,
         default="",
@@ -6274,6 +7875,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=DEFAULT_LLM_TEMPERATURE)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--llm-timeout-s", type=float, default=600.0)
+    parser.add_argument(
+        "--agentic-timeout-s",
+        type=float,
+        default=DEFAULT_CODEX_AGENTIC_TIMEOUT_S,
+        help=(
+            "Hang watchdog for agentic Codex synthesis. Much larger than "
+            "--llm-timeout-s because a synthesis agent legitimately runs for "
+            "tens of minutes; it only exists to break a wedged call."
+        ),
+    )
     parser.add_argument("--llm-concurrency", type=int, default=16)
     parser.add_argument(
         "--synthesis-replicates",

@@ -10,13 +10,19 @@ from __future__ import annotations
 
 import heapq
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from puzzlescript_adapter import build_puzzlescript_ctx
 
 MAX_AGAIN = 50
+
+# Number of decoded (key, ctx) pairs kept resident per search. Everything
+# beyond this is rebuilt from the engine backup on demand; the decoded ctx of
+# one state costs tens of kilobytes, so retaining one per generated state is
+# what drove multi-gigabyte search workers.
+STATE_CTX_CACHE_SIZE = 256
 
 
 @dataclass
@@ -190,6 +196,8 @@ def puzzlescript_astar(
                 elapsed = time.perf_counter() - t0
                 score = _gepa_score(True, expanded, max_expansions)
                 trace_summary = {
+                    "search_strategy": "legacy_astar",
+                    "search_algorithm": "astar",
                     "terminated_reason": "solved",
                     "root_snapshot": root_snapshot,
                     "sampled_states": expansion_samples,
@@ -243,6 +251,8 @@ def puzzlescript_astar(
         terminated_reason = "expansion_budget"
 
     trace_summary = {
+        "search_strategy": "legacy_astar",
+        "search_algorithm": "astar",
         "terminated_reason": terminated_reason,
         "root_snapshot": root_snapshot,
         "sampled_states": expansion_samples,
@@ -265,6 +275,212 @@ def puzzlescript_astar(
         time_s=elapsed, score=score,
         trace_summary=trace_summary,
     )
+
+
+class _SearchStopped(RuntimeError):
+    pass
+
+
+class PuzzleScriptSearchAPI:
+    """Budgeted engine boundary exposed to generated search code."""
+
+    def __init__(
+        self,
+        engine,
+        compiled_json: dict[str, Any],
+        max_expansions: int,
+        timeout_s: float,
+        ctx_cache_size: int = STATE_CTX_CACHE_SIZE,
+    ):
+        self._engine = engine
+        self._compiled = compiled_json
+        self._max_expansions = max(1, max_expansions)
+        self._deadline = time.perf_counter() + max(0.001, timeout_s)
+        # Only the engine backup and the terminal flag are retained per state.
+        # The decoded key and ctx are ~99% of the per-state footprint, so they
+        # live in a bounded LRU and are rebuilt from the backup after eviction.
+        self._states: list[tuple[Any, bool]] = []
+        self._decoded: OrderedDict[int, tuple[tuple, dict[str, Any]]] = OrderedDict()
+        self._decoded_limit = max(1, int(ctx_cache_size))
+        self.expanded = 0
+        self.generated = 0
+        self.samples: list[dict[str, Any]] = []
+        self.best_snapshot: dict[str, Any] = {}
+        self.best_progress = 0.0
+        self._add_state()
+
+    def _check(self) -> None:
+        if time.perf_counter() > self._deadline:
+            raise _SearchStopped("timeout")
+        if self.expanded >= self._max_expansions:
+            raise _SearchStopped("expansion_budget")
+
+    def _add_state(self) -> int:
+        ctx = build_puzzlescript_ctx(self._engine, self._compiled)
+        snapshot = _compact_ctx_snapshot(ctx)
+        progress = float(snapshot["progress_score"])
+        if not self._states or progress > self.best_progress:
+            self.best_progress = progress
+            self.best_snapshot = snapshot
+        index = len(self._states)
+        self._states.append((self._engine.backup_level(), self._engine.is_winning()))
+        self._remember(index, _state_key(self._engine), ctx)
+        self.generated += 1
+        return index
+
+    def _remember(self, index: int, key: tuple, ctx: dict[str, Any]) -> None:
+        """Cache one decoded state, evicting the least recently used entry."""
+        decoded = self._decoded
+        decoded[index] = (key, ctx)
+        decoded.move_to_end(index)
+        while len(decoded) > self._decoded_limit:
+            decoded.popitem(last=False)
+
+    def _decode(self, state: int) -> tuple[tuple, dict[str, Any]]:
+        """Return the (key, ctx) pair for a state, rebuilding it after eviction.
+
+        Rebuilding repositions the engine on the requested state. Callers that
+        also need the engine positioned elsewhere must restore it afterwards.
+        """
+        decoded = self._decoded
+        entry = decoded.get(state)
+        if entry is not None:
+            decoded.move_to_end(state)
+            return entry
+        self._engine.restore_level(self._states[state][0])
+        entry = (_state_key(self._engine), build_puzzlescript_ctx(self._engine, self._compiled))
+        self._remember(state, entry[0], entry[1])
+        return entry
+
+    def initial(self) -> int:
+        return 0
+
+    def key(self, state: int) -> tuple:
+        return self._decode(state)[0]
+
+    def ctx(self, state: int) -> dict[str, Any]:
+        return self._decode(state)[1]
+
+    def is_winning(self, state: int) -> bool:
+        return self._states[state][1]
+
+    def expansion_budget(self) -> int:
+        """Return the same hard expansion limit enforced by successors()."""
+        return self._max_expansions
+
+    def successors(self, state: int) -> list[tuple[int, int]]:
+        self._check()
+        self.expanded += 1
+        if len(self.samples) < 12:
+            self.samples.append(
+                {
+                    "expanded_index": self.expanded,
+                    "snapshot": _compact_ctx_snapshot(self.ctx(state)),
+                }
+            )
+        backup = self._states[state][0]
+        self._engine.restore_level(backup)
+        has_action = (
+            not self._engine.has_metadata("noaction")
+            if hasattr(self._engine, "has_metadata")
+            else True
+        )
+        children = []
+        for action in range(5 if has_action else 4):
+            self._engine.restore_level(backup)
+            if _process_input(self._engine, action):
+                children.append((action, self._add_state()))
+        return children
+
+
+def puzzlescript_custom_search(
+    engine,
+    compiled_json: dict[str, Any],
+    search_fn: Callable[[PuzzleScriptSearchAPI, int], list[int]],
+    max_expansions: int = 50_000,
+    timeout_s: float = 30.0,
+    seed: int = 0,
+) -> PuzzleScriptSearchResult:
+    """Run generated search code through the same result and budget boundary."""
+    t0 = time.perf_counter()
+    initial_backup = engine.backup_level()
+    api = PuzzleScriptSearchAPI(engine, compiled_json, max_expansions, timeout_s)
+    reason = "search_exhausted"
+    actions: list[int] = []
+    try:
+        proposed = search_fn(api, int(seed))
+        if not isinstance(proposed, list) or any(
+            not isinstance(action, int) or isinstance(action, bool) or action not in range(5)
+            for action in proposed
+        ):
+            reason = "invalid_solution"
+        else:
+            engine.restore_level(initial_backup)
+            valid = all(_process_input(engine, action) for action in proposed)
+            if valid and engine.is_winning():
+                actions = proposed
+                reason = "solved"
+            elif proposed:
+                reason = "invalid_solution"
+    except _SearchStopped as exc:
+        reason = str(exc)
+    except Exception as exc:
+        reason = "custom_search_error"
+        error = f"{type(exc).__name__}: {exc}"
+    solved = reason == "solved"
+    root_snapshot = _compact_ctx_snapshot(api.ctx(api.initial()))
+    trace = {
+        "search_strategy": "custom_search",
+        "search_algorithm": getattr(search_fn, "_search_algorithm", "custom_unspecified"),
+        "seed": int(seed),
+        "terminated_reason": reason,
+        "root_snapshot": root_snapshot,
+        "sampled_states": api.samples[:6],
+        "progress_samples": api.samples,
+        "late_states": api.samples[-6:],
+        "best_progress": api.best_progress,
+        "best_progress_snapshot": api.best_snapshot,
+        "open_set_size_at_end": 0,
+    }
+    if reason == "custom_search_error":
+        trace["error"] = error
+    elapsed = time.perf_counter() - t0
+    return PuzzleScriptSearchResult(
+        solved=solved,
+        actions=actions,
+        expanded_states=api.expanded,
+        generated_states=api.generated,
+        solution_length=len(actions),
+        time_s=elapsed,
+        score=_gepa_score(solved, api.expanded, max_expansions),
+        trace_summary=trace,
+    )
+
+
+def puzzlescript_search(
+    engine,
+    compiled_json: dict[str, Any],
+    strategy: str,
+    artifact_fn: Callable[..., Any],
+    max_expansions: int = 50_000,
+    timeout_s: float = 30.0,
+    seed: int = 0,
+) -> PuzzleScriptSearchResult:
+    """Dispatch a legacy heuristic or generated search through one evaluator."""
+    if strategy == "heuristic":
+        return puzzlescript_astar(
+            engine, compiled_json, artifact_fn, max_expansions=max_expansions, timeout_s=timeout_s
+        )
+    if strategy == "custom_search":
+        return puzzlescript_custom_search(
+            engine,
+            compiled_json,
+            artifact_fn,
+            max_expansions=max_expansions,
+            timeout_s=timeout_s,
+            seed=seed,
+        )
+    raise ValueError(f"unknown search strategy: {strategy}")
 
 
 def _reconstruct(

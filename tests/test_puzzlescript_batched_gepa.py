@@ -17,8 +17,8 @@ from scripts.compare_puzzlescript_batched_prompts import (
 )
 from scripts.plot_puzzlescript_paper_results import write_paper_plots
 from scripts.run_puzzlescript_batched_gepa import (
+    DEFAULT_CODEX_AGENTIC_TIMEOUT_S,
     DEFAULT_LLM_TEMPERATURE,
-    DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS,
     DEFAULT_REFLECTION_ENV_DESCRIPTION_CHARS,
     DEFAULT_REFLECTION_FEEDBACK_CHARS,
     DEFAULT_REFLECTION_HEURISTIC_CODE_CHARS,
@@ -39,6 +39,8 @@ from scripts.run_puzzlescript_batched_gepa import (
     build_repair_prompt,
     build_sbatch_array_command,
     build_seed_candidate,
+    build_codex_synthesis_workspace,
+    build_synthesis_prompt,
     build_train_dev_tasks,
     candidate_prompt_issue,
     candidate_score,
@@ -60,6 +62,7 @@ from scripts.run_puzzlescript_batched_gepa import (
     select_jobs_for_training_levels,
     select_reflection_traces,
     select_training_guard_tasks,
+    should_add_route_probes,
     split_train_dev_jobs,
     strip_outer_markdown_fences,
     trace_classification,
@@ -97,6 +100,12 @@ class _SequenceLLM(_FakeLLM):
     def complete(self, prompt: str) -> str:
         self.prompts.append(prompt)
         return next(self.responses)
+
+
+class _FailingLLM(_FakeLLM):
+    def complete(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        raise RuntimeError("temporary backend failure")
 
 
 def test_zero_global_gates_leave_local_pareto_scores_untouched() -> None:
@@ -200,6 +209,146 @@ def test_replicate_aggregation_tracks_solve_probability_and_solved_efficiency() 
     assert result["candidate_error_rate"] == pytest.approx(1 / 3)
 
 
+def test_replicate_aggregation_attributes_feedback_only_route_probes() -> None:
+    task = PuzzleScriptLevelTask(7, "game", 2, 1000, "description", "game.txt")
+    rows = [
+        {
+            "solved": True,
+            "score": 0.8,
+            "expanded": 200,
+            "generated": 250,
+            "solution_length": 8,
+            "search_strategy": "heuristic",
+            "search_algorithm": "astar",
+            "heuristic_code_path": "legacy.py",
+        },
+        {
+            "solved": False,
+            "score": 0.0,
+            "expanded": 1000,
+            "generated": 1200,
+            "solution_length": 0,
+            "search_strategy": "custom_search",
+            "search_algorithm": "novelty",
+            "heuristic_code_path": "default-custom.py",
+        },
+        {
+            "solved": True,
+            "score": 0.9,
+            "expanded": 100,
+            "generated": 130,
+            "solution_length": 8,
+            "search_strategy": "heuristic",
+            "search_algorithm": "astar",
+            "probe_route": "heuristic",
+            "heuristic_code_path": "legacy-probe.py",
+        },
+        {
+            "solved": True,
+            "score": 0.95,
+            "expanded": 50,
+            "generated": 80,
+            "solution_length": 8,
+            "search_strategy": "custom_search",
+            "search_algorithm": "novelty",
+            "probe_route": "custom_search",
+            "heuristic_code_path": "novelty-probe.py",
+        },
+    ]
+
+    result = aggregate_replicate_results(task, rows)
+
+    assert result["replicate_count"] == 2
+    assert result["probe_count"] == 2
+    assert result["solve_rate"] == pytest.approx(0.5)
+    assert result["strategy_breakdown"]["astar"]["solved"] == 2
+    assert result["strategy_breakdown"]["novelty"]["solved"] == 1
+    assert result["strategy_breakdown"]["novelty"]["mean_expanded"] == pytest.approx(525)
+    assert result["strategy_breakdown"]["novelty"]["representative_code_path"] == "novelty-probe.py"
+
+
+def test_hard_baselines_get_feedback_only_route_probes() -> None:
+    task = PuzzleScriptLevelTask(1, "game", 0, 10_000, "description", "game.txt")
+    assert should_add_route_probes(task, {"solve_rate": 0.6, "expanded": 100})
+    assert should_add_route_probes(task, {"solve_rate": 1.0, "solved_expanded_mean": 2500})
+    assert not should_add_route_probes(task, {"solve_rate": 1.0, "solved_expanded_mean": 200})
+
+
+def test_synthesis_prompt_keeps_api_out_of_prompt_and_forces_probe_route() -> None:
+    task = PuzzleScriptLevelTask(
+        1,
+        "game",
+        0,
+        10_000,
+        "mechanics",
+        "game.txt",
+        probe_route="custom_search",
+    )
+    prompt = build_synthesis_prompt("Do not define search_plan. Only write a heuristic.", task)
+
+    assert "def search_plan(api, seed)" not in prompt
+    assert "NON-NEGOTIABLE CUSTOM-SEARCH PROBE" in prompt
+    assert "define search_plan" in prompt
+    assert "set SEARCH_STRATEGY" in prompt
+
+
+def test_seed_prompt_is_minimal_and_runtime_contract_lives_in_agent_workspace(
+    tmp_path: Path,
+) -> None:
+    game = tmp_path / "game.txt"
+    game.write_text("title tiny\n")
+    task = PuzzleScriptLevelTask(1, "game", 0, 10_000, "mechanics", str(game))
+    prompt = build_synthesis_prompt(PUZZLESCRIPT_HEURISTIC_CONTRACT, task)
+    files = build_codex_synthesis_workspace(
+        task,
+        script_doctor=tmp_path / "script-doctor",
+    )
+
+    assert len(PUZZLESCRIPT_HEURISTIC_CONTRACT) < 300
+    assert "novelty" not in PUZZLESCRIPT_HEURISTIC_CONTRACT.lower()
+    assert "deadlock" not in PUZZLESCRIPT_HEURISTIC_CONTRACT.lower()
+    assert "api.initial()" not in prompt
+    assert "api.successors(state)" not in prompt
+    assert "api.initial()" in files["puzzlescript_api.py"]
+    assert "list[tuple[int, int]]" in files["puzzlescript_api.py"]
+    assert "TypeError" in files["puzzlescript_api.py"]
+    assert "SEARCH_STRATEGY" in files["candidate.py"]
+    assert validate_heuristic_code(files["candidate.py"]) is None
+    assert "game.puzzlescript" in files["evaluate.py"]
+    assert str(game) not in files["evaluate.py"]
+
+
+def test_codex_agentic_workspace_returns_the_candidate_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = "def heuristic_cost_to_go(ts, env_params, ctx):\n    return 7.0\n"
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        cwd = Path(str(kwargs["cwd"]))
+        assert (cwd / "README.md").exists()
+        assert (cwd / "puzzlescript_api.py").exists()
+        assert (cwd / "validate.py").exists()
+        assert (cwd / "evaluate.py").exists()
+        (cwd / "candidate.py").write_text(candidate)
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text('{"text":"ignore this response"}')
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("scripts.run_puzzlescript_batched_gepa.subprocess.run", fake_run)
+    client = CodexCLITextClient(model="sol", timeout_s=30.0, agentic_workspace=True)
+
+    assert client.complete(
+        "improve candidate.py",
+        workspace_files={
+            "candidate.py": "def heuristic_cost_to_go(ts, env_params, ctx): return 0.0",
+            "README.md": "instructions",
+            "puzzlescript_api.py": "api",
+            "validate.py": "validator",
+            "evaluate.py": "evaluator",
+        },
+    ) == candidate.strip()
+
+
 def test_codex_cli_text_client_uses_structured_stateless_exec(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -275,6 +424,7 @@ def test_codex_cli_text_client_agentic_synthesis_is_isolated(
         observed["cwd"] = kwargs["cwd"]
         observed["input"] = kwargs["input"]
         observed["has_timeout"] = "timeout" in kwargs
+        observed["timeout"] = kwargs.get("timeout")
         output_path = Path(command[command.index("--output-last-message") + 1])
         output_path.write_text('{"text":"def heuristic_cost_to_go(ts, env_params, ctx): return 0.0"}')
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -291,7 +441,12 @@ def test_codex_cli_text_client_agentic_synthesis_is_isolated(
     ]
     assert Path(str(observed["cwd"])).name.startswith("gepa-codex-")
     assert "candidate.py" in str(observed["input"])
-    assert observed["has_timeout"] is False
+    # Agentic synthesis gets the long hang watchdog, never the short text
+    # timeout: a synthesis agent legitimately runs for tens of minutes, but
+    # an unbounded call can wedge the whole optimizer.
+    assert observed["has_timeout"] is True
+    assert observed["timeout"] == DEFAULT_CODEX_AGENTIC_TIMEOUT_S
+    assert observed["timeout"] > 30.0
 
 
 def test_publish_search_pool_manifest_is_atomic(tmp_path: Path) -> None:
@@ -1445,6 +1600,9 @@ def test_candidate_prompt_issue_rejects_code_but_allows_contract_signature() -> 
 
     assert candidate_prompt_issue(instruction_prompt) is None
     assert "Python implementation" in str(candidate_prompt_issue(code_prompt))
+    assert "custom-search route" in str(
+        candidate_prompt_issue("Write a heuristic. Do not define search_plan.")
+    )
 
 
 def test_context_retry_max_tokens_uses_reported_prompt_tokens() -> None:
@@ -2070,6 +2228,25 @@ def test_hybrid_routes_local_synthesis_and_codex_proposals(tmp_path: Path) -> No
     assert "REGRESSION" in proposal_llm.prompts[0]
 
 
+def test_synthesis_client_failure_is_recorded_without_aborting_batch(tmp_path: Path) -> None:
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=_FailingLLM(""),  # type: ignore[arg-type]
+        state_root=tmp_path,
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+    )
+    rows = adapter._synthesize_batch(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        batch=[PuzzleScriptLevelTask(0, "game", 0, 10, "description", "game.txt")],
+        eval_dir=tmp_path,
+    )
+    assert len(rows) == 1
+    assert rows[0]["synthesis_error"].startswith("Synthesis client failed: RuntimeError")
+    assert Path(rows[0]["heuristic_code_path"]).read_text() == "\n"
+
+
 def test_custom_proposer_includes_current_addendum_when_revising() -> None:
     current_addendum = (
         "For persistent failures, inspect rules for a mechanics-grounded progress "
@@ -2210,9 +2387,6 @@ def test_custom_proposer_fallback_preserves_current_addendum_when_repairing_erro
     revised_prompt = result["heuristic_prompt"]
     assert "mechanics-grounded progress signal" in revised_prompt
     assert "No import statements" in revised_prompt
-    assert len(revised_prompt.split(GEPA_ADDENDUM_HEADER, 1)[1].strip()) <= (
-        DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
-    )
 
 
 def test_custom_proposer_compacts_code_repair_to_preserve_long_addendum() -> None:
@@ -2264,9 +2438,8 @@ def test_custom_proposer_compacts_code_repair_to_preserve_long_addendum() -> Non
 
     revised_addendum = result["heuristic_prompt"].split(GEPA_ADDENDUM_HEADER, 1)[1].strip()
     assert "compact causal sketch" in revised_addendum
-    assert "no imports" in revised_addendum
+    assert "no import" in revised_addendum.lower()
     assert "non-finite" in revised_addendum
-    assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
 
 
 def test_custom_proposer_preserves_near_budget_addendum_when_repairing_code_errors() -> None:
@@ -2274,7 +2447,6 @@ def test_custom_proposer_preserves_near_budget_addendum_when_repairing_code_erro
         "Preserve smooth ranking signal and reachability retention. "
         + "Keep the current rule-grounded efficiency preconditions. " * 18
     ).strip()
-    assert len(current_addendum) < DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
     current_prompt = build_seed_candidate(current_addendum)["heuristic_prompt"]
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
@@ -2308,9 +2480,8 @@ def test_custom_proposer_preserves_near_budget_addendum_when_repairing_code_erro
 
     revised_addendum = result["heuristic_prompt"].split(GEPA_ADDENDUM_HEADER, 1)[1].strip()
     assert "Preserve smooth ranking signal" in revised_addendum
-    assert "no imports" in revised_addendum
+    assert "no import" in revised_addendum.lower()
     assert "non-finite" in revised_addendum
-    assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
 
 
 def test_custom_proposer_does_not_duplicate_existing_compact_code_repair() -> None:
@@ -2324,10 +2495,6 @@ def test_custom_proposer_does_not_duplicate_existing_compact_code_repair() -> No
         "mechanics-grounded interaction distances. "
         + "Keep the current rule-grounded efficiency preconditions. " * 12
         + compact_repair
-    )
-    assert len(current_addendum) < DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
-    assert len(current_addendum + " " + compact_repair) <= (
-        DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
     )
     current_prompt = build_seed_candidate(current_addendum)["heuristic_prompt"]
     llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
@@ -2362,7 +2529,6 @@ def test_custom_proposer_does_not_duplicate_existing_compact_code_repair() -> No
 
     revised_addendum = result["heuristic_prompt"].split(GEPA_ADDENDUM_HEADER, 1)[1].strip()
     assert revised_addendum.count(compact_repair) == 1
-    assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
 
 
 def test_custom_proposer_does_not_duplicate_semantic_code_safety_seed() -> None:
@@ -2399,7 +2565,6 @@ def test_custom_proposer_does_not_duplicate_semantic_code_safety_seed() -> None:
     assert "Preserve current mechanics guidance" not in revised_addendum
     assert "bounded finite values and l " not in revised_addendum
     assert "local lists/dicts/sets/loops" in revised_addendum
-    assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
 
 
 def test_custom_proposer_preserves_long_seed_when_merging_noncode_fallback() -> None:
@@ -2464,7 +2629,6 @@ def test_custom_proposer_preserves_long_seed_when_merging_noncode_fallback() -> 
     assert "player-to-interaction distance" in revised_addendum
     assert "observable variants" in revised_addendum
     assert "preserve base reachability" in revised_addendum
-    assert len(revised_addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
 
 
 def test_custom_proposer_extracts_addendum_from_full_prompt_output() -> None:
@@ -2515,15 +2679,40 @@ def test_full_prompt_proposer_can_rewrite_every_instruction() -> None:
         components_to_update=["heuristic_prompt"],
     )
 
-    assert result["heuristic_prompt"] == replacement
+    assert result["heuristic_prompt"] == replacement.strip()
     assert "rewrite the entire prompt" in llm.prompts[0].lower()
 
 
-def test_full_prompt_proposer_retries_noop_and_duplicate_with_distinct_focus() -> None:
-    replacement = "Write a compact, mechanics-derived heuristic and return only Python code."
-    llm = _SequenceLLM(
-        [PUZZLESCRIPT_HEURISTIC_CONTRACT, PUZZLESCRIPT_HEURISTIC_CONTRACT, replacement]
+def test_full_prompt_proposer_accepts_conservative_base_length_rewrite() -> None:
+    replacement = (
+        PUZZLESCRIPT_HEURISTIC_CONTRACT
+        + "\n"
+        + (
+            "Prefer bounded custom search when rules prove scalar progress is deceptive. "
+            * 100
+        )
     )
+    assert len(replacement) > 6000
+    llm = _FakeLLM(replacement)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+        optimize_full_prompt=True,
+    )
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={"heuristic_prompt": []},
+        components_to_update=["heuristic_prompt"],
+    )
+    assert result["heuristic_prompt"] == replacement.strip()
+
+
+def test_full_prompt_proposer_allows_evidence_based_noop() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=llm,  # type: ignore[arg-type]
         state_root=Path("/tmp/gepa-state"),
@@ -2540,9 +2729,38 @@ def test_full_prompt_proposer_retries_noop_and_duplicate_with_distinct_focus() -
         components_to_update=["heuristic_prompt"],
     )
 
-    assert result["heuristic_prompt"] == replacement
-    assert len(llm.prompts) == 3
-    assert len(set(llm.prompts)) == 3
+    assert result["heuristic_prompt"] == PUZZLESCRIPT_HEURISTIC_CONTRACT
+    assert len(llm.prompts) == 1
+    assert "rewrite as much or as little" in llm.prompts[0].lower()
+    assert "leave it unchanged" in llm.prompts[0].lower()
+
+
+def test_full_prompt_proposer_does_not_force_fallback_after_noop() -> None:
+    llm = _FakeLLM(PUZZLESCRIPT_HEURISTIC_CONTRACT)
+    adapter = PuzzleScriptBatchedGEPAAdapter(
+        llm=llm,  # type: ignore[arg-type]
+        state_root=Path("/tmp/gepa-state"),
+        script_doctor=Path("/tmp/script-doctor"),
+        search_config=SimpleNamespace(),  # type: ignore[arg-type]
+        llm_concurrency=1,
+        astar_timeout_s=1.0,
+        optimize_full_prompt=True,
+    )
+
+    result = adapter.propose_new_texts(
+        candidate={"heuristic_prompt": PUZZLESCRIPT_HEURISTIC_CONTRACT},
+        reflective_dataset={
+            "heuristic_prompt": [
+                {
+                    "Comparison": {"classification": "persistent_failure"},
+                    "Feedback": "A* exhausted its expansion budget after plateaued progress.",
+                }
+            ]
+        },
+        components_to_update=["heuristic_prompt"],
+    )
+
+    assert result["heuristic_prompt"] == PUZZLESCRIPT_HEURISTIC_CONTRACT
 
 
 def test_custom_proposer_uses_persistent_failure_exploration_for_noop_output() -> None:
@@ -3619,9 +3837,11 @@ def test_custom_proposer_rejects_code_as_revised_prompt() -> None:
     assert "Do not output Python code as the revised prompt" in llm.prompts[0]
 
 
-def test_custom_proposer_rejects_overlong_addendum_instead_of_truncating() -> None:
+def test_custom_proposer_accepts_long_addendum_without_truncating() -> None:
     current_prompt = PUZZLESCRIPT_HEURISTIC_CONTRACT
-    llm = _FakeLLM("x" * (DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS + 1))
+    long_addendum = "Use mechanics-grounded exploration. " * 400
+    assert len(long_addendum) > 1200
+    llm = _FakeLLM(long_addendum)
     adapter = PuzzleScriptBatchedGEPAAdapter(
         llm=llm,  # type: ignore[arg-type]
         state_root=Path("/tmp/gepa-state"),
@@ -3637,7 +3857,7 @@ def test_custom_proposer_rejects_overlong_addendum_instead_of_truncating() -> No
         components_to_update=["heuristic_prompt"],
     )
 
-    assert result["heuristic_prompt"] == current_prompt
+    assert result["heuristic_prompt"].endswith(long_addendum.strip())
 
 
 def test_custom_proposer_rejects_dangling_addendum_tail() -> None:
@@ -3787,7 +4007,6 @@ def test_sharp_interaction_reach_code_safety_seed_file_builds_valid_prompt() -> 
     assert "observable WINCONDITIONS/RULES preconditions" in prompt
     assert "no imports" in prompt
     assert "non-finite returns" in prompt
-    assert len(addendum) <= DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS
     assert "Additional GEPA guidance" in prompt
 
 
@@ -4335,6 +4554,42 @@ def test_reflection_feedback_compares_replicates_and_baseline_trace() -> None:
     assert "baseline_expansions=[250, 300, 350]" in feedback
 
 
+def test_reflection_feedback_maps_outcomes_to_search_algorithms() -> None:
+    feedback = build_reflection_feedback(
+        {
+            "solved": True,
+            "solve_rate": 1.0,
+            "score": 0.9,
+            "expanded": 275,
+            "baseline_solved": True,
+            "baseline_solve_rate": 1.0,
+            "baseline_score": 0.8,
+            "baseline_expanded": 400,
+            "strategy_breakdown": {
+                "astar": {
+                    "count": 2,
+                    "solved": 2,
+                    "solve_rate": 1.0,
+                    "mean_expanded": 400.0,
+                    "probe_count": 1,
+                },
+                "novelty": {
+                    "count": 2,
+                    "solved": 2,
+                    "solve_rate": 1.0,
+                    "mean_expanded": 150.0,
+                    "probe_count": 1,
+                },
+            },
+        },
+        "solved_efficiency_gain",
+    )
+
+    assert "Strategy evidence:" in feedback
+    assert "astar solves=2/2 mean_expanded=400.0 probes=1" in feedback
+    assert "novelty solves=2/2 mean_expanded=150.0 probes=1" in feedback
+
+
 def test_filter_unlearnable_tasks_drops_only_exhaustive_state_spaces() -> None:
     tasks = [
         PuzzleScriptLevelTask(i, "g", i, 100, "env", "/tmp/game.txt")
@@ -4773,7 +5028,8 @@ def test_h100_launcher_defaults_to_extended_vllm_context() -> None:
     holdout_launcher = Path("sbatch/compare_puzzlescript_holdout_gpu.s").read_text(
         encoding="utf-8"
     )
-    assert "#SBATCH --time=01:15:00" in holdout_launcher
+    assert "#SBATCH --time=30:00:00" in holdout_launcher
+    assert "#SBATCH --gres=gpu:h100:1" in holdout_launcher
     assert 'VLLM_PORT_SPACING:-20' in holdout_launcher
     assert '--tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"' in holdout_launcher
     assert 'search_array_count=${SEARCH_ARRAY_COUNT:-101} concurrency=${SEARCH_ARRAY_CONCURRENCY:-16}' in holdout_launcher
