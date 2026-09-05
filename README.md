@@ -275,16 +275,24 @@ Latest run `blindrel_v13_20260901_1445` (Codex `gpt-5.6-sol` agentic synthesis, 
 level, 70 train and 24 dev tasks over Sokoban-family games, 20 iterations, 31 h wall clock,
 `COMPLETED`):
 
-| | dev aggregate | interpretation |
-| --- | ---: | --- |
-| seed prompt (candidate 0) | 17.75 | already far ahead of blind search |
-| GEPA best by val aggregate (candidate 3) | 3.43 log2 | ~10.8x fewer expansions than blind, 18/24 solved, 0 lost solves |
-| selected by generalization gate (candidate 2) | 18.20 | highest per-game solve delta (+0.91) |
+Two scales matter here and they disagree. GEPA's own validation aggregate is the mean
+`log2(blind / candidate)` speedup; the generalization gate scores `20 * solve_rate_delta + clipped
+efficiency` per game, so it weights solve coverage far above speed.
 
-Every candidate improved on the blind reference with zero lost solves, and the run is the first
-where GEPA's own best (candidate 3, best mean speedup) and the generalization gate's pick
-(candidate 2, best per-game solve coverage) disagree - the gate ranks solve coverage first, and
-candidate 3 bought its speedup on fewer games.
+| dev candidate | GEPA val aggregate (log2) | implied speedup vs blind | dev solved | gate score |
+| --- | ---: | ---: | ---: | ---: |
+| 0, seed prompt | 1.83 | 3.6x | - | 17.75 |
+| 1 | 2.21 | 4.6x | - | 16.79 |
+| 2, **selected** | 1.48 | 2.8x | 20/24 | **18.20** |
+| 3, GEPA best | **3.43** | **10.8x** | 18/24 | 13.26 |
+
+Every candidate beat the blind reference with zero lost solves, so synthesized search code is
+clearly faster than uninformed search on these levels. The interesting result is the disagreement:
+candidate 3 is 10.8x faster than blind on average but solves 18/24, while candidate 2 is only 2.8x
+faster and solves 20/24. The gate takes coverage, so the shipped prompt is the slower, broader one.
+Which of those is the right artifact to select is an open design question, not a settled one -
+candidate 3's speedup is concentrated on fewer games.
+
 
 **These are training and dev numbers only.** The v13 run was launched with `CONFIG=train`, so no
 untouched holdout has been evaluated for the search-code experiment yet; that is the next step
