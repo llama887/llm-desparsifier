@@ -12,6 +12,8 @@ sys.path[:0] = [str(ROOT), str(SEARCH)]
 import puzzlescript_astar as astar_module
 from puzzlescript_astar import puzzlescript_search
 from puzzlescript_sanitizer import sanitize_and_compile_puzzlescript_search
+
+import scripts.run_puzzlescript_batched_gepa as runner
 from scripts.run_puzzlescript_batched_gepa import evaluate_search_task
 
 
@@ -225,7 +227,13 @@ def test_cpu_launcher_keeps_holdout_out_of_optimization() -> None:
     assert "--no-reflection-artifact-tools" in launcher
     assert "smoke|train|full" in launcher
     assert 'if [ "$MODE" = full ]' in launcher
-    assert "llm-desparsifier/sbatch/logs" not in launcher
+    # Both experiments now live in one repository, so the search-code jobs
+    # need their own log namespace. Sharing sbatch/logs/ with the
+    # heuristic-prompt experiment made concurrent runs overwrite each
+    # other's controller logs, which is how a dead run was mistaken for a
+    # live one.
+    assert "sbatch/logs/search_code/" in launcher
+    assert "sbatch/logs/%x-%j" not in launcher
     assert '${LUNA_MODEL:-gpt-5.6-sol}' in launcher
     assert "#SBATCH --mem=64G" in launcher
     assert '--llm-concurrency "${LLM_CONCURRENCY:-32}"' in launcher
@@ -800,3 +808,26 @@ def test_cleanup_trap_cancels_the_pool_before_touching_disk() -> None:
         stripped = line.strip()
         if stripped.startswith("touch ") or stripped.startswith("scancel "):
             assert stripped.endswith("|| true"), stripped
+
+
+def test_default_seed_contract_offers_both_synthesis_routes():
+    """The shared runner defaults to the dual-route search-code experiment."""
+    assert runner.active_seed_contract() == runner.SEED_CONTRACT_DUAL_ROUTE
+    text = runner.build_seed_candidate()[runner.HEURISTIC_COMPONENT]
+    assert "search artifact" in text
+
+
+def test_astar_seed_contract_pins_the_heuristic_only_experiment():
+    """--seed-contract astar-heuristic reproduces the A*-heuristic experiment.
+
+    The two experiments share one runner, so the heuristic-prompt experiment
+    needs an explicit way to start from the A*-only contract instead of the
+    dual-route seed that also invites custom search programs.
+    """
+    runner.configure_seed_contract(runner.SEED_CONTRACT_ASTAR_HEURISTIC)
+    try:
+        text = runner.build_seed_candidate()[runner.HEURISTIC_COMPONENT]
+        assert "heuristic_cost_to_go" in text
+        assert "search_plan" not in text
+    finally:
+        runner.configure_seed_contract(runner.SEED_CONTRACT_DUAL_ROUTE)

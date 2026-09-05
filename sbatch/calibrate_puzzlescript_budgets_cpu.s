@@ -7,13 +7,13 @@
 #SBATCH --account=torch_pr_45_tandon_advanced
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=fyy2003@nyu.edu
-#SBATCH --chdir=/scratch/fyy2003/repos/llm-desparsifier-sokoban-search-code
-#SBATCH --output=/scratch/fyy2003/repos/llm-desparsifier-sokoban-search-code/sbatch/logs/%x-%j.out
-#SBATCH --error=/scratch/fyy2003/repos/llm-desparsifier-sokoban-search-code/sbatch/logs/%x-%j.err
+#SBATCH --chdir=/scratch/fyy2003/repos/llm-desparsifier
+#SBATCH --output=/scratch/fyy2003/repos/llm-desparsifier/sbatch/logs/search_code/%x-%j.out
+#SBATCH --error=/scratch/fyy2003/repos/llm-desparsifier/sbatch/logs/search_code/%x-%j.err
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
-mkdir -p sbatch/logs
+mkdir -p sbatch/logs/search_code
 
 SD_PATH="$SLURM_SUBMIT_DIR/../script-doctor"
 NODE_DIR="/scratch/fyy2003/node-v20.18.0-linux-x64"

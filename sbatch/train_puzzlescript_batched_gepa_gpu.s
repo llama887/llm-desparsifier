@@ -270,6 +270,7 @@ echo "[run] scoring_baseline_outputs_file=${SCORING_BASELINE_OUTPUTS_FILE:-}"
     --search-poll-interval-s "${SEARCH_POLL_INTERVAL_S:-15}" \
     --search-array-stall-timeout-s "${SEARCH_ARRAY_STALL_TIMEOUT_S:-300}" \
     --extra-sbatch-args "${SEARCH_EXTRA_SBATCH_ARGS:-}" \
+    --seed-contract astar-heuristic \
     --val-split "${VAL_SPLIT:-dev}" \
     --dev-fraction "${DEV_FRACTION:-0.25}" \
     --guard-levels "${GUARD_LEVELS:-}" \
@@ -303,6 +304,7 @@ if [ "${RUN_HOLDOUT_COMPARE:-1}" = "1" ]; then
     echo "[holdout] state_root=$HOLDOUT_STATE_ROOT"
     "$SD_PATH/.venv/bin/python" -u scripts/compare_puzzlescript_batched_prompts.py \
         --env-grid "${ENV_GRID:-configs/gepa_puzzlescript_envs.yaml}" \
+        --seed-contract astar-heuristic \
         --state-root "$HOLDOUT_STATE_ROOT" \
         --script-doctor "$SD_PATH" \
         --optimized-prompt "$BEST_PROMPT_PATH" \

@@ -221,6 +221,7 @@ for replicate in $(seq 1 "${REPLICATES:-1}"); do
         echo "[replicate] $replicate_name attempt=$attempt/${REPLICATE_ATTEMPTS:-3}"
         if "$SD_PATH/.venv/bin/python" -u scripts/compare_puzzlescript_batched_prompts.py \
         --env-grid "${ENV_GRID:-configs/gepa_puzzlescript_envs.yaml}" \
+        --seed-contract astar-heuristic \
         --state-root "$replicate_root" \
         --script-doctor "$SD_PATH" \
         --optimized-prompt "$OPTIMIZED_PROMPT" \

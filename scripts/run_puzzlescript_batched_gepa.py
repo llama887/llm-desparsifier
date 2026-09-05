@@ -259,6 +259,95 @@ _CONTEXT_LENGTH_RE = re.compile(
 
 PUZZLESCRIPT_HEURISTIC_CONTRACT = """Study the supplied PuzzleScript source, mechanics, and initial level. Produce the deterministic bounded search artifact you expect to solve the level most efficiently. Follow the runtime API contract below."""
 
+PUZZLESCRIPT_ASTAR_ONLY_CONTRACT = """You are writing a heuristic function for A* search on one PuzzleScript grid puzzle.
+
+Output exactly Python code defining:
+def heuristic_cost_to_go(ts, env_params, ctx) -> float
+
+Do not output markdown fences, backticks, prose, imports, print, exec, eval, open,
+or file/network access. For PuzzleScript games, ts and env_params are None; the
+function must use only ctx plus constants you derive from the prompt-time game
+source. The full source, LEGEND, COLLISIONLAYERS, RULES, WINCONDITIONS, and
+initial level state may be present in the prompt for analysis, but they are not
+runtime inputs except through ctx.
+
+Runtime ctx keys include:
+  ctx.get('game_title'): title string
+  ctx.get('object_positions'): dict mapping object name -> list of (x,y) tuples
+  ctx.get('grid_width'), ctx.get('grid_height'): grid dimensions
+  ctx.get('win_conditions_text'): human-readable win conditions
+  ctx.get('ascii_state'): text grid of current state
+  ctx.get('score'): engine score, lower is closer to solved
+  ctx.get('score_normalized'): engine progress in [0,1], higher is closer
+  ctx.get('is_winning'): True if state is already won
+  ctx.get('object_names'): list of all object type names
+  ctx.get('action_names'): action id/name mapping
+
+Read the actual PuzzleScript mechanics before choosing features. Do not assume
+the objective is crate-on-target or even Sokoban-like just because object names
+look familiar. Derive the main progress terms from WINCONDITIONS, then use RULES
+and COLLISIONLAYERS to decide whether distances, reachability, ordering,
+alignment, terrain consumption, swapping, pulling, sliding, teleportation,
+gravity, beams, or one-way effects matter.
+
+Heuristic requirements:
+- Return a non-negative float; lower means closer to a win.
+- Return 0.0 when ctx.get('is_winning') is True.
+- Produce varied values across plausible successor states; constant heuristics
+  turn A* into blind search.
+- Prefer conservative, finite penalties. Only use very large deadlock penalties
+  for conditions that are provably impossible under this game's rules.
+- Use ctx['score_normalized'] or ctx['score'] as a small fallback or tie-breaker
+  when the game-specific features are uncertain; do not make them the only
+  signal unless there is no reliable object-level signal.
+- If unsure, build a finite fallback from win_conditions_text, object names,
+  object counts, player-to-interaction distance, and score_normalized instead
+  of hard-coding a Sokoban template.
+- Do not assume exact object keys such as "player", "crate", or "target".
+  Inspect ctx['object_names'], ctx['object_positions'], WINCONDITIONS, and
+  LEGEND aliases to collect player variants, crate-like objects, target-like
+  objects, exits, portals, terrain, and other mechanic-specific roles.
+- Prefer robust helper logic that derives object roles from names and win text
+  over a single hard-coded Sokoban key. If aliases exist, use all matching
+  variants instead of treating missing "player" or "crate" as an invalid state.
+"""
+
+SEED_CONTRACT_DUAL_ROUTE = "dual-route"
+SEED_CONTRACT_ASTAR_HEURISTIC = "astar-heuristic"
+_SEED_CONTRACT_TEXTS = {
+    SEED_CONTRACT_DUAL_ROUTE: PUZZLESCRIPT_HEURISTIC_CONTRACT,
+    SEED_CONTRACT_ASTAR_HEURISTIC: PUZZLESCRIPT_ASTAR_ONLY_CONTRACT,
+}
+_SEED_CONTRACT = SEED_CONTRACT_DUAL_ROUTE
+
+
+def configure_seed_contract(mode: str) -> None:
+    """Select which seed prompt GEPA starts optimizing.
+
+    Both experiments in this repository share one runner and one evaluator.
+    They differ in what the seed prompt asks the synthesis model to produce:
+    the search-code experiment opens both the A* heuristic route and the
+    custom ``search_plan`` route, while the heuristic-prompt experiment pins
+    the A*-only contract so the optimizer explores heuristics rather than
+    whole search programs. Selecting the contract here keeps that difference
+    in one named place instead of forking the runner.
+    """
+    global _SEED_CONTRACT
+    if mode not in _SEED_CONTRACT_TEXTS:
+        raise ValueError(f"unknown seed contract: {mode}")
+    _SEED_CONTRACT = mode
+
+
+def active_seed_contract() -> str:
+    """Return the currently selected seed-contract mode."""
+    return _SEED_CONTRACT
+
+
+def seed_contract_text() -> str:
+    """Return the seed prompt text for the selected experiment."""
+    return _SEED_CONTRACT_TEXTS[_SEED_CONTRACT]
+
+
 IMMUTABLE_SEARCH_CONTRACT_HEADER = "NON-NEGOTIABLE DUAL-ROUTE CONTRACT"
 IMMUTABLE_SEARCH_CONTRACT = f"""{IMMUTABLE_SEARCH_CONTRACT_HEADER}:
 Use the supplied agent workspace as the authoritative runtime contract. Finish
@@ -4320,7 +4409,7 @@ def build_seed_candidate(initial_addendum: str = "") -> dict[str, str]:
     """
     addendum = initial_addendum.strip()
     if not addendum:
-        return {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
+        return {HEURISTIC_COMPONENT: seed_contract_text()}
     cleaned = _clean_proposed_addendum(
         addendum,
         max_chars=DEFAULT_PROPOSED_ADDENDUM_MAX_CHARS,
@@ -4329,7 +4418,7 @@ def build_seed_candidate(initial_addendum: str = "") -> dict[str, str]:
         raise ValueError("Initial GEPA addendum failed prompt-shape validation.")
     return {
         HEURISTIC_COMPONENT: _compose_prompt_with_addendum(
-            PUZZLESCRIPT_HEURISTIC_CONTRACT,
+            seed_contract_text(),
             cleaned,
         )
     }
@@ -5957,10 +6046,10 @@ class PuzzleScriptBatchedGEPAAdapter:
         }
         scoring_rows = outputs if scoring_outputs is None else scoring_outputs
         self.set_scoring_baseline_outputs(scoring_rows)
-        baseline_candidate = candidate or {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
+        baseline_candidate = candidate or {HEURISTIC_COMPONENT: seed_contract_text()}
         self.baseline_prompt_text = baseline_candidate.get(
             HEURISTIC_COMPONENT,
-            PUZZLESCRIPT_HEURISTIC_CONTRACT,
+            seed_contract_text(),
         ).strip()
 
     def _attach_baseline_metadata(self, result: dict[str, Any]) -> None:
@@ -6110,7 +6199,7 @@ class PuzzleScriptBatchedGEPAAdapter:
         batch: Sequence[PuzzleScriptLevelTask],
         eval_dir: Path,
     ) -> list[dict[str, Any]]:
-        prompt_text = candidate.get(HEURISTIC_COMPONENT, PUZZLESCRIPT_HEURISTIC_CONTRACT)
+        prompt_text = candidate.get(HEURISTIC_COMPONENT, seed_contract_text())
         heuristics_dir = eval_dir / "heuristics"
         heuristics_dir.mkdir(parents=True, exist_ok=True)
         rows: list[Optional[dict[str, Any]]] = [None] * len(batch)
@@ -6354,7 +6443,7 @@ class PuzzleScriptBatchedGEPAAdapter:
             f"capture_traces={capture_traces}",
             flush=True,
         )
-        prompt_text = candidate.get(HEURISTIC_COMPONENT, PUZZLESCRIPT_HEURISTIC_CONTRACT)
+        prompt_text = candidate.get(HEURISTIC_COMPONENT, seed_contract_text())
         prompt_issue = candidate_prompt_issue(prompt_text)
         if prompt_issue is not None:
             print(f"[adapter] rejecting candidate prompt: {prompt_issue}", flush=True)
@@ -7157,6 +7246,9 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     blind_reference = load_blind_reference(getattr(args, "blind_reference", None))
     if blind_reference:
         print(f"[inputs] blind reference levels={len(blind_reference)}", flush=True)
+    configure_seed_contract(
+        str(getattr(args, "seed_contract", SEED_CONTRACT_DUAL_ROUTE))
+    )
     configure_objective(
         mode=str(getattr(args, "objective", OBJECTIVE_ADJUSTED)),
         blind_reference=blind_reference,
@@ -7172,6 +7264,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
         ),
     )
     print(f"[gepa] objective={getattr(args, 'objective', OBJECTIVE_ADJUSTED)}", flush=True)
+    print(f"[gepa] seed_contract={active_seed_contract()}", flush=True)
     all_train_tasks = build_level_tasks(
         evaluator=evaluator,
         jobs=selected_jobs,
@@ -7355,7 +7448,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     ]
     scoring_baseline_outputs: Optional[list[dict[str, Any]]] = None
     expected_provenance = baseline_provenance(
-        prompt_text=PUZZLESCRIPT_HEURISTIC_CONTRACT,
+        prompt_text=seed_contract_text(),
         model=str(getattr(args, "synthesis_codex_model", "") or ""),
         reasoning_effort=str(getattr(args, "codex_reasoning_effort", "") or ""),
         agentic=bool(getattr(args, "synthesis_agentic", True)),
@@ -7381,7 +7474,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
                 flush=True,
             )
         else:
-            base_candidate = {HEURISTIC_COMPONENT: PUZZLESCRIPT_HEURISTIC_CONTRACT}
+            base_candidate = {HEURISTIC_COMPONENT: seed_contract_text()}
             print(
                 "[gepa] evaluating original base prompt for seeded-run scoring: "
                 f"tasks={len(baseline_tasks)}",
@@ -7744,6 +7837,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_BLIND_BUDGET_MULTIPLIER,
         help="Per-level expansion budget as a multiple of measured blind effort.",
+    )
+    parser.add_argument(
+        "--seed-contract",
+        choices=(SEED_CONTRACT_DUAL_ROUTE, SEED_CONTRACT_ASTAR_HEURISTIC),
+        default=SEED_CONTRACT_DUAL_ROUTE,
+        help="'astar-heuristic' seeds the A*-heuristic-only contract used by the "
+        "heuristic-prompt experiment. 'dual-route' also offers the bounded "
+        "custom-search route used by the search-code experiment.",
     )
     parser.add_argument(
         "--objective",

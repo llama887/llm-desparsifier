@@ -80,6 +80,7 @@ COMMON_ARGS=(
     --reflection-backend codex-cli \
     --codex-model "${CODEX_MODEL:-gpt-5.6-sol}" \
     --reflection-artifact-tools \
+    --seed-contract astar-heuristic \
     --optimize-full-prompt \
     --synthesis-replicates "${SYNTHESIS_REPLICATES:-5}" \
     --lost-solve-penalty "${LOST_SOLVE_PENALTY:-20}" \
@@ -95,6 +96,7 @@ COMMON_ARGS=(
 
 "$SD_PATH/.venv/bin/python" -u scripts/compare_puzzlescript_batched_prompts.py \
     "${COMMON_ARGS[@]}" \
+    --seed-contract astar-heuristic \
     --state-root "$RUN_STATE_ROOT/holdout" \
     --optimized-prompt "$RUN_STATE_ROOT/best_prompt.txt" \
     --max-expansions "${MAX_EXPANSIONS:-50000}" \

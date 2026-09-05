@@ -27,15 +27,18 @@ from scripts.run_puzzlescript_batched_gepa import (  # noqa: E402
     DEFAULT_SCRIPT_DOCTOR,
     DEFAULT_SEARCH_ARRAY_STALL_TIMEOUT_S,
     HEURISTIC_COMPONENT,
-    PUZZLESCRIPT_HEURISTIC_CONTRACT,
+    SEED_CONTRACT_ASTAR_HEURISTIC,
+    SEED_CONTRACT_DUAL_ROUTE,
     CodexCLITextClient,
     OpenAITextClient,
     PuzzleScriptBatchedGEPAAdapter,
     PuzzleScriptEvaluator,
     SearchArrayConfig,
     build_level_tasks,
+    configure_seed_contract,
     load_env_grid,
     parse_extra_sbatch_args,
+    seed_contract_text,
 )
 
 
@@ -340,6 +343,7 @@ def evaluate_candidate(
 
 
 def run_holdout_comparison(args: argparse.Namespace) -> None:
+    configure_seed_contract(args.seed_contract)
     state_root = args.state_root.expanduser().resolve()
     state_root.mkdir(parents=True, exist_ok=True)
 
@@ -387,7 +391,7 @@ def run_holdout_comparison(args: argparse.Namespace) -> None:
         tasks=tasks,
         state_root=state_root,
         label="base",
-        prompt_text=PUZZLESCRIPT_HEURISTIC_CONTRACT,
+        prompt_text=seed_contract_text(),
     )
     optimized_outputs, optimized_dir = evaluate_candidate(
         adapter=adapter,
@@ -464,6 +468,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--llm-timeout-s", type=float, default=600.0)
     parser.add_argument("--llm-concurrency", type=int, default=16)
+    parser.add_argument(
+        "--seed-contract",
+        choices=(SEED_CONTRACT_DUAL_ROUTE, SEED_CONTRACT_ASTAR_HEURISTIC),
+        default=SEED_CONTRACT_DUAL_ROUTE,
+        help="Seed contract for the 'base' arm. Must match the contract the "
+        "optimized prompt was trained under, or the comparison is not paired.",
+    )
     parser.add_argument("--synthesis-replicates", type=int, default=1)
     parser.add_argument(
         "--synthesis-backend",
