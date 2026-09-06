@@ -258,6 +258,12 @@ CONFIG=train STATE_ROOT=$PWD/artifacts/<run> sbatch sbatch/train_sokoban_search_
 # CONFIG=smoke for a two-iteration single-level check, CONFIG=full to append the untouched holdout
 ```
 
+The two Codex roles are pinned to different models, because they do different jobs. Synthesis
+writes the code that is actually executed and scored, so it gets `gpt-5.6-luna`
+(`SYNTHESIS_MODEL`); reflection only rewrites the prompt, and gets `gpt-6-astra` (`GEPA_MODEL`).
+Note that `--codex-reasoning-effort` is shared by both clients, so `SYNTHESIS_EFFORT` (default
+`high`) currently sets the effort for reflection too.
+
 The launcher pins the objective and its guards rather than leaving them to defaults:
 `--objective blind-relative-time --blind-reference configs/puzzlescript_blind_reference.json
 --require-blind-reference --sibling-level-holdout --include-frontier-levels

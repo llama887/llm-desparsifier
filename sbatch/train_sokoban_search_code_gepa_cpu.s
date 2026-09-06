@@ -77,9 +77,9 @@ COMMON_ARGS=(
     --llm-timeout-s 900
     --llm-concurrency "${LLM_CONCURRENCY:-32}"
     --synthesis-backend codex-cli
-    --synthesis-codex-model "${LUNA_MODEL:-gpt-5.6-sol}"
+    --synthesis-codex-model "${SYNTHESIS_MODEL:-gpt-5.6-luna}"
     --synthesis-agentic
-    --codex-reasoning-effort "${LUNA_EFFORT:-high}"
+    --codex-reasoning-effort "${SYNTHESIS_EFFORT:-high}"
     --search-array-count "$POOL_SIZE"
     --search-array-concurrency "$POOL_SIZE"
     --search-pool-dir "$POOL_DIR"
@@ -99,7 +99,7 @@ RUN_ARGS=(
     --synthesis-cache-dir "${SYNTHESIS_CACHE_DIR:-artifacts/synthesis_cache}"
     --require-blind-reference
     --reflection-backend codex-cli
-    --codex-model "${GEPA_MODEL:-gpt-5.6-sol}"
+    --codex-model "${GEPA_MODEL:-gpt-6-astra}"
     --no-reflection-artifact-tools
     --optimize-full-prompt
     --min-reference-seconds "${MIN_REFERENCE_SECONDS:-1.0}"

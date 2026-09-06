@@ -234,7 +234,12 @@ def test_cpu_launcher_keeps_holdout_out_of_optimization() -> None:
     # live one.
     assert "sbatch/logs/search_code/" in launcher
     assert "sbatch/logs/%x-%j" not in launcher
-    assert '${LUNA_MODEL:-gpt-5.6-sol}' in launcher
+    # The model that writes the code and the model that rewrites the prompt
+    # are pinned separately: synthesis is the one whose output is executed
+    # and scored, so it gets the stronger coding model at high effort.
+    assert '${SYNTHESIS_MODEL:-gpt-5.6-luna}' in launcher
+    assert '${SYNTHESIS_EFFORT:-high}' in launcher
+    assert '${GEPA_MODEL:-gpt-6-astra}' in launcher
     assert "#SBATCH --mem=64G" in launcher
     assert '--llm-concurrency "${LLM_CONCURRENCY:-32}"' in launcher
     assert "--synthesis-cache-dir" in launcher
