@@ -137,11 +137,21 @@ full coverage, and `--blind-budget-multiplier` sets the candidate budget relativ
   recording that the holdout was untouched during optimization.
 - `--sibling-level-holdout` shows the synthesis agent one level and scores it on a different level of
   the same game, so an artifact cannot bank a precomputed plan for the instance it is graded on.
-- The final prompt is chosen by `select_generalizing_candidate`, not by raw GEPA aggregate. Per game
-  it averages `20 * solve_rate_delta + clipped efficiency delta`, then a non-base candidate is
-  eligible only if its mean per-game solve-rate delta is positive, or the solve-rate delta is zero
-  while at least two games improve, more games improve than regress, and mean per-game score is
-  positive. Eligible candidates rank by `(mean solve delta, median game score, mean game score)`.
+- Aggregates weight games equally per level, but `--macro-weight-cap` (default `4.0`) bounds how
+  much any one level can carry. Uncapped inverse-count weighting let a game that survived level
+  filtering with a single level supply 57% of a candidate's aggregate in the v13 run.
+- `--min-dev-levels-per-game` (default `2`) keeps games too thin to validate on out of the dev set,
+  and `--min-dev-games` (default `4`) raises the dev game target so the per-game majority in the
+  selection rule has enough games to mean something. Level-count balance still leads; the game floor
+  breaks ties.
+- The final prompt is chosen by `select_generalizing_candidate`, not by raw GEPA aggregate, and the
+  rule follows the objective. Under `adjusted` it averages `20 * solve_rate_delta + clipped
+  efficiency delta` per game, and a non-base candidate is eligible only if its mean per-game
+  solve-rate delta is positive, or the delta is zero while at least two games improve, more games
+  improve than regress, and mean per-game score is positive. Under a speed objective it ranks by
+  median then mean per-game score of that same objective, with a no-lost-solves floor, because
+  selecting on solve coverage would pick a candidate the optimizer never tried to produce.
+  `selection_rule` in the diagnostics records which applied.
 - The base prompt is always eligible, so a run can legitimately finish by keeping it.
   `gepa_result.json` records `best_idx`, `selected_best_idx`, and `selection_diagnostics`, so a
   disagreement between GEPA's aggregate and the generalization gate is visible after the fact.
