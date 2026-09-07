@@ -34,7 +34,13 @@ POOL_SIZE="${ARRAY_SIZE:-$([ "$MODE" = smoke ] && echo 8 || echo 64)}"
 # SLURM_JOB_PARTITION can report a partition alias that is not itself a
 # valid submission target, so allow an explicit override.
 POOL_PARTITION="${POOL_PARTITION:-${SLURM_JOB_PARTITION:?missing controller partition}}"
-if [ "$MODE" = smoke ] || [ "$POOL_PARTITION" = cpu_short ]; then
+# The pool must outlive its controller. A CONFIG=full run adds the untouched
+# holdout after training, so when the controller is given a longer --time the
+# pool has to be extended with it or the holdout loses its workers partway
+# through, which is how v13's training ended without a holdout at all.
+if [ -n "${POOL_TIME:-}" ]; then
+    :
+elif [ "$MODE" = smoke ] || [ "$POOL_PARTITION" = cpu_short ]; then
     POOL_TIME=04:00:00
 else
     POOL_TIME=2-00:00:00
