@@ -246,8 +246,12 @@ def test_cpu_launcher_keeps_holdout_out_of_optimization() -> None:
     assert '--macro-weight-cap' in launcher
     assert '--min-dev-levels-per-game' in launcher
     assert '--min-dev-games' in launcher
-    assert "#SBATCH --mem=64G" in launcher
-    assert '--llm-concurrency "${LLM_CONCURRENCY:-32}"' in launcher
+    # Two long runs died OUT_OF_MEMORY at ~18h on 64G while the controller
+    # held many concurrent Codex subprocesses plus accumulated results.
+    assert "#SBATCH --mem=192G" in launcher
+    # Synthesis is 97% of wall time and search 2.6%, so concurrency here,
+    # not pool size, is what makes a run finish sooner.
+    assert '--llm-concurrency "${LLM_CONCURRENCY:-64}"' in launcher
     assert "--synthesis-cache-dir" in launcher
     # The objective, its reference table, and the level holdout must all be
     # pinned in the launcher, not left to defaults.
@@ -961,3 +965,69 @@ def test_reflection_effort_can_differ_from_synthesis_effort():
     # Unset reflection effort falls back to the synthesis setting.
     default = runner.build_arg_parser().parse_args(["--codex-reasoning-effort", "high"])
     assert default.reflection_reasoning_effort == ""
+
+
+def test_load_env_grid_reads_an_explicit_val_jobs_block(tmp_path):
+    """An explicit val_jobs block names the validation games directly.
+
+    Deriving val by subset-searching the training jobs makes the split a
+    property of a seed rather than of the experiment. v13 landed on three dev
+    games that way, which is too few for the per-game selection rule.
+    """
+    grid = tmp_path / "grid.yaml"
+    grid.write_text(
+        "jobs:\n"
+        "- {name: TrainA, levels: 5}\n"
+        "- {name: TrainB, levels: 5}\n"
+        "val_jobs:\n"
+        "- {name: ValA, levels: 4}\n"
+        "eval_jobs:\n"
+        "- {name: HoldA, levels: 6}\n",
+        encoding="utf-8",
+    )
+    train, val, evaluation = runner.load_env_grid(grid)
+    assert [job["name"] for job in train] == ["TrainA", "TrainB"]
+    assert [job["name"] for job in val] == ["ValA"]
+    assert [job["name"] for job in evaluation] == ["HoldA"]
+
+
+def test_load_env_grid_without_val_jobs_leaves_the_split_to_the_runner(tmp_path):
+    """Configs with no val_jobs keep the previous auto-split behaviour."""
+    grid = tmp_path / "grid.yaml"
+    grid.write_text(
+        "jobs:\n- {name: TrainA, levels: 5}\neval_jobs:\n- {name: HoldA, levels: 6}\n",
+        encoding="utf-8",
+    )
+    train, val, evaluation = runner.load_env_grid(grid)
+    assert [job["name"] for job in train] == ["TrainA"]
+    assert val == []
+    assert [job["name"] for job in evaluation] == ["HoldA"]
+
+
+def test_val_games_never_overlap_training_games(tmp_path):
+    """A game named in both blocks is a leak, so refuse to run."""
+    grid = tmp_path / "grid.yaml"
+    grid.write_text(
+        "jobs:\n- {name: Shared, levels: 5}\n"
+        "val_jobs:\n- {name: Shared, levels: 5}\n"
+        "eval_jobs:\n- {name: HoldA, levels: 6}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="both jobs and val_jobs"):
+        runner.load_env_grid(grid)
+
+
+def test_smoke_mode_does_not_ask_for_a_sibling_it_cannot_have():
+    """A single-level smoke target has no sibling to hide behind.
+
+    Pinning --sibling-level-holdout for every mode dropped the only level of
+    the smoke target and failed the sweep 0/1, which is what tripped the v14
+    launch gate.
+    """
+    launcher = (ROOT / "sbatch" / "train_sokoban_search_code_gepa_cpu.s").read_text()
+    smoke = launcher.index('if [ "$MODE" = smoke ]')
+    tail = launcher.index('"$SD_PATH/.venv/bin/python" -u scripts/run_puzzlescript_batched_gepa.py')
+    smoke_branch = launcher[smoke:tail]
+    else_branch = smoke_branch[smoke_branch.index("else"):]
+    assert "--sibling-level-holdout" in else_branch
+    assert "--sibling-level-holdout" not in smoke_branch[: smoke_branch.index("else")]

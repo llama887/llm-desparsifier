@@ -1485,9 +1485,37 @@ def heuristic_score(solved: bool, expanded: int, max_expansions: int) -> float:
     return ((n + 1) - s) / (n + 1)
 
 
-def load_env_grid(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def load_env_grid(
+    path: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return the training, validation and holdout jobs named by a grid config.
+
+    `val_jobs` is optional. When present it names the validation games
+    directly, which makes the split a recorded property of the experiment
+    rather than an outcome of a subset search over a seed; when absent the
+    runner falls back to splitting `jobs` as before.
+    """
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return list(payload.get("jobs", [])), list(payload.get("eval_jobs", []))
+    train_jobs = list(payload.get("jobs", []))
+    val_jobs = list(payload.get("val_jobs", []))
+    eval_jobs = list(payload.get("eval_jobs", []))
+    train_names = {str(job.get("name", "")) for job in train_jobs}
+    overlap = sorted(train_names & {str(job.get("name", "")) for job in val_jobs})
+    if overlap:
+        raise ValueError(
+            "games appear in both jobs and val_jobs, which leaks training "
+            f"mechanics into validation: {overlap}"
+        )
+    holdout_overlap = sorted(
+        (train_names | {str(job.get("name", "")) for job in val_jobs})
+        & {str(job.get("name", "")) for job in eval_jobs}
+    )
+    if holdout_overlap:
+        raise ValueError(
+            "games appear in eval_jobs and in jobs or val_jobs, which puts the "
+            f"holdout inside optimization: {holdout_overlap}"
+        )
+    return train_jobs, val_jobs, eval_jobs
 
 
 def split_train_dev_jobs(
@@ -7394,7 +7422,7 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     (gepa_run_dir / "prog_candidates").mkdir(exist_ok=True)
 
     evaluator = PuzzleScriptEvaluator(args.script_doctor)
-    train_jobs, eval_jobs = load_env_grid(args.env_grid)
+    train_jobs, val_jobs, eval_jobs = load_env_grid(args.env_grid)
     training_level_selection = parse_guard_level_selection(args.training_levels)
     selected_jobs = select_jobs_for_training_levels(
         train_jobs,
@@ -7464,11 +7492,46 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
                     f"{game}:{level}" for game, level in missing_training_keys
                 )
             )
-    if args.val_split == "dev":
+    explicit_val_tasks: list[PuzzleScriptLevelTask] = []
+    if val_jobs:
+        explicit_val_tasks = build_level_tasks(
+            evaluator=evaluator,
+            jobs=val_jobs,
+            script_doctor=args.script_doctor,
+            levels_per_game=args.levels_per_game,
+            budget=max(1, args.max_gepa_expansions_per_level),
+            blind_reference=blind_reference,
+            min_reference_seconds=float(
+                getattr(args, "min_reference_seconds", DEFAULT_MIN_REFERENCE_SECONDS)
+            ),
+            require_blind_reference=bool(getattr(args, "require_blind_reference", False)),
+            include_frontier_levels=bool(getattr(args, "include_frontier_levels", False)),
+            blind_budget_multiplier=float(
+                getattr(args, "blind_budget_multiplier", DEFAULT_BLIND_BUDGET_MULTIPLIER)
+            ),
+            sibling_level_holdout=bool(getattr(args, "sibling_level_holdout", False)),
+            sibling_seed=int(getattr(args, "sibling_seed", 0)),
+        )
+    if explicit_val_tasks:
+        # Named validation games beat a seeded subset search: the split is then
+        # a recorded property of the experiment, and every training game keeps
+        # all of its levels instead of losing whole games to the dev side.
+        train_tasks = all_train_tasks
+        val_tasks = explicit_val_tasks
+        print(
+            f"[inputs] explicit val_jobs: {len(val_tasks)} level(s) across "
+            f"{len({task.game for task in val_tasks})} game(s)",
+            flush=True,
+        )
+    elif args.val_split == "dev":
         split_train_tasks, split_val_tasks = build_train_dev_tasks(
             all_train_tasks,
             dev_fraction=args.dev_fraction,
             seed=args.seed,
+            min_levels_per_game=int(
+                getattr(args, "min_dev_levels_per_game", DEFAULT_MIN_DEV_LEVELS_PER_GAME)
+            ),
+            min_dev_games=int(getattr(args, "min_dev_games", DEFAULT_MIN_DEV_GAMES)),
         )
         train_tasks = [cast(PuzzleScriptLevelTask, task) for task in split_train_tasks]
         val_tasks = [cast(PuzzleScriptLevelTask, task) for task in split_val_tasks]

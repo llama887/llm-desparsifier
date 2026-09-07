@@ -158,14 +158,29 @@ full coverage, and `--blind-budget-multiplier` sets the candidate budget relativ
 
 ### Environment grids
 
-`configs/*.yaml` list `jobs` (train/dev) and `eval_jobs` (holdout) as `{name, levels}` entries where
-`levels` is the game's level count; `--levels-per-game` decides how many are sampled.
+`configs/*.yaml` list `jobs` (train), an optional `val_jobs` (validation), and `eval_jobs` (holdout)
+as `{name, levels}` entries where `levels` is the game's level count; `--levels-per-game` decides how
+many are sampled. A game may appear in only one block, and `load_env_grid` refuses to start if one
+appears in two.
+
+When `val_jobs` is present it *is* the validation set, and every training game keeps all of its
+levels. When it is absent the runner falls back to splitting `jobs` by game with `--dev-fraction`.
+Prefer naming the games: a seeded subset search made v13's validation set three games, which is too
+few for the per-game selection rule and let one level dominate the objective.
+
+Validation is whole unseen games rather than held-out levels of trained games. The optimized object
+is a global prompt, so the unit of generalization is the mechanic, not the level: a held-out level of
+a trained game shares its rules, object names and win conditions, and measures little that the
+training levels do not already show.
 
 - `configs/gepa_puzzlescript_envs.yaml` - Sokoban-family curriculum: 19 train/dev games, 22 holdout
   games, 254 holdout tasks at `--levels-per-game 0`.
 - `configs/gepa_puzzlescript_gallery_random_20260723.yaml` - fixed-seed random gallery from
   `script-doctor/data/scraped_games`: 44 compileable games with at least 3 levels (32 train/dev, 12
   holdout), explicit Sokoban names capped at 4, 3 levels sampled per game.
+- `configs/gepa_puzzlescript_sokoban_partition_20260906.yaml` - the same pool partitioned once with
+  a recorded seed into 21 train / 10 val / 10 holdout games, so validation and holdout are drawn from
+  one distribution instead of being curated separately.
 - `configs/gepa_puzzlescript_envs_smoke3.yaml` - three-game smoke grid.
 - `configs/puzzlescript_blind_reference.json` - calibrated blind reference for 440 Sokoban levels.
 
@@ -267,6 +282,12 @@ sbatch sbatch/calibrate_puzzlescript_budgets_cpu.s
 CONFIG=train STATE_ROOT=$PWD/artifacts/<run> sbatch sbatch/train_sokoban_search_code_gepa_cpu.s
 # CONFIG=smoke for a two-iteration single-level check, CONFIG=full to append the untouched holdout
 ```
+
+Run cost is dominated by synthesis, not search. In v13, 30.3 of 31.1 wall-clock hours went to Codex
+synthesis and 0.8 h to A* across the whole run: median 47.8 min of synthesis per evaluation against
+1.0 min of search. The lever that shortens a run is `--llm-concurrency` and the controller CPUs that
+support it, not the size of the search pool - the pool sits idle for most of a run, so it is set to
+32 workers rather than 64.
 
 The two Codex roles are pinned to different models, because they do different jobs. Synthesis
 writes the code that is actually executed and scored, so it gets `gpt-5.6-luna`

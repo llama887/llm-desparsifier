@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=cx-sk-search-code
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=192G
 #SBATCH --time=2-00:00:00
 #SBATCH --account=torch_pr_45_tandon_advanced
 #SBATCH --mail-type=END,FAIL
@@ -30,7 +30,9 @@ codex login status
 MODE="${CONFIG:-smoke}"
 case "$MODE" in smoke|train|full) ;; *) echo "CONFIG must be smoke, train, or full" >&2; exit 2;; esac
 RUN_STATE_ROOT="${STATE_ROOT:?STATE_ROOT is required}"
-POOL_SIZE="${ARRAY_SIZE:-$([ "$MODE" = smoke ] && echo 8 || echo 64)}"
+# Search is a few percent of wall time, so a smaller pool costs almost
+# nothing and stops 64 workers idling for the 97% spent in synthesis.
+POOL_SIZE="${ARRAY_SIZE:-$([ "$MODE" = smoke ] && echo 8 || echo 32)}"
 # SLURM_JOB_PARTITION can report a partition alias that is not itself a
 # valid submission target, so allow an explicit override.
 POOL_PARTITION="${POOL_PARTITION:-${SLURM_JOB_PARTITION:?missing controller partition}}"
@@ -81,7 +83,7 @@ COMMON_ARGS=(
     --script-doctor "$SD_PATH"
     --astar-timeout-s 30
     --llm-timeout-s 900
-    --llm-concurrency "${LLM_CONCURRENCY:-32}"
+    --llm-concurrency "${LLM_CONCURRENCY:-64}"
     --synthesis-backend codex-cli
     --synthesis-codex-model "${SYNTHESIS_MODEL:-gpt-5.6-luna}"
     --synthesis-agentic
@@ -105,7 +107,6 @@ RUN_ARGS=(
     --min-dev-levels-per-game "${MIN_DEV_LEVELS_PER_GAME:-2}"
     --min-dev-games "${MIN_DEV_GAMES:-4}"
     --reflection-reasoning-effort "${REFLECTION_EFFORT:-high}"
-    --sibling-level-holdout
     --synthesis-cache-dir "${SYNTHESIS_CACHE_DIR:-artifacts/synthesis_cache}"
     --require-blind-reference
     --reflection-backend codex-cli
@@ -137,6 +138,7 @@ if [ "$MODE" = smoke ]; then
 else
     RUN_ARGS+=(
         --levels-per-game "${LEVELS_PER_GAME:-0}"
+        --sibling-level-holdout
         --max-gepa-expansions-per-level "${FALLBACK_EXPANSIONS:-10000}"
         --synthesis-replicates "${REPLICATES:-5}"
         --val-split dev

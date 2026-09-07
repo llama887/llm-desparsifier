@@ -349,7 +349,7 @@ def run_holdout_comparison(args: argparse.Namespace) -> None:
 
     optimized_prompt = args.optimized_prompt.read_text(encoding="utf-8").strip()
     evaluator = PuzzleScriptEvaluator(args.script_doctor)
-    _train_jobs, eval_jobs = load_env_grid(args.env_grid)
+    _train_jobs, _val_jobs, eval_jobs = load_env_grid(args.env_grid)
     tasks = build_level_tasks(
         evaluator=evaluator,
         jobs=eval_jobs,

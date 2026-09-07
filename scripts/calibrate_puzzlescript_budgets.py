@@ -86,7 +86,11 @@ def main(argv: list[str] | None = None) -> int:
     state_root.mkdir(parents=True, exist_ok=True)
     script_doctor = args.script_doctor.expanduser().resolve()
 
-    train_jobs, eval_jobs = load_env_grid(args.env_grid.expanduser().resolve())
+    train_jobs, val_jobs, eval_jobs = load_env_grid(
+        args.env_grid.expanduser().resolve()
+    )
+    # Validation games need calibrated references too.
+    train_jobs = [*train_jobs, *val_jobs]
     jobs = list(train_jobs) + (list(eval_jobs) if args.include_eval_jobs else [])
     print(f"[calibrate] jobs={len(jobs)} (train={len(train_jobs)} eval_included={args.include_eval_jobs})", flush=True)
 

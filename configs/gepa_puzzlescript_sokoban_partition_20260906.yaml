@@ -1,0 +1,53 @@
+# Seeded train/val/holdout partition of the Sokoban-family pool.
+# Seed 20260906; partition is fixed and recorded so val-based selection and the
+# holdout test are drawn from the same distribution rather than hand-curated.
+# 21 train / 10 val / 10 holdout games.
+# val_jobs are whole unseen games: the optimized object is a global prompt, so
+# the unit of generalization is the mechanic, not the level.
+
+jobs:
+- {name: "1D_Sokoban", levels: 3}
+- {name: "Algorithm-Generated_Sokoban_Levels", levels: 40}
+- {name: "All_These_Damn_Crates", levels: 20}
+- {name: "Aperture_Science_Sokoban_Testing_Initiative", levels: 85}
+- {name: "Beam_Islands", levels: 13}
+- {name: "Broken_Leg_Sokoban", levels: 20}
+- {name: "Collapsable_Sokoban", levels: 7}
+- {name: "Crate_Rotate", levels: 11}
+- {name: "Ice_Cubes", levels: 75}
+- {name: "Memory_Push", levels: 20}
+- {name: "Muddy_Sokoban_Level_Set_I", levels: 7}
+- {name: "Nethack_Sokoban", levels: 38}
+- {name: "No_Right_Turn_Sokoban", levels: 8}
+- {name: "Remote_Control_Sokoban", levels: 7}
+- {name: "Soko-bine", levels: 9}
+- {name: "Sokoban_Flipped", levels: 21}
+- {name: "Sokobot", levels: 15}
+- {name: "Ultimate_Sokoban_Supreme", levels: 22}
+- {name: "ZigZag_Ice", levels: 5}
+- {name: "sokoban_basic", levels: 2}
+- {name: "where_did_all_this_ice_come_from_", levels: 30}
+
+val_jobs:
+- {name: "Crates_and_Portals", levels: 60}
+- {name: "Inswaption", levels: 42}
+- {name: "Not_Normal_Crates", levels: 74}
+- {name: "Pulling_Box_Sokoban", levels: 21}
+- {name: "Push_-_A_-_Crate", levels: 28}
+- {name: "Sasquatch_Sokoban", levels: 38}
+- {name: "Sokoban_Dungeon", levels: 6}
+- {name: "Sokocross", levels: 28}
+- {name: "Swap_Sokoban", levels: 21}
+- {name: "Tractor_Beam_Sokoban9", levels: 24}
+
+eval_jobs:
+- {name: "Beams_and_Flowers", levels: 20}
+- {name: "Cold_Feet_Sokoban", levels: 7}
+- {name: "Darkness_Sokoban", levels: 2}
+- {name: "Drop_Swap", levels: 16}
+- {name: "Gravity_Sokoban", levels: 21}
+- {name: "Heroes_of_Sokoban", levels: 31}
+- {name: "IceCrates", levels: 13}
+- {name: "Isle_of_Sokoban", levels: 17}
+- {name: "Merge_and_Swap", levels: 8}
+- {name: "sokoban_sanity", levels: 3}
