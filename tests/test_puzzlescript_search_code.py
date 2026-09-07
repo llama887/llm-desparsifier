@@ -240,6 +240,12 @@ def test_cpu_launcher_keeps_holdout_out_of_optimization() -> None:
     assert '${SYNTHESIS_MODEL:-gpt-5.6-luna}' in launcher
     assert '${SYNTHESIS_EFFORT:-high}' in launcher
     assert '${GEPA_MODEL:-gpt-6-astra}' in launcher
+    # v13 post-mortem guards. Each one is a property of the measurement,
+    # so leaving them to defaults would let a later default change alter
+    # what a run means without the launcher recording it.
+    assert '--macro-weight-cap' in launcher
+    assert '--min-dev-levels-per-game' in launcher
+    assert '--min-dev-games' in launcher
     assert "#SBATCH --mem=64G" in launcher
     assert '--llm-concurrency "${LLM_CONCURRENCY:-32}"' in launcher
     assert "--synthesis-cache-dir" in launcher
@@ -836,3 +842,122 @@ def test_astar_seed_contract_pins_the_heuristic_only_experiment():
         assert "search_plan" not in text
     finally:
         runner.configure_seed_contract(runner.SEED_CONTRACT_DUAL_ROUTE)
+
+
+def _row(game: str, level: int, *, solve_rate: float = 1.0, baseline_rate: float = 0.0):
+    """Build a minimal scored-result row for selection and weighting tests."""
+    return {
+        "game": game,
+        "level": level,
+        "solve_rate": solve_rate,
+        "baseline_solve_rate": baseline_rate,
+        "solved_expanded_mean": 100.0,
+        "baseline_solved_expanded_mean": 100.0,
+    }
+
+
+def test_macro_weights_cap_a_game_that_survives_with_one_level():
+    """A one-level game must not be able to carry the whole objective.
+
+    v13's dev split was 18/5/1 levels over three games. Inverse-count macro
+    weighting gave the single level weight 8.0, so one level supplied 57% of
+    the best candidate's aggregate and reversed the ranking.
+    """
+    rows = (
+        [_row("big", i) for i in range(18)]
+        + [_row("mid", i) for i in range(5)]
+        + [_row("thin", 0)]
+    )
+    weights = runner._macro_game_weights(rows)
+    assert max(weights) <= runner.DEFAULT_MACRO_WEIGHT_CAP + 1e-9
+    # The mean stays one, so the aggregate is still a per-row average.
+    assert abs(sum(weights) / len(weights) - 1.0) < 1e-9
+
+
+def test_dev_split_rejects_games_too_thin_to_validate_on():
+    """Games with too few surviving levels must not be chosen as dev games."""
+    counts = {"big": 18, "mid": 5, "thin": 1, "other": 6, "fourth": 6}
+    dev = runner._select_dev_games_by_task_count(
+        counts,
+        dev_fraction=0.4,
+        seed=0,
+        min_levels_per_game=2,
+    )
+    assert "thin" not in dev
+
+
+def test_dev_split_prefers_enough_games_for_the_selection_rule():
+    """The gate needs several dev games before its majority rule means anything."""
+    counts = {f"g{i}": 6 for i in range(10)}
+    dev = runner._select_dev_games_by_task_count(
+        counts,
+        dev_fraction=0.4,
+        seed=0,
+        min_dev_games=4,
+    )
+    assert len(dev) >= 4
+
+
+def test_speed_objective_selects_on_the_objective_it_optimized():
+    """Under a speed objective the gate must rank by speed, not solve coverage.
+
+    v13 optimized blind-relative time but selected with the solve-coverage rule
+    built for the base-relative objective, so GEPA's best candidate and the
+    selected candidate disagreed with no principled tie-break.
+    """
+    runner.configure_objective(
+        mode=runner.OBJECTIVE_BASE_RELATIVE_TIME,
+        blind_reference={},
+        solve_slack=0.0,
+        unsolved_log2=-3.0,
+        speedup_clip=14.0,
+        slow_solve_clip=2.0,
+    )
+    try:
+        def timed(game: str, seconds: float):
+            # base-relative time is only defined where both sides solved.
+            return {
+                **_row(game, 0, solve_rate=1.0, baseline_rate=1.0),
+                "solved_time_mean": seconds,
+                "baseline_solved_time_mean": 8.0,
+            }
+
+        base = [timed("a", 8.0), timed("b", 8.0)]
+        slower = [timed("a", 16.0), timed("b", 16.0)]
+        faster = [timed("a", 1.0), timed("b", 1.0)]
+        selected, diagnostics = runner.select_generalizing_candidate([base, slower, faster])
+        assert selected == 2, diagnostics
+        assert diagnostics[0]["selection_rule"] == "objective"
+    finally:
+        runner.configure_objective(mode=runner.OBJECTIVE_ADJUSTED)
+
+
+def test_adjusted_objective_keeps_the_solve_coverage_rule():
+    """The base-relative experiment keeps the rule it was designed with."""
+    runner.configure_objective(mode=runner.OBJECTIVE_ADJUSTED)
+    more_solves = [
+        _row("a", 0, solve_rate=1.0, baseline_rate=0.0),
+        _row("b", 0, solve_rate=1.0, baseline_rate=0.0),
+    ]
+    base = [
+        _row("a", 0, solve_rate=0.0, baseline_rate=0.0),
+        _row("b", 0, solve_rate=0.0, baseline_rate=0.0),
+    ]
+    selected, diagnostics = runner.select_generalizing_candidate([base, more_solves])
+    assert selected == 1
+    assert diagnostics[0]["selection_rule"] == "solve-coverage"
+
+
+def test_reflection_effort_can_differ_from_synthesis_effort():
+    """The prompt writer and the code writer are different models now."""
+    parsed = runner.build_arg_parser().parse_args(
+        [
+            "--codex-reasoning-effort", "high",
+            "--reflection-reasoning-effort", "medium",
+        ]
+    )
+    assert parsed.codex_reasoning_effort == "high"
+    assert parsed.reflection_reasoning_effort == "medium"
+    # Unset reflection effort falls back to the synthesis setting.
+    default = runner.build_arg_parser().parse_args(["--codex-reasoning-effort", "high"])
+    assert default.reflection_reasoning_effort == ""

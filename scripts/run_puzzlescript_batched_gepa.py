@@ -106,6 +106,9 @@ DEFAULT_BLIND_BUDGET_MULTIPLIER = 2.0
 # feasible one.
 CONSTRAINT_VIOLATION_PENALTY = 1000.0
 
+DEFAULT_MACRO_WEIGHT_CAP = 4.0
+DEFAULT_MIN_DEV_LEVELS_PER_GAME = 2
+DEFAULT_MIN_DEV_GAMES = 4
 OBJECTIVE_ADJUSTED = "adjusted"
 OBJECTIVE_SPEEDUP_CONSTRAINED = "speedup-constrained"
 OBJECTIVE_BASE_RELATIVE_TIME = "base-relative-time"
@@ -154,11 +157,22 @@ DEFAULT_MIN_REFERENCE_SECONDS = 0.0
 MIN_MEASURABLE_SOLVE_SECONDS = 1e-4
 
 _OBJECTIVE_MODE = OBJECTIVE_ADJUSTED
+_MACRO_WEIGHT_CAP: float = DEFAULT_MACRO_WEIGHT_CAP
 _OBJECTIVE_BLIND_REFERENCE: dict[tuple[str, int], dict[str, Any]] = {}
 _OBJECTIVE_SOLVE_SLACK = 0.0
 _OBJECTIVE_UNSOLVED_LOG2 = DEFAULT_BLIND_RELATIVE_UNSOLVED_LOG2
 _OBJECTIVE_SPEEDUP_CLIP = DEFAULT_BLIND_RELATIVE_CLIP
 _OBJECTIVE_SLOW_SOLVE_CLIP = DEFAULT_SLOW_SOLVE_CLIP
+
+
+def configure_macro_weight_cap(cap: float) -> None:
+    """Set the largest weight any single level may carry in an aggregate.
+
+    Kept beside the objective configuration because it changes what the
+    objective's mean means, not merely how it is reported.
+    """
+    global _MACRO_WEIGHT_CAP
+    _MACRO_WEIGHT_CAP = max(1.0, float(cap)) if cap and cap > 0 else 0.0
 
 
 def configure_objective(
@@ -1734,6 +1748,8 @@ def _select_dev_games_by_task_count(
     *,
     dev_fraction: float,
     seed: int,
+    min_levels_per_game: int = DEFAULT_MIN_DEV_LEVELS_PER_GAME,
+    min_dev_games: int = DEFAULT_MIN_DEV_GAMES,
 ) -> set[str]:
     """Return a game-disjoint dev set whose level count is near the target.
 
@@ -1750,11 +1766,29 @@ def _select_dev_games_by_task_count(
     games = list(game_counts)
     if len(games) <= 1:
         return set()
+    # A game reduced to one or two surviving levels by reference filtering is a
+    # bad validation game twice over: the macro weighting inflates it, and the
+    # selection rule reads it as a whole game's worth of evidence. Prefer games
+    # thick enough to validate on, but never filter so hard that no split is
+    # possible.
+    eligible = [game for game in games if int(game_counts[game]) >= max(1, min_levels_per_game)]
+    if len(eligible) >= 2 and len(eligible) < len(games):
+        thin = set(games) - set(eligible)
+        print(
+            f"[inputs] excluding {len(thin)} game(s) from dev with fewer than "
+            f"{min_levels_per_game} surviving levels: {sorted(thin)}",
+            flush=True,
+        )
+        games = eligible
     total_tasks = sum(max(0, int(game_counts[game])) for game in games)
     if total_tasks <= 0:
         return set()
     target_tasks = max(1, min(total_tasks - 1, int(round(total_tasks * dev_fraction))))
+    # The selection rule asks whether more games improved than regressed, which
+    # is close to a coin flip on three dev games. Ask for enough games that the
+    # majority means something, while still leaving training games behind.
     target_games = max(1, min(len(games) - 1, int(round(len(games) * dev_fraction))))
+    target_games = max(target_games, min(len(games) - 1, max(1, int(min_dev_games))))
     shuffled = games[:]
     random.Random(seed).shuffle(shuffled)
 
@@ -1772,6 +1806,10 @@ def _select_dev_games_by_task_count(
         if not subset or len(subset) == len(games):
             continue
         key = (
+            # Level count still leads: a dev set whose size does not match the
+            # optimized metric is unrepresentative no matter how many games it
+            # spans. The raised game target below breaks ties toward more
+            # games, which is where the selection rule needs the breadth.
             abs(task_count - target_tasks),
             abs(len(subset) - target_games),
             len(subset),
@@ -1789,6 +1827,8 @@ def build_train_dev_tasks(
     *,
     dev_fraction: float = DEFAULT_DEV_FRACTION,
     seed: int = 0,
+    min_levels_per_game: int = DEFAULT_MIN_DEV_LEVELS_PER_GAME,
+    min_dev_games: int = DEFAULT_MIN_DEV_GAMES,
 ) -> tuple[list[Any], list[Any]]:
     """Split materialized level tasks into game-disjoint train/dev batches.
 
@@ -1804,6 +1844,8 @@ def build_train_dev_tasks(
         game_counts,
         dev_fraction=dev_fraction,
         seed=seed,
+        min_levels_per_game=min_levels_per_game,
+        min_dev_games=min_dev_games,
     )
     train_games = set(game_counts) - dev_games
     train_tasks = [task for task in tasks if _task_game(task) in train_games]
@@ -2147,8 +2189,22 @@ def _common_solve_efficiency_delta(row: Mapping[str, Any], *, clip: float) -> fl
     return _clamp(scaled_delta, max(0.0, clip))
 
 
-def _macro_game_weights(rows: Sequence[Mapping[str, Any]]) -> list[float]:
-    """Return per-row weights whose mean is one and games contribute equally."""
+def _macro_game_weights(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    cap: float | None = None,
+) -> list[float]:
+    """Return per-row weights whose mean is one and games contribute equally.
+
+    Equal per-game contribution is the point, but inverse-count weighting alone
+    lets a game that survives level filtering with a single level dominate the
+    objective: in the v13 dev split of 18/5/1 levels the lone level carried
+    weight 8.0 and supplied 57% of the best candidate's aggregate, which
+    reversed the candidate ranking. Weights are therefore capped and
+    renormalized until the mean is one and no row exceeds the cap, so a thin
+    game still counts for more per level than a fat one without being able to
+    decide the run on its own.
+    """
     if not rows:
         return []
     counts: dict[str, int] = {}
@@ -2157,7 +2213,20 @@ def _macro_game_weights(rows: Sequence[Mapping[str, Any]]) -> list[float]:
         counts[game] = counts.get(game, 0) + 1
     n_rows = len(rows)
     n_games = max(1, len(counts))
-    return [n_rows / (n_games * counts[str(row.get("game", ""))]) for row in rows]
+    weights = [n_rows / (n_games * counts[str(row.get("game", ""))]) for row in rows]
+    limit = _MACRO_WEIGHT_CAP if cap is None else cap
+    if limit is None or limit <= 0.0:
+        return weights
+    limit = max(1.0, float(limit))
+    for _ in range(64):
+        capped = [min(limit, weight) for weight in weights]
+        mean = sum(capped) / len(capped)
+        if mean <= 0.0:
+            return [1.0] * n_rows
+        weights = [weight / mean for weight in capped]
+        if max(weights) <= limit + 1e-9:
+            break
+    return weights
 
 
 def _has_baseline(row: Mapping[str, Any]) -> bool:
@@ -2729,10 +2798,102 @@ def adjusted_candidate_scores(
     return scores
 
 
+def _mean_solve_rate(outputs: Sequence[Mapping[str, Any]]) -> float:
+    """Return the mean per-level solve rate for one candidate."""
+    rows = list(outputs)
+    if not rows:
+        return 0.0
+    return sum(_row_solve_rate(row) for row in rows) / len(rows)
+
+
+def _per_game_objective_scores(outputs: Sequence[Mapping[str, Any]]) -> list[float]:
+    """Return one objective score per game, under the run's active objective.
+
+    `adjusted_candidate_scores` already dispatches on the configured objective,
+    so this reads the same numbers GEPA optimized rather than a second metric
+    invented for selection.
+    """
+    rows = list(outputs)
+    if not rows:
+        return []
+    scores = adjusted_candidate_scores(rows)
+    by_game: dict[str, list[float]] = {}
+    for row, score in zip(rows, scores, strict=True):
+        by_game.setdefault(str(row.get("game", "")), []).append(score)
+    return [sum(values) / len(values) for values in by_game.values()]
+
+
+def _median(values: Sequence[float]) -> float:
+    """Return the median, or 0.0 for an empty sequence."""
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return sum(ordered[middle - 1 : middle + 1]) / 2
+
+
+def _select_on_objective(
+    candidates: Sequence[Sequence[Mapping[str, Any]]],
+) -> tuple[int, list[dict[str, Any]]]:
+    """Rank speed-objective candidates by the objective they were optimized on.
+
+    The solve-coverage rule below was built for the base-relative objective,
+    where solves are the thing being bought. Under a speed objective the run
+    optimizes time against a fixed reference, so selecting on solve coverage
+    picks a candidate the optimizer never tried to produce - that is how v13
+    ended with GEPA's best candidate and the selected candidate disagreeing
+    with no principled tie-break.
+
+    Ranking uses the median across games before the mean, so a single level or
+    a single game cannot decide the run even when the weight cap lets it lead.
+    Candidates that solve strictly less than the seed are rejected outright:
+    speed bought by abandoning levels is not the result this experiment wants.
+    """
+    diagnostics: list[dict[str, Any]] = []
+    ranks: list[tuple[float, float, float]] = []
+    eligible: list[bool] = []
+    seed_solve_rate = _mean_solve_rate(candidates[0]) if candidates else 0.0
+    for index, outputs in enumerate(candidates):
+        game_scores = _per_game_objective_scores(outputs)
+        mean_score = sum(game_scores) / len(game_scores) if game_scores else 0.0
+        median_score = _median(game_scores)
+        solve_rate = _mean_solve_rate(outputs)
+        solve_delta = solve_rate - seed_solve_rate
+        positive_games = sum(score > 1e-9 for score in game_scores)
+        negative_games = sum(score < -1e-9 for score in game_scores)
+        is_eligible = index == 0 or solve_delta >= -1e-9
+        diagnostics.append(
+            {
+                "candidate_idx": index,
+                "selection_rule": "objective",
+                "objective": _OBJECTIVE_MODE,
+                "mean_game_score": mean_score,
+                "median_game_score": median_score,
+                "mean_solve_rate": solve_rate,
+                "mean_solve_rate_delta": solve_delta,
+                "positive_games": positive_games,
+                "negative_games": negative_games,
+                "eligible": is_eligible,
+            }
+        )
+        ranks.append((median_score, mean_score, solve_delta))
+        eligible.append(is_eligible)
+    selected = max(
+        (index for index in range(len(candidates)) if eligible[index]),
+        key=lambda index: ranks[index],
+        default=0,
+    )
+    return selected, diagnostics
+
+
 def select_generalizing_candidate(
     candidates: Sequence[Sequence[Mapping[str, Any]]],
 ) -> tuple[int, list[dict[str, Any]]]:
     """Select broad validation gains, rejecting single-game efficiency outliers."""
+    if _OBJECTIVE_MODE != OBJECTIVE_ADJUSTED:
+        return _select_on_objective(candidates)
     diagnostics: list[dict[str, Any]] = []
     ranks: list[tuple[float, float, float]] = []
     eligible: list[bool] = []
@@ -2773,6 +2934,7 @@ def select_generalizing_candidate(
         diagnostics.append(
             {
                 "candidate_idx": index,
+                "selection_rule": "solve-coverage",
                 "mean_solve_rate_delta": mean_solve_delta,
                 "mean_game_score": mean_score,
                 "median_game_score": median_score,
@@ -7249,6 +7411,9 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
     configure_seed_contract(
         str(getattr(args, "seed_contract", SEED_CONTRACT_DUAL_ROUTE))
     )
+    configure_macro_weight_cap(
+        float(getattr(args, "macro_weight_cap", DEFAULT_MACRO_WEIGHT_CAP))
+    )
     configure_objective(
         mode=str(getattr(args, "objective", OBJECTIVE_ADJUSTED)),
         blind_reference=blind_reference,
@@ -7392,7 +7557,10 @@ def run_standalone_gepa(args: argparse.Namespace) -> None:
             model=args.codex_model,
             timeout_s=args.llm_timeout_s,
             executable=args.codex_executable,
-            reasoning_effort=args.codex_reasoning_effort,
+            reasoning_effort=(
+                getattr(args, "reflection_reasoning_effort", "")
+                or args.codex_reasoning_effort
+            ),
             working_directory=state_root,
             allow_read_tools=args.reflection_artifact_tools,
         )
@@ -7795,7 +7963,7 @@ def run_training_target_sweep(
         raise RuntimeError(f"{len(failed)} training target(s) failed; see {summary_path}")
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Standalone GEPA with batched local-LLM synthesis and CPU-array search."
     )
@@ -7837,6 +8005,34 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_BLIND_BUDGET_MULTIPLIER,
         help="Per-level expansion budget as a multiple of measured blind effort.",
+    )
+    parser.add_argument(
+        "--macro-weight-cap",
+        type=float,
+        default=DEFAULT_MACRO_WEIGHT_CAP,
+        help="Largest weight one level may carry in an aggregate. Games are "
+        "still weighted equally per level, but a game left with a single "
+        "surviving level can no longer decide the run. 0 disables the cap.",
+    )
+    parser.add_argument(
+        "--min-dev-levels-per-game",
+        type=int,
+        default=DEFAULT_MIN_DEV_LEVELS_PER_GAME,
+        help="Games with fewer surviving levels are not eligible as dev games.",
+    )
+    parser.add_argument(
+        "--min-dev-games",
+        type=int,
+        default=DEFAULT_MIN_DEV_GAMES,
+        help="Floor on dev games, so the selection rule's per-game majority "
+        "has enough games to mean something.",
+    )
+    parser.add_argument(
+        "--reflection-reasoning-effort",
+        type=str,
+        default=os.getenv("REFLECTION_REASONING_EFFORT", ""),
+        help="Reasoning effort for the reflection model. Defaults to "
+        "--codex-reasoning-effort, which is the synthesis setting.",
     )
     parser.add_argument(
         "--seed-contract",
@@ -8169,7 +8365,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse runner arguments from the command line."""
+    return build_arg_parser().parse_args()
 
 
 def main() -> None:

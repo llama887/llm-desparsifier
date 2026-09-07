@@ -95,6 +95,10 @@ RUN_ARGS=(
     --blind-reference "$BLIND_REFERENCE"
     --blind-budget-multiplier "${BLIND_BUDGET_MULTIPLIER:-2}"
     --objective "${OBJECTIVE:-blind-relative-time}"
+    --macro-weight-cap "${MACRO_WEIGHT_CAP:-4.0}"
+    --min-dev-levels-per-game "${MIN_DEV_LEVELS_PER_GAME:-2}"
+    --min-dev-games "${MIN_DEV_GAMES:-4}"
+    --reflection-reasoning-effort "${REFLECTION_EFFORT:-high}"
     --sibling-level-holdout
     --synthesis-cache-dir "${SYNTHESIS_CACHE_DIR:-artifacts/synthesis_cache}"
     --require-blind-reference
